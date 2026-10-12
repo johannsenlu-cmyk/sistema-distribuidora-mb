@@ -1,0 +1,1859 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>Distribuidora MB · Gestión</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --fondo: #F6F5F1;
+      --superficie: #FFFFFF;
+      --superficie-2: #FAF9F6;
+      --tinta: #1C1C1A;
+      --tinta-2: #45443F;
+      --tenue: #7E7B73;
+      --linea: #E4E1D9;
+      --linea-2: #CDC9BF;
+      --acento: #8C6D46;
+      --acento-suave: #F2ECE3;
+      --ok: #3D6A4D;
+      --ok-suave: #E7EFE9;
+      --alerta: #8F6418;
+      --alerta-suave: #F6EEDD;
+      --error: #8F2E2E;
+      --error-suave: #F6E5E3;
+      --serif: 'Cormorant Garamond', Georgia, 'Times New Roman', serif;
+      --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --radio: 3px;
+      color-scheme: light;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { margin: 0; background: var(--fondo); color: var(--tinta); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+    body.sin-scroll { overflow: hidden; }
+    [hidden] { display: none !important; }
+    h1, h2, h3 { font-family: var(--serif); font-weight: 600; letter-spacing: .01em; margin: 0; color: var(--tinta); font-variant-numeric: lining-nums; }
+    p { margin: 0; }
+    a { color: var(--tinta); }
+    button { font-family: inherit; }
+    .tenue { color: var(--tenue); }
+    .eyebrow { font-size: 11px; font-weight: 500; letter-spacing: .16em; text-transform: uppercase; color: var(--tenue); }
+    .mt { margin-top: 16px; }
+    .mt-l { margin-top: 28px; }
+
+    /* ───── Marca ───── */
+    .marca { font-family: var(--serif); font-weight: 600; text-transform: uppercase; letter-spacing: .16em; line-height: 1.1; color: var(--tinta); font-variant-numeric: lining-nums; }
+    .marca b { color: var(--acento); font-weight: 700; }
+    .acceso .marca b { display: block; margin-top: 4px; }
+
+    /* ───── Acceso ───── */
+    .acceso { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px 16px; gap: 20px; }
+    .acceso-caja { width: 100%; max-width: 400px; background: var(--superficie); border: 1px solid var(--linea); border-radius: var(--radio); padding: 44px 36px 34px; }
+    .acceso .marca { font-size: 30px; text-align: center; }
+    .acceso-sub { text-align: center; margin: 10px 0 0; }
+    .acceso-regla { width: 40px; height: 1px; background: var(--acento); margin: 26px auto 28px; }
+    .acceso form { display: flex; flex-direction: column; gap: 10px; }
+    .acceso label { font-size: 12px; font-weight: 500; color: var(--tinta-2); }
+    .acceso input { font-size: 16px; }
+    .acceso .btn { margin-top: 8px; min-height: 44px; }
+    .acceso-msg { min-height: 20px; font-size: 13px; color: var(--tinta-2); text-align: center; margin-top: 6px; }
+    .acceso-msg.error { color: var(--error); }
+    .acceso-pie { font-size: 12px; color: var(--tenue); text-align: center; max-width: 400px; }
+    /* v2.2: ingreso en dos pasos (correo → código) */
+    .acceso .check { margin-top: 4px; font-size: 12px; }
+    .acceso-info { font-size: 13px; color: var(--tinta-2); background: var(--superficie-2); border: 1px solid var(--linea); border-radius: var(--radio); padding: 10px 12px; margin-bottom: 4px; }
+    .acceso-links { display: flex; justify-content: space-between; gap: 8px; margin-top: 2px; flex-wrap: wrap; }
+    .acceso #codigo { font-size: 26px; letter-spacing: .4em; text-align: center; font-variant-numeric: tabular-nums; padding-left: 18px; }
+    .usuario-rol { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--acento); }
+
+    /* ───── Formularios ───── */
+    input, select, textarea {
+      font: 14px var(--sans); color: var(--tinta); background: var(--superficie);
+      border: 1px solid var(--linea-2); border-radius: var(--radio); padding: 9px 11px; width: 100%; min-height: 40px;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    textarea { min-height: 76px; resize: vertical; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--tinta); box-shadow: 0 0 0 3px rgba(140, 109, 70, .16); }
+    input[readonly] { background: var(--superficie-2); color: var(--tinta-2); }
+    input.invalido, select.invalido { border-color: var(--error); }
+    .campo { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .campo > label { font-size: 12px; font-weight: 500; color: var(--tinta-2); }
+    .ayuda { font-size: 12px; color: var(--tenue); }
+    .form-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px 16px; }
+    .c-2 { grid-column: span 2; } .c-3 { grid-column: span 3; } .c-4 { grid-column: span 4; } .c-5 { grid-column: span 5; }
+    .c-6 { grid-column: span 6; } .c-7 { grid-column: span 7; } .c-8 { grid-column: span 8; } .c-12 { grid-column: span 12; }
+    .espaciador { visibility: hidden; }
+    .con-boton { display: flex; gap: 8px; }
+    .con-boton select { flex: 1; min-width: 0; }
+    .check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--tinta-2); cursor: pointer; user-select: none; }
+    .check input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--tinta); }
+    .segmentado { display: inline-flex; border: 1px solid var(--linea-2); border-radius: var(--radio); overflow: hidden; width: 100%; }
+    .segmentado button { flex: 1; border: 0; background: var(--superficie); padding: 9px 12px; min-height: 40px; font-size: 13px; cursor: pointer; color: var(--tinta-2); }
+    .segmentado button + button { border-left: 1px solid var(--linea-2); }
+    .segmentado button[aria-pressed="true"] { background: var(--tinta); color: #fff; }
+    .error-linea { color: var(--error); font-size: 13px; min-height: 18px; margin-top: 8px; }
+    .separador { height: 1px; background: var(--linea); margin: 22px 0 18px; }
+
+    /* ───── Botones ───── */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px; font: 500 13px var(--sans); letter-spacing: .02em;
+      padding: 9px 16px; min-height: 40px; border-radius: var(--radio); border: 1px solid var(--tinta); background: var(--tinta);
+      color: #fff; cursor: pointer; white-space: nowrap; text-decoration: none; transition: background .15s, border-color .15s;
+    }
+    .btn:hover { background: #000; }
+    .btn:focus-visible, .btn-sec:focus-visible, .btn-link:focus-visible, .nav button:focus-visible, .subtabs button:focus-visible { outline: 2px solid var(--acento); outline-offset: 2px; }
+    .btn[disabled] { opacity: .55; cursor: progress; }
+    .btn-sec { background: var(--superficie); color: var(--tinta); border-color: var(--linea-2); }
+    .btn-sec:hover { background: var(--superficie-2); border-color: var(--tinta); }
+    .btn-peligro { background: var(--error); border-color: var(--error); }
+    .btn-peligro:hover { background: #6f2222; }
+    .btn-bloque { width: 100%; }
+    a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; text-align: center; }
+    a.btn.deshabilitado { opacity: .5; cursor: not-allowed; }
+    .lista-pend { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 16px; }
+    .lista-pend li { font-size: 13px; padding: 6px 0; border-bottom: 1px solid var(--linea); }
+    .pend-n { display: inline-block; min-width: 34px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--acento); }
+    @media (max-width: 600px) { .lista-pend { grid-template-columns: 1fr; } }
+    .acceso .check { margin-top: 12px; }
+    .btn-link { background: none; border: 0; padding: 4px 6px; min-height: 0; font: 500 12px var(--sans); color: var(--tinta); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--linea-2); cursor: pointer; }
+    .btn-link:hover { text-decoration-color: var(--tinta); }
+    .btn-link.peligro { color: var(--error); }
+    .btn-icono { background: none; border: 1px solid transparent; width: 34px; height: 34px; border-radius: var(--radio); font-size: 18px; line-height: 1; color: var(--tinta-2); cursor: pointer; }
+    .btn-icono:hover { border-color: var(--linea-2); background: var(--superficie-2); }
+    .btn-icono[disabled] { opacity: .35; cursor: default; }
+
+    /* ───── Cabecera ───── */
+    .cabecera { background: var(--superficie); border-bottom: 1px solid var(--linea); position: sticky; top: 0; z-index: 20; }
+    .cabecera-fila { max-width: 1200px; margin: 0 auto; padding: 14px 24px 10px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .cabecera .marca { font-size: 21px; }
+    .periodo { display: flex; align-items: center; gap: 6px; }
+    .periodo-etq { min-width: 140px; text-align: center; font-family: var(--serif); font-size: 19px; font-weight: 600; text-transform: capitalize; font-variant-numeric: lining-nums; }
+    .corto { display: none; }
+    .usuario { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--tenue); }
+    .usuario a { font-weight: 500; color: var(--tinta); text-underline-offset: 3px; text-decoration-color: var(--linea-2); }
+    .nav { max-width: 1200px; margin: 0 auto; padding: 0 24px; display: flex; gap: 28px; overflow-x: auto; scrollbar-width: none; }
+    .nav::-webkit-scrollbar { display: none; }
+    .nav button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 0 11px; font: 500 12px var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--tenue); cursor: pointer; white-space: nowrap; }
+    .nav button:hover { color: var(--tinta); }
+    .nav button[aria-current="page"] { color: var(--tinta); border-bottom-color: var(--tinta); }
+    .barra-carga { position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 60; overflow: hidden; background: transparent; }
+    .barra-carga::after { content: ''; position: absolute; top: 0; bottom: 0; width: 35%; background: var(--acento); animation: carga 1.1s ease-in-out infinite; }
+    @keyframes carga { from { left: -35%; } to { left: 100%; } }
+
+    /* ───── Contenido ───── */
+    .contenido { max-width: 1200px; margin: 0 auto; padding: 30px 24px 72px; }
+    .vista-cab { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
+    .vista-cab h1 { font-size: 34px; line-height: 1.1; margin-top: 4px; }
+    .vista-acc { display: flex; gap: 8px; flex-wrap: wrap; }
+    .subtabs { display: inline-flex; gap: 2px; padding: 3px; background: var(--superficie); border: 1px solid var(--linea); border-radius: 4px; max-width: 100%; overflow-x: auto; margin-bottom: 18px; scrollbar-width: none; }
+    .subtabs button { border: 0; background: none; padding: 7px 14px; border-radius: var(--radio); font: 500 13px var(--sans); color: var(--tinta-2); cursor: pointer; white-space: nowrap; }
+    .subtabs button:hover { background: var(--superficie-2); }
+    .subtabs button[aria-selected="true"] { background: var(--tinta); color: #fff; }
+    .contador { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; font-size: 11px; line-height: 18px; text-align: center; background: var(--alerta-suave); color: var(--alerta); }
+    .subtabs button[aria-selected="true"] .contador { background: rgba(255,255,255,.18); color: #fff; }
+    .panel { background: var(--superficie); border: 1px solid var(--linea); border-radius: 4px; padding: 22px; }
+    .panel > h2 { font-size: 22px; margin-bottom: 14px; }
+    .panel-cab { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+    .panel-cab h2 { font-size: 22px; }
+    .grilla-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .barra-herr { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+    .barra-herr input[type="search"] { max-width: 360px; }
+    .nota-pie { margin-top: 26px; font-size: 12px; color: var(--tenue); }
+
+    /* ───── Indicadores ───── */
+    .kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .kpi { background: var(--superficie); border: 1px solid var(--linea); border-radius: 4px; padding: 18px 20px; border-top: 2px solid var(--linea); }
+    .kpi-etq { font-size: 11px; font-weight: 500; letter-spacing: .14em; text-transform: uppercase; color: var(--tenue); }
+    .kpi-val { font-size: 26px; font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; margin-top: 8px; line-height: 1.15; }
+    .kpi-det { font-size: 12px; color: var(--tenue); margin-top: 4px; }
+    .kpi-alerta { border-top-color: var(--alerta); }
+    .kpi-error { border-top-color: var(--error); }
+    .kpi-error .kpi-val { color: var(--error); }
+
+    /* ───── Tablas ───── */
+    .tabla-cont { overflow-x: auto; border: 1px solid var(--linea); border-radius: 4px; background: var(--superficie); }
+    .panel .tabla-cont { border: 0; border-radius: 0; margin: 0 -22px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { font: 500 11px var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--tenue); text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--linea); background: var(--superficie-2); white-space: nowrap; }
+    td { padding: 11px 14px; border-bottom: 1px solid var(--linea); vertical-align: top; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #FCFBF9; }
+    tfoot td { border-top: 1px solid var(--linea-2); border-bottom: 0; font-weight: 600; background: var(--superficie-2); }
+    .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .cod { font-variant-numeric: tabular-nums; color: var(--tinta-2); white-space: nowrap; font-size: 12px; }
+    .fuerte { font-weight: 500; }
+    .det { font-size: 12px; color: var(--tenue); }
+    .acciones { text-align: right; white-space: nowrap; }
+    .fila-anulada td { color: var(--tenue); }
+    .fila-anulada .fuerte { text-decoration: line-through; text-decoration-color: var(--linea-2); }
+    .vacio { padding: 28px 18px; text-align: center; color: var(--tenue); font-size: 13px; border: 1px dashed var(--linea-2); border-radius: 4px; background: var(--superficie); }
+    .panel .vacio { border: 0; padding: 18px 0 8px; text-align: left; background: none; }
+    .positivo { color: var(--ok); }
+    .negativo { color: var(--error); }
+    .total-fila { display: flex; justify-content: flex-end; align-items: baseline; gap: 18px; padding: 16px 2px 4px; }
+    .total-fila span { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--tenue); }
+    .total-fila strong { font-size: 26px; font-variant-numeric: tabular-nums; font-weight: 600; }
+    .form-acciones { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+
+    /* ───── Etiquetas ───── */
+    .badge { display: inline-block; font-size: 11px; font-weight: 500; letter-spacing: .03em; padding: 2px 9px; border-radius: 999px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .b-ok { color: var(--ok); background: var(--ok-suave); }
+    .b-alerta { color: var(--alerta); background: var(--alerta-suave); }
+    .b-error { color: var(--error); background: var(--error-suave); }
+    .b-neutro { color: var(--tenue); background: #EFEDE7; }
+
+    /* ───── Primeros pasos ───── */
+    .pasos { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .paso { background: var(--superficie); border: 1px solid var(--linea); border-left: 2px solid var(--acento); border-radius: 4px; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+    .paso h3 { font-size: 20px; }
+    .paso p { font-size: 13px; color: var(--tinta-2); }
+
+    /* ───── Modal ───── */
+    .modal { position: fixed; inset: 0; background: rgba(28, 28, 26, .42); display: flex; align-items: flex-start; justify-content: center; padding: 6vh 16px 24px; z-index: 50; overflow-y: auto; }
+    .modal-caja { background: var(--superficie); width: 100%; max-width: 580px; border-radius: 4px; border: 1px solid var(--linea); box-shadow: 0 24px 60px rgba(0, 0, 0, .18); }
+    .modal-caja.ancho { max-width: 760px; }
+    .modal-cab { padding: 18px 22px 16px; border-bottom: 1px solid var(--linea); display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .modal-cab h2 { font-size: 24px; }
+    .modal-cuerpo { padding: 20px 22px 22px; }
+    .modal-pie { padding: 14px 22px; border-top: 1px solid var(--linea); display: flex; justify-content: flex-end; align-items: center; gap: 8px; background: var(--superficie-2); flex-wrap: wrap; }
+    .modal-error { color: var(--error); font-size: 13px; margin-right: auto; flex: 1 1 200px; }
+    .ficha { font-size: 13px; color: var(--tinta-2); background: var(--superficie-2); border: 1px solid var(--linea); border-radius: var(--radio); padding: 10px 12px; }
+    .ficha strong { color: var(--tinta); font-weight: 600; }
+    .dl { display: grid; grid-template-columns: 140px 1fr; gap: 6px 14px; font-size: 13px; margin-bottom: 16px; }
+    .dl dt { color: var(--tenue); }
+    .dl dd { margin: 0; }
+
+    /* ───── Avisos ───── */
+    .toasts { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 70; max-width: 420px; }
+    .toast { display: flex; gap: 12px; align-items: flex-start; background: var(--tinta); color: #fff; padding: 12px 12px 12px 16px; border-radius: 4px; box-shadow: 0 12px 30px rgba(0,0,0,.2); font-size: 13px; border-left: 3px solid var(--ok); animation: entra .2s ease-out; }
+    .toast p { flex: 1; }
+    .toast button { background: none; border: 0; color: rgba(255,255,255,.7); font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
+    .t-error { border-left-color: #E07B7B; }
+    .t-aviso { border-left-color: #D9A441; }
+    @keyframes entra { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+    /* ───── Responsive ───── */
+    @media (max-width: 900px) {
+      .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grilla-2, .pasos { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 720px) {
+      .cabecera { position: static; }
+      .cabecera-fila { flex-wrap: wrap; padding: 12px 16px 6px; gap: 6px 12px; }
+      .cabecera .marca { font-size: 16px; letter-spacing: .12em; }
+      .usuario { gap: 12px; }
+      .usuario #usuario-correo, .largo { display: none; }
+      .corto { display: inline; }
+      .periodo { order: 3; width: 100%; justify-content: space-between; border-top: 1px solid var(--linea); padding-top: 4px; }
+      .periodo-etq { font-size: 18px; }
+      .nav { padding: 0 16px; gap: 22px; }
+      .contenido { padding: 22px 16px 56px; }
+      .vista-cab h1 { font-size: 28px; }
+      .form-grid > * { grid-column: span 12; }
+      .espaciador { display: none; }
+      .panel { padding: 18px 16px; }
+      .panel .tabla-cont { margin: 0 -16px; }
+      th, td { padding: 9px 10px; }
+      .kpi { padding: 14px 16px; }
+      .kpi-val { font-size: 22px; margin-top: 6px; }
+      .toasts { left: 16px; right: 16px; bottom: 16px; max-width: none; }
+      .dl { grid-template-columns: 110px 1fr; }
+      .acceso-caja { padding: 36px 24px 28px; }
+    }
+    @media (max-width: 480px) {
+      .kpis { grid-template-columns: 1fr; gap: 10px; }
+      .vista-acc { width: 100%; }
+      .vista-acc .btn { flex: 1; }
+    }
+    /* v2.2: filas de 4 indicadores y columnas que se pliegan en el celular */
+    .kpis.kpis-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .solo-movil { display: none; }
+    @media (max-width: 900px) { .kpis.kpis-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 720px) {
+      .ocultar-movil { display: none; }
+      .solo-movil { display: block; }
+      .usuario .usuario-rol { display: none; }
+      .tabla-plegable .acciones { white-space: normal; min-width: 64px; }
+      .tabla-plegable .acciones .btn-link { display: inline-block; padding: 5px 3px; }
+    }
+    @media (max-width: 480px) { .kpis.kpis-4 { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body data-pagina="<?= pagina ?>" data-version="<?= version ?>">
+  <!-- ═════════════ ACCESO (v2.3): identidad verificada por Google («MB Acceso»); código por correo solo como respaldo ═════════════ -->
+  <main id="acceso" class="acceso">
+    <div class="acceso-caja">
+      <p class="marca">Distribuidora <b>MB</b></p>
+      <p class="acceso-sub eyebrow">Inventario y gestión</p>
+      <div class="acceso-regla"></div>
+      <div id="paso-google" class="campo">
+        <a id="btn-google" class="btn btn-bloque" href="#" target="_top" rel="noreferrer">Ingresar con Google</a>
+        <label class="check"><input type="checkbox" id="recordar" checked> Recordar este dispositivo por 30 días (no lo marque en equipos compartidos)</label>
+        <p class="acceso-info">Google confirma quién es usted: no hace falta escribir el correo. La primera vez le pedirá permiso para que «MB Acceso» vea su dirección de correo.</p>
+        <button type="button" class="btn-link" id="link-codigo" data-accion="usar-codigo" hidden>Ingresar con un código por correo</button>
+      </div>
+      <form id="form-acceso" novalidate autocomplete="on" hidden>
+        <div id="paso-correo" class="campo">
+          <label for="correo">Correo electrónico</label>
+          <input id="correo" name="email" type="email" inputmode="email" autocomplete="email" autocapitalize="off" spellcheck="false" placeholder="nombre@gmail.com" required>
+          <button id="btn-ingresar" type="submit" class="btn btn-bloque">Enviar código</button>
+          <div class="acceso-links"><button type="button" class="btn-link" data-accion="volver-google">Volver a «Ingresar con Google»</button></div>
+        </div>
+        <div id="paso-codigo" class="campo" hidden>
+          <p id="codigo-info" class="acceso-info"></p>
+          <label for="codigo">Código de 6 dígitos</label>
+          <input id="codigo" name="codigo" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" spellcheck="false" placeholder="••••••">
+          <button id="btn-verificar" type="submit" class="btn btn-bloque">Ingresar</button>
+          <div class="acceso-links">
+            <button type="button" class="btn-link" data-accion="reenviar-codigo">Enviar otro código</button>
+            <button type="button" class="btn-link" data-accion="volver-google">Volver a «Ingresar con Google»</button>
+          </div>
+        </div>
+      </form>
+      <p id="acceso-msg" class="acceso-msg" role="status" aria-live="polite"></p>
+    </div>
+    <p class="acceso-pie">Su identidad la confirma Google. La hoja de cálculo es solo para administradoras.<br>Si usa varias cuentas de Google en el mismo navegador, use un perfil del navegador por persona.</p>
+  </main>
+  <script type="application/json" id="arranque"><?!= arranque ?></script>
+
+  <!-- ═════════════ APLICACIÓN ═════════════ -->
+  <div id="app" hidden>
+    <header class="cabecera">
+      <div class="cabecera-fila">
+        <p class="marca">Distribuidora <b>MB</b></p>
+        <div class="periodo" aria-label="Período">
+          <button type="button" class="btn-icono" data-accion="mes" data-delta="-1" aria-label="Mes anterior">‹</button>
+          <span id="periodo-etq" class="periodo-etq"></span>
+          <button type="button" class="btn-icono" id="mes-siguiente" data-accion="mes" data-delta="1" aria-label="Mes siguiente">›</button>
+        </div>
+        <div class="usuario">
+          <span id="usuario-correo"></span>
+          <span id="usuario-rol" class="usuario-rol"></span>
+          <a id="enlace-hoja" href="#" target="_blank" rel="noopener" hidden><span class="largo">Abrir hoja de cálculo</span><span class="corto">Hoja de cálculo</span></a>
+          <button type="button" class="btn-link" data-accion="salir">Salir</button>
+        </div>
+      </div>
+      <nav class="nav" id="nav" aria-label="Módulos">
+        <button type="button" data-vista="resumen">Resumen</button>
+        <button type="button" data-vista="venta">Venta</button>
+        <button type="button" data-vista="agenda">Agenda</button>
+        <button type="button" data-vista="inventario">Inventario</button>
+        <button type="button" data-vista="ventas">Ventas</button>
+        <button type="button" data-vista="cartera">Cartera</button>
+        <button type="button" data-vista="clientes">Base de datos</button>
+        <button type="button" data-vista="salon">Salón</button>
+        <button type="button" data-vista="comisiones">Comisiones</button>
+        <button type="button" data-vista="proveedores">Proveedores</button>
+        <button type="button" data-vista="reportes">Reportes</button>
+        <button type="button" data-vista="sistema">Sistema</button>
+      </nav>
+    </header>
+    <main id="contenido" class="contenido"></main>
+  </div>
+
+  <div id="modal" class="modal" hidden></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="barra-carga" class="barra-carga" hidden></div>
+
+  <!-- v2.3: módulos de la aplicación (parciales UI_*.html del mismo proyecto; los que falten no rompen nada) -->
+  <?!= incluir_('UI_Sistema') ?>
+  <?!= incluir_('UI_Cartera') ?>
+  <?!= incluir_('UI_Clientes') ?>
+  <?!= incluir_('UI_Proveedores') ?>
+  <?!= incluir_('UI_Comisiones') ?>
+  <?!= incluir_('UI_Venta') ?>
+  <?!= incluir_('UI_Agenda') ?>
+  <?!= incluir_('UI_Reportes') ?>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ═════════════ Estado ═════════════
+    var MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+    var ROL_ADMIN = 'ADMINISTRADOR';
+    var CLAVE_LOCAL = 'mb_sesion_v23';
+    var PAGINA = document.body.getAttribute('data-pagina') || '';
+    var VERSION = document.body.getAttribute('data-version') || '';
+    // v2.3: secciones solo para administradoras (el servidor igual valida cada función).
+    var SOLO_ADMIN = { comisiones: true, proveedores: true, reportes: true, sistema: true };
+    var ARRANQUE = (function () { try { return JSON.parse(document.getElementById('arranque').textContent) || {}; } catch (e) { return {}; } })();
+    var S = {
+      email: '', token: '', rol: '', nombre: '', recordar: true, recordado: false, url: '', mes: mesActual(), datos: null, vista: 'resumen',
+      sub: { inventario: 'productos', ventas: 'nueva', salon: 'registrar', cartera: 'clientas', sistema: 'salud', clientes: 'lista', agenda: 'dia', reportes: 'resumen', comisiones: 'mes', proveedores: 'lista' },
+      filtro: { productos: '', inactivos: false, profesional: '' },
+      venta: null, servicio: null, modal: null, cargas: 0, enVuelo: {},
+    };
+    var MB = null; // puente para Cartera.html (se arma más abajo)
+
+    // ═════════════ Utilidades ═════════════
+    function $(sel, raiz) { return (raiz || document).querySelector(sel); }
+    function esc(v) {
+      return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    function miles(n) {
+      var v = Math.round(Number(n) || 0);
+      return (v < 0 ? '−' : '') + String(Math.abs(v)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    }
+    function gs(n) { return 'Gs. ' + miles(n); }
+    function pct(n) { return String(Math.round((Number(n) || 0) * 100) / 100).replace('.', ',') + '%'; }
+    function fecha(iso) {
+      if (!iso) return '—';
+      var p = String(iso).slice(0, 10).split('-');
+      return p.length === 3 ? p[2] + '/' + p[1] + '/' + p[0] : String(iso);
+    }
+    function dos(n) { return (n < 10 ? '0' : '') + n; }
+    function hoyISO() { var d = new Date(); return d.getFullYear() + '-' + dos(d.getMonth() + 1) + '-' + dos(d.getDate()); }
+    function mesActual() { return hoyISO().slice(0, 7); }
+    function etiquetaMes(mes) { var p = mes.split('-'); return MESES[Number(p[1]) - 1] + ' ' + p[0]; }
+    function sumarMes(mes, n) {
+      var p = mes.split('-').map(Number);
+      var d = new Date(p[0], p[1] - 1 + n, 1);
+      return d.getFullYear() + '-' + dos(d.getMonth() + 1);
+    }
+    function diasEntre(desde, hasta) {
+      var a = desde.split('-').map(Number), b = hasta.split('-').map(Number);
+      return Math.round((Date.UTC(b[0], b[1] - 1, b[2]) - Date.UTC(a[0], a[1] - 1, a[2])) / 86400000);
+    }
+    function sumarDias(iso, n) {
+      var p = String(iso).slice(0, 10).split('-').map(Number);
+      var d = new Date(Date.UTC(p[0], p[1] - 1, p[2] + n));
+      return d.getUTCFullYear() + '-' + dos(d.getUTCMonth() + 1) + '-' + dos(d.getUTCDate());
+    }
+    function esAdmin() { return S.rol === ROL_ADMIN; }
+    function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+    function digitos(v) { return String(v === null || v === undefined ? '' : v).replace(/\D/g, ''); }
+    function enteroDe(v) { var d = digitos(v); return d ? Number(d) : NaN; }
+    function decimalDe(v) {
+      var s = String(v === null || v === undefined ? '' : v).replace(/[%\s]/g, '').replace(',', '.');
+      return s === '' ? NaN : Number(s);
+    }
+    function plural(n, uno, varios) { return miles(n) + ' ' + (n === 1 ? uno : varios); }
+    function norm(s) { return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+    function buscar(lista, codigo) {
+      for (var i = 0; i < lista.length; i++) if (lista[i].codigo === codigo) return lista[i];
+      return null;
+    }
+    function asignar(ruta, valor) {
+      var partes = ruta.split('.'), obj = S;
+      for (var i = 0; i < partes.length - 1; i++) obj = obj[partes[i]];
+      obj[partes[partes.length - 1]] = valor;
+    }
+
+    // ═════════════ Comunicación con el servidor ═════════════
+    // Cada llamada lleva el token de sesión (el servidor decide correo y rol; el navegador no autoriza nada).
+    // Ante cortes de red reintenta sola hasta 2 veces con el MISMO idSolicitud: el servidor no duplica la operación.
+    // Un segundo clic con la misma solicitud en curso devuelve la misma promesa (anti doble clic).
+    function api(fn, datos, idSolicitud, extra) {
+      var clave = idSolicitud ? fn + '|' + idSolicitud : '';
+      if (clave && S.enVuelo[clave]) return S.enVuelo[clave];
+      var carga = Object.assign({ token: S.token, mes: S.mes, idSolicitud: idSolicitud || '', datos: datos || {}, cliente: VERSION }, extra || {});
+      var promesa = new Promise(function (resolve, reject) {
+        if (!(window.google && window.google.script && window.google.script.run)) {
+          reject(new Error('Esta página funciona solo dentro de la aplicación publicada en Google Apps Script.'));
+          return;
+        }
+        cargando(1);
+        var lento = setTimeout(function () { toast('La operación está tardando más de lo habitual. No cierre la página.', 'aviso', 7000); }, 20000);
+        var intento = 0;
+        function fin() { clearTimeout(lento); cargando(-1); }
+        function llamar() {
+          intento++;
+          window.google.script.run.withSuccessHandler(function (r) {
+            fin();
+            if (!r || r.ok !== true) { reject(new Error('Respuesta inesperada del servidor. Intente nuevamente.')); return; }
+            resolve(r);
+          }).withFailureHandler(function (err) {
+            var e = limpiarError(err);
+            if (e.red && intento < 3) {
+              if (intento === 1) toast('Conexión inestable: reintentando…', 'aviso', 4000);
+              setTimeout(llamar, intento === 1 ? 1500 : 4000);
+              return;
+            }
+            fin();
+            if (e.sesion) cerrarSesion(e.message);
+            reject(e);
+          })[fn](carga);
+        }
+        llamar();
+      });
+      if (clave) {
+        S.enVuelo[clave] = promesa;
+        promesa.then(function () { delete S.enVuelo[clave]; }, function () { delete S.enVuelo[clave]; });
+      }
+      return promesa;
+    }
+    function limpiarError(err) {
+      var msg = err && err.message ? String(err.message) : String(err || 'Error desconocido');
+      msg = msg.replace(/^(Exception|Error|ScriptError|TypeError):\s*/i, '');
+      var red = /NetworkError|HTTP 0|Failed to fetch|Network request failed|Load failed/i.test(msg);
+      if (red) msg = 'No hay conexión con el servidor. Revise su internet y vuelva a pulsar el botón: la operación no se duplica.';
+      var e = new Error(msg.replace(/^\[SESION\]\s*/, ''));
+      e.sesion = /^\[SESION\]/.test(msg);
+      e.red = red;
+      return e;
+    }
+
+    // ═════════════ Sesión guardada en este dispositivo ═════════════
+    // «Recordar» → localStorage (30 días); si no, sessionStorage (solo esta pestaña). Todo con try/catch:
+    // si el navegador bloquea el almacenamiento, simplemente se vuelve a ingresar con Google.
+    function almacen(tipo) {
+      try { var s = window[tipo]; s.setItem('__mb', '1'); s.removeItem('__mb'); return s; } catch (e) { return null; }
+    }
+    function guardarSesionLocal() {
+      borrarSesionLocal();
+      try {
+        var destino = almacen(S.recordado ? 'localStorage' : 'sessionStorage');
+        if (destino) destino.setItem(CLAVE_LOCAL, JSON.stringify({ email: S.email, token: S.token, recordado: S.recordado }));
+      } catch (e) { /* sin almacenamiento: se vuelve a ingresar con Google */ }
+    }
+    function leerSesionLocal() {
+      var tipos = ['sessionStorage', 'localStorage'];
+      for (var i = 0; i < tipos.length; i++) {
+        try {
+          var s = almacen(tipos[i]);
+          var t = s && s.getItem(CLAVE_LOCAL);
+          if (t) { var o = JSON.parse(t); if (o && o.token) return o; }
+        } catch (e) { /* ignorar */ }
+      }
+      return null;
+    }
+    function borrarSesionLocal() {
+      ['localStorage', 'sessionStorage'].forEach(function (t) { try { var s = almacen(t); if (s) s.removeItem(CLAVE_LOCAL); } catch (e) { /* nada */ } });
+    }
+    function cargando(delta) {
+      S.cargas = Math.max(0, S.cargas + delta);
+      $('#barra-carga').hidden = S.cargas === 0;
+    }
+    function aplicar(r) {
+      if (r.datos) { S.datos = r.datos; S.mes = r.datos.mes; }
+      if (r.mensaje) toast((r.repetida ? 'Ya estaba registrado: ' : '') + r.mensaje, r.repetida ? 'aviso' : 'ok');
+      render();
+    }
+    function fallo(e) { if (!e.sesion) toast(e.message, 'error'); }
+    function conBoton(btn, texto, fn) {
+      var original = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = texto; }
+      return Promise.resolve().then(fn).finally(function () {
+        if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = original; }
+      });
+    }
+
+    // ═════════════ Avisos ═════════════
+    function toast(msg, tipo, ms) {
+      var el = document.createElement('div');
+      el.className = 'toast t-' + (tipo || 'ok');
+      el.setAttribute('role', tipo === 'error' ? 'alert' : 'status');
+      el.innerHTML = '<p>' + esc(msg) + '</p><button type="button" aria-label="Cerrar aviso">×</button>';
+      el.querySelector('button').addEventListener('click', function () { el.remove(); });
+      $('#toasts').appendChild(el);
+      setTimeout(function () { el.remove(); }, ms || (tipo === 'error' ? 10000 : tipo === 'aviso' ? 9000 : 5000));
+    }
+
+    // ═════════════ Acceso (v2.3) ═════════════
+    function mensajeAcceso(txt, esError) {
+      var el = $('#acceso-msg');
+      el.textContent = txt || '';
+      el.className = 'acceso-msg' + (esError ? ' error' : '');
+    }
+    // paso: 'google' (botón principal) | 'correo' y 'codigo' (respaldo, solo si la administración lo habilitó)
+    function pasoAcceso(paso) {
+      $('#paso-google').hidden = paso !== 'google';
+      $('#form-acceso').hidden = paso === 'google';
+      $('#paso-correo').hidden = paso !== 'correo';
+      $('#paso-codigo').hidden = paso !== 'codigo';
+    }
+    function prepararBotonGoogle() {
+      var b = $('#btn-google');
+      var enlace = ARRANQUE.enlaceAcceso || '';
+      if (enlace) {
+        b.href = enlace + ($('#recordar').checked ? '?r=1' : '');
+        b.removeAttribute('aria-disabled');
+        b.classList.remove('deshabilitado');
+      } else {
+        b.href = '#';
+        b.setAttribute('aria-disabled', 'true');
+        b.classList.add('deshabilitado');
+      }
+      $('#link-codigo').hidden = !ARRANQUE.codigoPorCorreo;
+    }
+    // Entrada con una sesión ya emitida por el servidor (recién verificada por Google o recordada en este dispositivo).
+    function entrarConSesion(token, email, recordado, texto) {
+      S.token = token; S.email = email || ''; S.recordado = !!recordado;
+      mensajeAcceso(texto || 'Ingresando…');
+      var espera = setTimeout(function () {
+        mensajeAcceso('Preparando el sistema. Tras una actualización, el primer ingreso puede tardar hasta un minuto.');
+      }, 2500);
+      S.mes = mesActual();
+      return api('iniciarSesion', {}, '').then(entrar).catch(function (e) {
+        S.token = '';
+        borrarSesionLocal();
+        pasoAcceso('google');
+        prepararBotonGoogle();
+        mensajeAcceso(e.message, true);
+      }).finally(function () { clearTimeout(espera); });
+    }
+    // Respaldo (solo si «Ingreso con código por correo» = Sí): paso 1, el correo.
+    function ingresar(ev) {
+      if (ev) ev.preventDefault();
+      if (!$('#paso-codigo').hidden) { verificar(); return; }
+      var input = $('#correo');
+      var correo = input.value.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(correo)) {
+        input.classList.add('invalido');
+        mensajeAcceso('Ingrese un correo electrónico válido.', true);
+        input.focus();
+        return;
+      }
+      input.classList.remove('invalido');
+      S.email = correo;
+      S.recordar = $('#recordar').checked;
+      S.token = '';
+      pedirCodigo($('#btn-ingresar'), 'Enviando…');
+    }
+    function pedirCodigo(btn, texto) {
+      var original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = texto;
+      mensajeAcceso('');
+      S.mes = mesActual();
+      return api('iniciarSesion', {}, '', { email: S.email }).then(function (r) {
+        if (r.verificacion) { mostrarPasoCodigo(r); return; }
+        entrar(r);
+      }).catch(function (e) {
+        mensajeAcceso(e.message, true);
+      }).finally(function () {
+        btn.disabled = false;
+        btn.textContent = original;
+      });
+    }
+    function mostrarPasoCodigo(r) {
+      pasoAcceso('codigo');
+      $('#codigo-info').innerHTML = (r.reenviado === false ? 'Ya le enviamos un código hace menos de un minuto a ' : 'Le enviamos un código de 6 dígitos a ') +
+        '<strong>' + esc(r.destino) + '</strong>. Vence en ' + esc(r.minutos) + ' minutos. Si no lo ve, revise «Spam» o «Promociones».';
+      var c = $('#codigo');
+      c.value = '';
+      c.focus();
+    }
+    // Respaldo: paso 2, el código recibido por correo.
+    function verificar() {
+      var c = $('#codigo');
+      var codigo = digitos(c.value);
+      if (codigo.length !== 6) {
+        c.classList.add('invalido');
+        mensajeAcceso('Escriba los 6 dígitos del código.', true);
+        c.focus();
+        return;
+      }
+      c.classList.remove('invalido');
+      var btn = $('#btn-verificar');
+      btn.disabled = true;
+      btn.textContent = 'Verificando…';
+      mensajeAcceso('');
+      api('verificarCodigo', {}, '', { email: S.email, codigo: codigo, recordar: S.recordar }).then(entrar).catch(function (e) {
+        mensajeAcceso(e.message, true);
+        c.select();
+      }).finally(function () {
+        btn.disabled = false;
+        btn.textContent = 'Ingresar';
+      });
+    }
+    function entrar(r) {
+      var s = r.sesion;
+      S.token = s.token; S.email = s.email; S.rol = s.rol; S.nombre = s.nombre || ''; S.recordado = !!s.recordado; S.url = s.url || '';
+      guardarSesionLocal();
+      S.datos = r.datos;
+      S.mes = r.datos.mes;
+      S.venta = ventaNueva();
+      S.servicio = servicioNuevo();
+      if (PAGINA === 'health' && esAdmin()) { S.vista = 'sistema'; S.sub.sistema = 'salud'; PAGINA = ''; }
+      mensajeAcceso('');
+      pasoAcceso('google');
+      mostrarApp();
+      if (s.creada) toast('Se creó la hoja «' + s.nombreHoja + '» en Google Drive.', 'ok', 12000);
+      (s.avisos || []).forEach(function (a) { toast(a, 'aviso', 15000); });
+    }
+    function mostrarApp() {
+      $('#acceso').hidden = true;
+      $('#app').hidden = false;
+      $('#usuario-correo').textContent = S.nombre ? S.nombre + ' · ' + S.email : S.email;
+      $('#usuario-rol').textContent = esAdmin() ? 'Administradora' : 'Operativa';
+      $('#enlace-hoja').href = S.url || '#';
+      $('#enlace-hoja').hidden = !esAdmin() || !S.url; // la hoja tiene costos: solo administradoras
+      render();
+      window.scrollTo(0, 0);
+    }
+    function cerrarSesion(mensaje, revocar) {
+      if (revocar && S.token) {
+        // Revoca el token en el servidor (si no hay red, igual se borra de este dispositivo).
+        try { window.google.script.run.withFailureHandler(function () {}).cerrarSesion({ token: S.token }); } catch (e) { /* sin servidor */ }
+      }
+      borrarSesionLocal();
+      cerrarModal(true);
+      var correo = S.email;
+      S.email = ''; S.token = ''; S.rol = ''; S.nombre = ''; S.url = ''; S.datos = null; S.venta = null; S.servicio = null; S.vista = 'resumen';
+      $('#app').hidden = true;
+      $('#acceso').hidden = false;
+      pasoAcceso('google');
+      prepararBotonGoogle();
+      mensajeAcceso(mensaje || '', !!mensaje);
+      $('#correo').value = mensaje ? correo : '';
+    }
+
+    // ═════════════ Render general ═════════════
+    var VISTAS = { resumen: vResumen, inventario: vInventario, ventas: vVentas, salon: vSalon, comisiones: vComisiones };
+    function vistaPermitida(v) { return !!VISTAS[v] && !(SOLO_ADMIN[v] && !esAdmin()); }
+    function render() {
+      if (!S.datos) return;
+      if (!vistaPermitida(S.vista)) S.vista = 'resumen';
+      $('#periodo-etq').textContent = etiquetaMes(S.mes);
+      $('#mes-siguiente').disabled = S.mes >= mesActual();
+      Array.prototype.forEach.call(document.querySelectorAll('#nav button'), function (b) {
+        var v = b.getAttribute('data-vista');
+        b.hidden = !vistaPermitida(v); // v2.2: menú según el rol (el servidor igual valida cada operación)
+        if (v === S.vista) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+      });
+      $('#contenido').innerHTML = VISTAS[S.vista]();
+      if (S.vista === 'salon' && S.sub.salon === 'registrar') actualizarComision();
+      if (MB && MB.alRender) MB.alRender();
+    }
+    function cabecera(titulo, sub, acciones) {
+      return '<div class="vista-cab"><div><p class="eyebrow">' + esc(sub) + '</p><h1>' + esc(titulo) + '</h1></div>' +
+        (acciones ? '<div class="vista-acc">' + acciones + '</div>' : '') + '</div>';
+    }
+    function subtabs(vista, opciones) {
+      return '<div class="subtabs" role="tablist">' + opciones.map(function (o) {
+        return '<button type="button" role="tab" data-sub="' + o[0] + '" aria-selected="' + (S.sub[vista] === o[0]) + '">' + esc(o[1]) +
+          (o[2] ? '<span class="contador">' + o[2] + '</span>' : '') + '</button>';
+      }).join('') + '</div>';
+    }
+    function tabla(columnas, filas, vacio, pie) {
+      if (!filas.length) return '<div class="vacio">' + vacio + '</div>';
+      return '<div class="tabla-cont"><table><thead><tr>' + columnas.map(function (c) {
+        var t = typeof c === 'string' ? c : c[0];
+        var cls = typeof c === 'string' ? '' : c[1];
+        return '<th class="' + cls + '">' + esc(t) + '</th>';
+      }).join('') + '</tr></thead><tbody>' + filas.join('') + '</tbody>' + (pie || '') + '</table></div>';
+    }
+    function kpi(etq, val, det, tono) {
+      return '<div class="kpi' + (tono ? ' kpi-' + tono : '') + '"><p class="kpi-etq">' + esc(etq) + '</p><p class="kpi-val">' + esc(val) +
+        '</p><p class="kpi-det">' + esc(det) + '</p></div>';
+    }
+    function badge(txt, tono) { return '<span class="badge b-' + tono + '">' + esc(txt) + '</span>'; }
+    function estadoVenta(e) {
+      if (e === 'Cobrada') return badge('Cobrada', 'ok');
+      if (e === 'Pendiente') return badge('Pendiente', 'alerta');
+      return badge(e || '—', 'neutro');
+    }
+    // v2.3: estado del crédito con los textos del xlsx (AL DÍA, ATRASO …, A CONFIRMAR); rojo si el atraso supera P_DIAS_BLOQUEO.
+    function estadoCredito(c) {
+      if (!c || !c.estado) return '—';
+      if (c.estado === 'A CONFIRMAR') return badge('Plan a confirmar', 'neutro');
+      if (c.estado === 'AL DÍA') return badge('Al día', 'ok');
+      if (c.estado === 'CANCELADO') return badge('Cancelado', 'ok');
+      var bloqueo = S.datos && S.datos.cartera && S.datos.cartera.parametros ? Number(S.datos.cartera.parametros.P_DIAS_BLOQUEO) || 0 : 0;
+      return badge(c.estado.charAt(0) + c.estado.slice(1).toLowerCase(), (c.atraso || 0) > bloqueo ? 'error' : 'alerta');
+    }
+    function stockBadge(p) {
+      if (p.stock <= 0) return badge(miles(p.stock), 'error');
+      if (p.stock <= p.stockMinimo) return badge(miles(p.stock), 'alerta');
+      return miles(p.stock);
+    }
+    function boton(texto, accion, extra, clase) {
+      return '<button type="button" class="' + (clase || 'btn-link') + '" data-accion="' + accion + '"' + (extra || '') + '>' + esc(texto) + '</button>';
+    }
+    function attr(nombre, valor) { return ' data-' + nombre + '="' + esc(valor) + '"'; }
+
+    // ═════════════ Vista: Resumen ═════════════
+    function vResumen() {
+      var d = S.datos, k = d.kpis, admin = esAdmin();
+      var cartera = d.cartera || { clientes: [], creditos: [] };
+      var primeros = admin && (!d.productos.length || !d.peluquerias.length || !d.personal.length || !d.servicios.length);
+      var html = cabecera(admin ? 'Resumen' : 'Inicio', etiquetaMes(S.mes), boton('Actualizar datos', 'actualizar', '', 'btn btn-sec'));
+      if (primeros) {
+        html += '<div class="pasos">' +
+          paso('1 · Productos', 'Cargue cada producto con su precio y el stock que tiene hoy.', 'Nuevo producto', 'nuevo-producto', d.productos.length) +
+          paso('2 · Peluquerías', 'Registre las peluquerías a las que vende.', 'Nueva peluquería', 'nueva-peluqueria', d.peluquerias.length) +
+          paso('3 · Salón', 'Cargue al personal con su % y los servicios con su precio.', d.personal.length ? 'Nuevo servicio' : 'Nuevo profesional',
+            d.personal.length ? 'nuevo-servicio' : 'nuevo-profesional', d.personal.length && d.servicios.length) +
+          '</div>';
+      }
+      var vigentes = d.ventas.filter(function (v) { return v.estado !== 'Anulada'; });
+      var totalVentas = vigentes.reduce(function (t, v) { return t + v.total; }, 0);
+      html += '<div class="kpis' + (admin ? '' : ' kpis-4') + '">' +
+        kpi('Ventas a peluquerías', gs(totalVentas), plural(vigentes.length, 'venta', 'ventas') + ' en el período') +
+        kpi('Cartera por cobrar', gs(k.porCobrar), plural(k.cantidadPorCobrar, 'crédito con saldo', 'créditos con saldo') + ' (todos los meses)', k.porCobrar > 0 ? 'alerta' : '') +
+        kpi('Cartera vencida', gs(k.carteraVencida), k.porCobrar > 0 ? pct(k.carteraVencida / k.porCobrar * 100) + ' de la cartera (más de ' + plural((cartera.parametros || {}).P_GRACIA || 0, 'día', 'días') + ' de gracia)' : 'Sin saldos pendientes', k.carteraVencida > 0 ? 'error' : '') +
+        (admin ? kpi('Servicios del salón', gs(k.serviciosMes), plural(k.cantidadServicios, 'servicio', 'servicios') + ' · comisiones ' + gs(k.comisionesMes) + ' (pendiente ' + gs(k.comisionesPendientes) + ')') : '') +
+        kpi('Stock bajo', miles(k.stockBajo), k.stockBajo === 1 ? 'producto en o bajo el mínimo' : 'productos en o bajo el mínimo', k.stockBajo > 0 ? 'error' : '') +
+        (admin ? kpi('Valor del inventario', gs(k.valorInventario), 'a costo · ' + plural(k.productosActivos, 'producto activo', 'productos activos')) : '') +
+        '</div>';
+      // v2.3: pendientes por completar o confirmar (nunca se completan con supuestos).
+      if (admin && d.pendientesPanel && d.pendientesPanel.length) {
+        html += '<section class="panel mt"><div class="panel-cab"><h2>Pendientes</h2>' + boton('Ver todo', 'ir', attr('destino', 'sistema:pendientes')) + '</div><ul class="lista-pend">' +
+          d.pendientesPanel.slice(0, 8).map(function (p) { return '<li><span class="pend-n">' + miles(p.cantidad) + '</span> ' + esc(p.titulo) + '</li>'; }).join('') + '</ul></section>';
+      }
+
+      var bajos = d.productos.filter(function (p) { return p.activo && p.stock <= p.stockMinimo; })
+        .sort(function (a, b) { return (a.stock - a.stockMinimo) - (b.stock - b.stockMinimo); }).slice(0, 8);
+      var filasBajos = bajos.map(function (p) {
+        return '<tr><td><div class="fuerte">' + esc(p.nombre) + '</div><div class="det">' + esc(p.marca || '—') + '</div></td><td class="num">' +
+          stockBadge(p) + '</td><td class="num">' + miles(p.stockMinimo) + '</td><td class="acciones">' + boton('Ingreso', 'movimiento', attr('codigo', p.codigo)) + '</td></tr>';
+      });
+      // v2.2: cobranza priorizada por saldo vencido (fuente: Cartera; los cobros se registran con recibo y van a las cuotas).
+      var prioridad = cartera.clientes.filter(function (c) { return c.saldo > 0; }).slice(0, 6);
+      var filasCobrar = prioridad.map(function (c) {
+        return '<tr><td><div class="fuerte">' + esc(c.nombre) + '</div><div class="det">' + (MB && MB.ext.badgeEstado ? MB.ext.badgeEstado(c.estado) : esc(c.estado)) +
+          (c.atraso > 0 ? ' · ' + plural(c.atraso, 'día', 'días') + ' de atraso' : '') + '</div></td><td class="num"><div>' + gs(c.saldo) + '</div>' +
+          (c.vencido > 0 ? '<div class="det negativo">vencido ' + gs(c.vencido) + '</div>' : '') + '</td><td class="acciones">' +
+          boton('Cobrar', 'cobro', attr('cliente', c.codigo)) + boton('Ficha', 'ficha', attr('codigo', c.codigo)) + '</td></tr>';
+      });
+      html += '<div class="grilla-2 mt">' +
+        '<section class="panel"><h2>Stock bajo</h2>' + tabla(['Producto', ['Stock', 'num'], ['Mín.', 'num'], ''], filasBajos, 'Todos los productos activos están por encima de su stock mínimo.') + '</section>' +
+        '<section class="panel"><div class="panel-cab"><h2>Cobranza</h2>' + boton('Ver cartera', 'ir', attr('destino', 'cartera:clientas')) + '</div>' +
+        tabla(['Peluquería', ['Saldo', 'num'], ''], filasCobrar, 'No hay saldos pendientes de cobro.') + '</section></div>';
+
+      var porCliente = {};
+      d.ventas.forEach(function (v) {
+        if (v.estado === 'Anulada') return;
+        var c = porCliente[v.codigoCliente] || (porCliente[v.codigoCliente] = { nombre: v.cliente, total: 0, n: 0 });
+        c.total += v.total; c.n += 1;
+      });
+      var ranking = Object.keys(porCliente).map(function (k2) { return porCliente[k2]; })
+        .sort(function (a, b) { return b.total - a.total; }).slice(0, 6);
+      var filasCli = ranking.map(function (c) {
+        return '<tr><td class="fuerte">' + esc(c.nombre) + '</td><td class="num">' + miles(c.n) + '</td><td class="num">' + gs(c.total) + '</td></tr>';
+      });
+      var segundo;
+      if (admin) {
+        var filasProf = d.comisiones.map(function (c) {
+          return '<tr><td class="fuerte">' + esc(c.nombre) + '</td><td class="num">' + miles(c.servicios) + '</td><td class="num">' + gs(c.facturado) + '</td></tr>';
+        });
+        segundo = '<section class="panel"><h2>Servicios por profesional</h2>' + tabla(['Profesional', ['Servicios', 'num'], ['Facturado', 'num']], filasProf, 'Sin servicios en ' + etiquetaMes(S.mes) + '.') + '</section>';
+      } else {
+        var limite = sumarDias(d.hoy, 7);
+        var proximos = cartera.creditos.filter(function (c) { return c.saldo > 0 && c.proximoVto && c.proximoVto <= limite; })
+          .sort(function (a, b) { return a.proximoVto < b.proximoVto ? -1 : 1; }).slice(0, 8);
+        var filasVto = proximos.map(function (c) {
+          return '<tr><td><div class="fuerte">' + esc(c.cliente) + '</div><div class="det">' + esc(c.id) + '</div></td><td>' + fecha(c.proximoVto) + '</td><td class="num">' + gs(c.aCobrar) +
+            '</td><td class="acciones">' + boton('Cobrar', 'cobro', attr('credito', c.id)) + '</td></tr>';
+        });
+        segundo = '<section class="panel"><h2>Vencimientos de la semana</h2>' + tabla(['Peluquería', 'Vence', ['Cuota', 'num'], ''], filasVto, 'No hay cuotas que venzan en los próximos 7 días.') + '</section>';
+      }
+      html += '<div class="grilla-2 mt">' +
+        '<section class="panel"><h2>Ventas por peluquería</h2>' + tabla(['Peluquería', ['Ventas', 'num'], ['Total', 'num']], filasCli, 'Sin ventas en ' + etiquetaMes(S.mes) + '.') + '</section>' +
+        segundo + '</div>';
+      if (admin) {
+        html += '<p class="nota-pie">Registro de nuevos correos: <strong>' + (d.config.registroAbierto ? 'abierto' : 'cerrado') +
+          '</strong> (se cambia en Sistema › Usuarias). Facturación electrónica: ' + esc(String(d.config.sifen || '').toLowerCase()) +
+          ' · WhatsApp: ' + esc(String(d.config.whatsapp || '').toLowerCase()) + ' · versión ' + esc(d.config.version || '') + '.</p>';
+      }
+      return html;
+    }
+    function paso(titulo, texto, accionTxt, accion, hecho) {
+      return '<div class="paso"><p class="eyebrow">' + (hecho ? 'Listo' : 'Pendiente') + '</p><h3>' + esc(titulo) + '</h3><p>' + esc(texto) + '</p>' +
+        boton(accionTxt, accion, '', 'btn btn-sec') + '</div>';
+    }
+
+    // ═════════════ Vista: Inventario ═════════════
+    function vInventario() {
+      var acciones = boton('Registrar movimiento', 'movimiento', '', 'btn btn-sec') + (esAdmin() ? boton('Nuevo producto', 'nuevo-producto', '', 'btn') : '');
+      var html = cabecera('Inventario', 'Stock de productos', acciones);
+      html += subtabs('inventario', [['productos', 'Productos'], ['movimientos', 'Movimientos']]);
+      if (S.sub.inventario === 'productos') {
+        html += '<div class="barra-herr"><input type="search" id="buscar-producto" placeholder="Buscar por producto, marca, categoría o código" value="' +
+          esc(S.filtro.productos) + '" autocomplete="off"><label class="check"><input type="checkbox" id="ver-inactivos"' +
+          (S.filtro.inactivos ? ' checked' : '') + '> Mostrar inactivos</label></div><div id="tabla-productos">' + tablaProductos() + '</div>';
+      } else {
+        var filas = S.datos.movimientos.map(function (m) {
+          return '<tr><td class="cod">' + esc(m.id) + '</td><td>' + fecha(m.fecha) + '</td><td>' + esc(m.tipo) + '</td><td><div class="fuerte">' +
+            esc(m.producto) + '</div><div class="det">' + esc(m.codigo) + '</div></td><td class="num ' + (m.cantidad < 0 ? 'negativo' : 'positivo') + '">' +
+            (m.cantidad > 0 ? '+' : '') + miles(m.cantidad) + '</td><td>' + esc(m.referencia || '—') + '</td><td><div>' + esc(m.nota || '') +
+            '</div><div class="det">' + esc(m.usuario) + '</div></td></tr>';
+        });
+        html += tabla(['N°', 'Fecha', 'Tipo', 'Producto', ['Cantidad', 'num'], 'Referencia', 'Nota / usuario'], filas,
+          'Todavía no hay movimientos. Se generan al crear productos con stock, registrar ingresos, ventas o ajustes.');
+        if (filas.length) html += '<p class="nota-pie">Se muestran los últimos 200 movimientos. El historial completo está en la hoja «Movimientos de stock».</p>';
+      }
+      return html;
+    }
+    function tablaProductos() {
+      var q = norm(S.filtro.productos).trim();
+      var lista = S.datos.productos.filter(function (p) {
+        if (!S.filtro.inactivos && !p.activo) return false;
+        if (!q) return true;
+        return norm([p.codigo, p.nombre, p.marca, p.categoria, p.presentacion].join(' ')).indexOf(q) >= 0;
+      });
+      var admin = esAdmin(); // v2.2: las operativas no reciben ni ven costos
+      var filas = lista.map(function (p) {
+        var iva = p.iva === 0 ? 'IVA exenta' : (p.iva === 5 ? 'IVA 5%' : '');
+        return '<tr class="' + (p.activo ? '' : 'fila-anulada') + '"><td class="cod">' + esc(p.codigo) + '</td><td><div class="fuerte">' + esc(p.nombre) +
+          '</div><div class="det">' + esc([p.presentacion, p.categoria, iva].filter(Boolean).join(' · ') || '—') + (p.activo ? '' : ' · inactivo') + '</div></td><td>' +
+          esc(p.marca || '—') + '</td>' + (admin ? '<td class="num">' + gs(p.costo) + '</td>' : '') + '<td class="num">' + gs(p.precio) + '</td><td class="num">' + stockBadge(p) +
+          '</td><td class="num">' + miles(p.stockMinimo) + '</td><td class="acciones">' + (admin ? boton('Editar', 'editar-producto', attr('codigo', p.codigo)) : '') +
+          (p.activo ? boton('Movimiento', 'movimiento', attr('codigo', p.codigo)) : '') + '</td></tr>';
+      });
+      var vacio = S.datos.productos.length ? 'Ningún producto coincide con la búsqueda.' : 'Aún no hay productos.' + (admin ? ' Use «Nuevo producto» para cargar el primero.' : '');
+      var cols = ['Código', 'Producto', 'Marca'].concat(admin ? [['Costo', 'num']] : []).concat([['Precio', 'num'], ['Stock', 'num'], ['Mín.', 'num'], '']);
+      return tabla(cols, filas, vacio);
+    }
+
+    // ═════════════ Vista: Ventas ═════════════
+    function ventaNueva() {
+      return {
+        id: uid(), fecha: hoyISO(), cliente: '', condicion: 'Contado', nota: '', items: [], linea: { codigo: '', cantidad: '1', precio: '' },
+        // v2.2 contado: medio de pago, N° de operación y N° de factura emitida aparte (si no, factura electrónica automática)
+        medioPago: 'EFECTIVO', nroOperacion: '', nroComprobante: '',
+        // v2.2 crédito: plan de pagos y cobro de la entrega
+        plan: { entrega: '', cuotas: '4', frecuencia: 'SEMANAL', primerVto: '', moraPactada: false },
+        cobrarEntrega: true, entregaMedio: 'EFECTIVO', entregaRecibo: '', entregaOperacion: '',
+      };
+    }
+    function puedeAnularVenta(v) {
+      if (v.estado === 'Anulada') return false;
+      if (esAdmin()) return true;
+      return String(v.usuario || '').toLowerCase() === S.email && v.fecha === S.datos.hoy; // el servidor lo vuelve a validar
+    }
+    function detalleCondicion(v) {
+      var partes = [plural(v.unidades, 'unidad', 'unidades')];
+      if (v.condicion === 'Crédito') {
+        partes.push('Crédito' + (v.credito ? ' ' + v.credito.id : ''));
+        if (v.credito && v.estado === 'Pendiente') partes.push('saldo ' + gs(v.credito.saldo));
+      } else {
+        partes.push('Contado' + (v.medioPago ? ' · ' + v.medioPago.toLowerCase() : ''));
+      }
+      if (v.nroComprobante) partes.push('Fact. ' + v.nroComprobante);
+      return esc(partes.join(' · '));
+    }
+    function vVentas() {
+      var d = S.datos, admin = esAdmin();
+      var html = cabecera('Ventas a peluquerías', etiquetaMes(S.mes), boton('Nueva peluquería', 'nueva-peluqueria', '', 'btn btn-sec'));
+      html += subtabs('ventas', [['nueva', 'Nueva venta'], ['historial', 'Ventas del mes'], ['cobrar', 'Por cobrar', d.pendientes.length || ''], ['peluquerias', 'Peluquerías']]);
+      var sub = S.sub.ventas;
+      if (sub === 'nueva') return html + formVenta();
+      if (sub === 'historial') {
+        var facturar = admin && d.config.sifen && d.config.sifen !== 'APAGADO';
+        var filas = d.ventas.map(function (v) {
+          var anulada = v.estado === 'Anulada';
+          var situacion = v.credito && v.estado === 'Pendiente' && v.credito.estado && v.credito.estado !== 'AL DÍA' ? ' ' + estadoCredito(v.credito) : '';
+          return '<tr class="' + (anulada ? 'fila-anulada' : '') + '"><td class="cod">' + esc(v.id) + '</td><td>' + fecha(v.fecha) + '</td><td><div class="fuerte">' + esc(v.cliente) +
+            '</div><div class="det">' + detalleCondicion(v) + '</div></td><td class="num">' + gs(v.total) + '</td><td>' +
+            estadoVenta(v.estado) + situacion + '</td><td class="acciones">' + boton('Ver', 'ver-venta', attr('id', v.id)) +
+            (v.estado === 'Pendiente' ? boton('Cobrar', 'cobrar-venta', attr('id', v.id)) : '') +
+            (facturar && !anulada && !v.nroComprobante ? boton('Factura', 'emitir-factura', attr('id', v.id)) : '') +
+            (puedeAnularVenta(v) ? boton('Anular', 'anular-venta', attr('id', v.id), 'btn-link peligro') : '') + '</td></tr>';
+        });
+        var vigentes = d.ventas.filter(function (v) { return v.estado !== 'Anulada'; });
+        var pie = filas.length ? '<tfoot><tr><td colspan="3">Total del mes (sin anuladas)</td><td class="num">' + gs(vigentes.reduce(function (t, v) { return t + v.total; }, 0)) + '</td><td colspan="2"></td></tr></tfoot>' : '';
+        return html + tabla(['N°', 'Fecha', 'Peluquería', ['Total', 'num'], 'Estado', ''], filas, 'No hay ventas registradas en ' + etiquetaMes(S.mes) + '.', pie);
+      }
+      if (sub === 'cobrar') {
+        var totalSaldo = 0;
+        var filasC = d.pendientes.map(function (v) {
+          var c = v.credito || null;
+          var saldo = c ? c.saldo : v.total;
+          totalSaldo += saldo;
+          var atraso = c ? c.atraso : diasEntre(v.fecha, d.hoy);
+          var sit = c ? estadoCredito(c) + (atraso > 0 ? '<div class="det">' + plural(atraso, 'día', 'días') + ' de atraso</div>' : '') : '—';
+          return '<tr><td class="cod">' + esc(v.id) + '</td><td>' + fecha(v.fecha) + '</td><td><div class="fuerte">' + esc(v.cliente) + '</div><div class="det">' + (c ? esc(c.id) : '') + '</div></td><td>' +
+            sit + '</td><td class="num">' + gs(saldo) + '<div class="det">de ' + gs(v.total) + '</div></td><td class="acciones">' + boton('Ver', 'ver-venta', attr('id', v.id)) +
+            boton('Cobrar', 'cobrar-venta', attr('id', v.id)) + '</td></tr>';
+        });
+        var pieC = filasC.length ? '<tfoot><tr><td colspan="4">Saldo de ventas a crédito</td><td class="num">' + gs(totalSaldo) + '</td><td></td></tr></tfoot>' : '';
+        return html + tabla(['N°', 'Fecha', 'Peluquería', 'Situación', ['Saldo', 'num'], ''], filasC, 'No hay ventas a crédito pendientes de cobro.', pieC) +
+          '<p class="nota-pie">Cada cobro se registra con su recibo o N° de operación y se aplica solo: primero la entrega, después la cuota más antigua. ' +
+          'La venta pasa a «Cobrada» al cancelar el saldo. Saldos históricos y la cartera completa: ' + boton('Cartera', 'ir', attr('destino', 'cartera:clientas')) + '</p>';
+      }
+      var filasP = d.peluquerias.map(function (c) {
+        var cred = c.saldo > 0 || c.estadoCredito ? (MB && MB.ext.badgeEstado ? MB.ext.badgeEstado(c.estadoCredito) : esc(c.estadoCredito)) + (c.saldo > 0 ? '<div class="det">saldo ' + gs(c.saldo) + '</div>' : '') : '—';
+        return '<tr class="' + (c.activo ? '' : 'fila-anulada') + '"><td class="cod">' + esc(c.codigo) + (c.legado ? '<div class="det">' + esc(c.legado) + '</div>' : '') + '</td><td><div class="fuerte">' + esc(c.nombre) + '</div><div class="det">' +
+          esc(c.contacto || '') + (c.activo ? '' : ' · inactiva') + '</div></td><td>' + esc(c.telefono || '—') + ((c.telefono || c.celular) && !c.celular ? '<div class="det negativo">sin WhatsApp válido</div>' : '') +
+          '</td><td>' + esc(c.categoria || '—') + '</td><td>' + cred + '</td><td class="ocultar-movil">' + esc(c.ruc || (c.ci ? 'CI ' + c.ci : '—')) +
+          '</td><td class="acciones">' + boton('Editar', 'editar-peluqueria', attr('codigo', c.codigo)) + boton('Ficha', 'ficha', attr('codigo', c.codigo)) + '</td></tr>';
+      });
+      return html + tabla(['Código', 'Peluquería', 'Teléfono', 'Categoría', 'Crédito', ['RUC / CI', 'ocultar-movil'], ''], filasP, 'Aún no hay peluquerías. Use «Nueva peluquería».');
+    }
+    function opcionesProductos(seleccionado, soloConStock, reservado) {
+      var grupos = {}, orden = [];
+      S.datos.productos.forEach(function (p) {
+        if (!p.activo) return;
+        var g = p.marca || 'Sin marca';
+        if (!grupos[g]) { grupos[g] = []; orden.push(g); }
+        grupos[g].push(p);
+      });
+      var html = '<option value="">Seleccione un producto…</option>';
+      orden.forEach(function (g) {
+        html += '<optgroup label="' + esc(g) + '">' + grupos[g].map(function (p) {
+          var disp = p.stock - (reservado ? reservado(p.codigo) : 0);
+          var sin = soloConStock && disp <= 0;
+          return '<option value="' + esc(p.codigo) + '"' + (p.codigo === seleccionado ? ' selected' : '') + (sin ? ' disabled' : '') + '>' +
+            esc(p.nombre) + (p.presentacion ? ' · ' + esc(p.presentacion) : '') + ' — ' + (sin ? 'sin stock' : 'stock ' + miles(disp)) + '</option>';
+        }).join('') + '</optgroup>';
+      });
+      return html;
+    }
+    function reservadoEnVenta(codigo) {
+      return S.venta.items.reduce(function (t, i) { return t + (i.codigo === codigo ? i.cantidad : 0); }, 0);
+    }
+    function formVenta() {
+      var d = S.datos, v = S.venta;
+      if (!d.productos.some(function (p) { return p.activo; }) || !d.peluquerias.some(function (c) { return c.activo; })) {
+        return '<div class="vacio">Para registrar ventas necesita al menos un producto activo y una peluquería.<br><br>' +
+          boton('Nuevo producto', 'nuevo-producto', '', 'btn btn-sec') + ' ' + boton('Nueva peluquería', 'nueva-peluqueria', '', 'btn btn-sec') + '</div>';
+      }
+      var clientes = '<option value="">Seleccione una peluquería…</option>' + d.peluquerias.filter(function (c) { return c.activo; }).map(function (c) {
+        return '<option value="' + esc(c.codigo) + '"' + (c.codigo === v.cliente ? ' selected' : '') + '>' + esc(c.nombre) + (c.ciudad ? ' · ' + esc(c.ciudad) : '') + '</option>';
+      }).join('');
+      var total = 0;
+      var filas = v.items.map(function (it, i) {
+        var sub = it.cantidad * it.precio;
+        total += sub;
+        return '<tr><td><div class="fuerte">' + esc(it.nombre) + '</div><div class="det">' + esc(it.codigo) + (it.marca ? ' · ' + esc(it.marca) : '') + '</div></td><td class="num">' +
+          miles(it.cantidad) + '</td><td class="num">' + gs(it.precio) + '</td><td class="num">' + gs(sub) + '</td><td class="acciones">' +
+          boton('Quitar', 'quitar-linea', attr('i', i), 'btn-link peligro') + '</td></tr>';
+      });
+      var p = buscar(d.productos, v.linea.codigo);
+      return '<section class="panel"><form id="form-venta" novalidate autocomplete="off">' +
+        '<div class="form-grid">' +
+        '<div class="campo c-3"><label for="v-fecha">Fecha</label><input id="v-fecha" type="date" data-campo="venta.fecha" value="' + esc(v.fecha) + '" max="' + esc(d.hoy) + '"></div>' +
+        '<div class="campo c-6"><label for="v-cliente">Peluquería</label><div class="con-boton"><select id="v-cliente" data-campo="venta.cliente">' + clientes + '</select>' +
+        boton('Nueva', 'nueva-peluqueria', attr('origen', 'venta'), 'btn btn-sec') + '</div></div>' +
+        '<div class="campo c-3"><label>Condición</label><div class="segmentado">' +
+        ['Contado', 'Crédito'].map(function (c) { return '<button type="button" data-accion="condicion" data-valor="' + c + '" aria-pressed="' + (v.condicion === c) + '">' + c + '</button>'; }).join('') +
+        '</div></div></div>' +
+        '<div class="separador"></div><p class="eyebrow">Agregar producto</p>' +
+        '<div class="form-grid mt">' +
+        '<div class="campo c-6"><label for="v-producto">Producto</label><select id="v-producto" data-campo="venta.linea.codigo">' +
+        opcionesProductos(v.linea.codigo, true, reservadoEnVenta) + '</select><span class="ayuda" id="v-disponible">' + textoDisponible(p) + '</span></div>' +
+        '<div class="campo c-2"><label for="v-cantidad">Cantidad</label><input id="v-cantidad" data-tipo="entero" inputmode="numeric" data-campo="venta.linea.cantidad" value="' + esc(v.linea.cantidad) + '"></div>' +
+        '<div class="campo c-2"><label for="v-precio">Precio unit. (Gs.)</label><input id="v-precio" data-tipo="gs" inputmode="numeric" data-campo="venta.linea.precio" value="' + esc(v.linea.precio) + '"></div>' +
+        '<div class="campo c-2"><label class="espaciador" aria-hidden="true">Agregar</label>' + boton('Agregar', 'agregar-linea', '', 'btn btn-sec') + '</div>' +
+        '</div><p class="error-linea" id="error-linea" role="alert"></p>' +
+        tabla(['Producto', ['Cant.', 'num'], ['Precio unit.', 'num'], ['Subtotal', 'num'], ''], filas, 'Agregue los productos de la venta.') +
+        '<div class="total-fila"><span>' + (v.condicion === 'Crédito' ? 'Subtotal de productos' : 'Total') + '</span><strong>' + gs(total) + '</strong></div>' +
+        (v.condicion === 'Crédito' ? seccionCredito(v, total) : seccionContado(v)) +
+        '<div class="campo mt"><label for="v-nota">Nota (opcional)</label><input id="v-nota" maxlength="300" data-campo="venta.nota" value="' + esc(v.nota) + '" placeholder="Ej.: forma de entrega"></div>' +
+        '<div class="form-acciones">' + boton('Limpiar', 'limpiar-venta', '', 'btn btn-sec') + '<button type="submit" class="btn">' +
+        (v.condicion === 'Crédito' ? 'Revisar plan y registrar' : 'Registrar venta') + '</button></div>' +
+        '</form></section>';
+    }
+    // v2.2: datos del cobro de una venta al contado (medio, N° de operación) y factura emitida aparte.
+    function seccionContado(v) {
+      var medios = (S.datos.cartera && S.datos.cartera.medios) || ['EFECTIVO'];
+      var sifen = S.datos.config.sifen || '';
+      return '<div class="separador"></div><p class="eyebrow">Cobro y comprobante</p><div class="form-grid mt">' +
+        '<div class="campo c-4"><label for="v-medio">Medio de pago</label><select id="v-medio" data-campo="venta.medioPago">' +
+        medios.map(function (m) { return '<option value="' + esc(m) + '"' + (m === v.medioPago ? ' selected' : '') + '>' + esc(m) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="campo c-4" id="v-op-campo"' + (v.medioPago === 'EFECTIVO' ? ' hidden' : '') + '><label for="v-op">N° de operación / referencia</label>' +
+        '<input id="v-op" maxlength="40" data-campo="venta.nroOperacion" value="' + esc(v.nroOperacion) + '" placeholder="Para conciliar con el extracto"></div>' +
+        '<div class="campo c-4"><label for="v-fact">N° de factura (solo si la emitió aparte)</label><input id="v-fact" maxlength="20" data-campo="venta.nroComprobante" value="' +
+        esc(v.nroComprobante) + '" placeholder="001-001-0000123"><span class="ayuda">' +
+        (sifen === 'APAGADO' ? 'Facturación electrónica apagada.' : 'Vacío: la factura electrónica se genera sola' + (sifen === 'SIMULACIÓN' ? ' (hoy en modo simulación: no se envía a SIFEN).' : '.')) +
+        '</span></div></div>';
+    }
+    function seccionCredito(v, subtotal) {
+      if (MB && MB.ext.seccionCredito) return MB.ext.seccionCredito(v, subtotal);
+      return '<p class="error-linea">No se pudo cargar el módulo de cartera. Recargue la página.</p>';
+    }
+    function textoDisponible(p) {
+      if (!p) return 'Elija un producto para ver su stock.';
+      var par = S.datos.cartera && S.datos.cartera.parametros;
+      var desc = par && par.P_DESC_VEND !== null && par.P_DESC_VEND !== undefined ? ' · descuento hasta ' + pct(par.P_DESC_VEND * 100) + ' (' + pct(par.P_DESC_MAX * 100) + ' con autorización)' : '';
+      return 'Disponible: ' + miles(p.stock - reservadoEnVenta(p.codigo)) + ' · Precio de lista: ' + gs(p.precio) + desc;
+    }
+
+    // ═════════════ Vista: Salón ═════════════
+    function servicioNuevo() {
+      return { id: uid(), fecha: hoyISO(), profesional: '', servicio: '', precio: '', porcentaje: '', pctManual: false, cliente: '', nota: '' };
+    }
+    function vSalon() {
+      var d = S.datos;
+      var admin = esAdmin();
+      var html = cabecera('Salón', etiquetaMes(S.mes), admin ? boton('Nuevo profesional', 'nuevo-profesional', '', 'btn btn-sec') + boton('Nuevo servicio', 'nuevo-servicio', '', 'btn btn-sec') : '');
+      html += subtabs('salon', admin ? [['registrar', 'Registrar servicio'], ['historial', 'Servicios del mes'], ['personal', 'Personal'], ['catalogo', 'Catálogo de servicios']]
+        : [['registrar', 'Registrar servicio'], ['historial', 'Servicios del mes']]);
+      var sub = S.sub.salon;
+      if (!admin && sub !== 'registrar' && sub !== 'historial') sub = S.sub.salon = 'registrar';
+      if (sub === 'registrar') return html + formServicio();
+      if (sub === 'historial') {
+        var filas = d.realizados.map(function (r) {
+          var anulado = r.estado === 'Anulado';
+          if (!admin) {
+            return '<tr class="' + (anulado ? 'fila-anulada' : '') + '"><td class="cod">' + esc(r.id) + '</td><td>' + fecha(r.fecha) + '</td><td><div class="fuerte">' + esc(r.servicio) +
+              '</div><div class="det">' + esc(r.cliente || 'Sin cliente') + '</div></td><td>' + esc(r.profesional) + '</td><td class="num">' + gs(r.precio) + '</td><td>' +
+              (anulado ? badge('Anulado', 'neutro') : badge('Registrado', 'ok')) + '</td></tr>';
+          }
+          var est = anulado ? badge('Anulado', 'neutro') : (r.liquidado ? badge('Liquidado ' + fecha(r.liquidado), 'ok') : badge('Pendiente', 'alerta'));
+          return '<tr class="' + (anulado ? 'fila-anulada' : '') + '"><td class="cod">' + esc(r.id) + '</td><td>' + fecha(r.fecha) + '</td><td><div class="fuerte">' + esc(r.servicio) +
+            '</div><div class="det">' + esc(r.cliente || 'Sin cliente') + '</div></td><td>' + esc(r.profesional) + '</td><td class="num">' + gs(r.precio) + '</td><td class="num">' +
+            pct(r.porcentaje) + '</td><td class="num">' + gs(r.comision) + '</td><td>' + est + '</td><td class="acciones">' +
+            (!anulado && !r.liquidado ? boton('Anular', 'anular-servicio', attr('id', r.id), 'btn-link peligro') : '') + '</td></tr>';
+        });
+        if (!admin) return html + tabla(['N°', 'Fecha', 'Servicio / cliente', 'Profesional', ['Precio', 'num'], 'Estado'], filas, 'No hay servicios registrados en ' + etiquetaMes(S.mes) + '.');
+        return html + tabla(['N°', 'Fecha', 'Servicio / cliente', 'Profesional', ['Precio', 'num'], ['%', 'num'], ['Comisión', 'num'], 'Estado', ''], filas,
+          'No hay servicios registrados en ' + etiquetaMes(S.mes) + '.');
+      }
+      if (sub === 'personal') {
+        var filasP = d.personal.map(function (p) {
+          return '<tr class="' + (p.activo ? '' : 'fila-anulada') + '"><td class="cod">' + esc(p.codigo) + '</td><td><div class="fuerte">' + esc(p.nombre) + '</div><div class="det">' +
+            esc(p.rol || '—') + (p.activo ? '' : ' · inactivo') + '</div></td><td class="num">' + pct(p.comision) + '</td><td>' + esc(p.telefono || '—') + '</td><td class="acciones">' +
+            boton('Editar', 'editar-profesional', attr('codigo', p.codigo)) + '</td></tr>';
+        });
+        return html + tabla(['Código', 'Nombre', ['% Comisión', 'num'], 'Teléfono', ''], filasP, 'Aún no hay personal cargado. Use «Nuevo profesional».');
+      }
+      var filasS = d.servicios.map(function (s) {
+        return '<tr class="' + (s.activo ? '' : 'fila-anulada') + '"><td class="cod">' + esc(s.codigo) + '</td><td class="fuerte">' + esc(s.nombre) + (s.activo ? '' : ' <span class="det">· inactivo</span>') +
+          '</td><td class="num">' + gs(s.precio) + '</td><td class="num">' + (s.comision > 0 ? pct(s.comision) : '<span class="det">Según profesional</span>') + '</td><td class="acciones">' +
+          boton('Editar', 'editar-servicio', attr('codigo', s.codigo)) + '</td></tr>';
+      });
+      return html + tabla(['Código', 'Servicio', ['Precio base', 'num'], ['% Comisión', 'num'], ''], filasS, 'Aún no hay servicios. Use «Nuevo servicio».') +
+        '<p class="nota-pie">Regla de comisión: si el servicio tiene un % propio se usa ese; si no, se usa el % del profesional. En cada registro el % se puede ajustar.</p>';
+    }
+    function formServicio() {
+      var d = S.datos, s = S.servicio;
+      var prof = d.personal.filter(function (p) { return p.activo; });
+      var serv = d.servicios.filter(function (x) { return x.activo; });
+      if (!prof.length || !serv.length) {
+        return '<div class="vacio">Para registrar servicios necesita al menos un profesional y un servicio en el catálogo.<br><br>' +
+          boton('Nuevo profesional', 'nuevo-profesional', '', 'btn btn-sec') + ' ' + boton('Nuevo servicio', 'nuevo-servicio', '', 'btn btn-sec') + '</div>';
+      }
+      return '<section class="panel"><form id="form-servicio" novalidate autocomplete="off"><div class="form-grid">' +
+        '<div class="campo c-3"><label for="s-fecha">Fecha</label><input id="s-fecha" type="date" data-campo="servicio.fecha" value="' + esc(s.fecha) + '" max="' + esc(d.hoy) + '"></div>' +
+        '<div class="campo c-5"><label for="s-prof">Profesional</label><select id="s-prof" data-campo="servicio.profesional"><option value="">Seleccione…</option>' +
+        prof.map(function (p) { return '<option value="' + esc(p.codigo) + '"' + (p.codigo === s.profesional ? ' selected' : '') + '>' + esc(p.nombre) + (p.rol ? ' · ' + esc(p.rol) : '') + '</option>'; }).join('') +
+        '</select></div>' +
+        '<div class="campo c-4"><label for="s-serv">Servicio</label><select id="s-serv" data-campo="servicio.servicio"><option value="">Seleccione…</option>' +
+        serv.map(function (x) { return '<option value="' + esc(x.codigo) + '"' + (x.codigo === s.servicio ? ' selected' : '') + '>' + esc(x.nombre) + '</option>'; }).join('') +
+        '</select></div>' +
+        '<div class="campo c-3"><label for="s-precio">Precio cobrado (Gs.)</label><input id="s-precio" data-tipo="gs" inputmode="numeric" data-campo="servicio.precio" value="' + esc(s.precio) + '"></div>' +
+        (esAdmin() ? '<div class="campo c-2"><label for="s-pct">% Comisión</label><input id="s-pct" data-tipo="pct" inputmode="decimal" data-campo="servicio.porcentaje" value="' + esc(s.porcentaje) + '"></div>' +
+        '<div class="campo c-3"><label for="s-comision">Comisión (Gs.)</label><input id="s-comision" readonly tabindex="-1" value=""></div>' : '') +
+        '<div class="campo c-4"><label for="s-cliente">Cliente (opcional)</label><input id="s-cliente" maxlength="80" data-campo="servicio.cliente" value="' + esc(s.cliente) + '"></div>' +
+        '<div class="campo c-12"><span class="ayuda" id="s-ayuda"></span></div>' +
+        '<div class="campo c-12"><label for="s-nota">Nota (opcional)</label><input id="s-nota" maxlength="300" data-campo="servicio.nota" value="' + esc(s.nota) + '"></div>' +
+        '</div><div class="form-acciones">' + boton('Limpiar', 'limpiar-servicio', '', 'btn btn-sec') + '<button type="submit" class="btn">Registrar servicio</button></div></form></section>';
+    }
+    function sugerirPorcentaje() {
+      var s = S.servicio, d = S.datos;
+      var serv = buscar(d.servicios, s.servicio), prof = buscar(d.personal, s.profesional);
+      if (serv && serv.comision > 0) return { valor: serv.comision, origen: 'según el servicio «' + serv.nombre + '»' };
+      if (prof) return { valor: prof.comision, origen: 'según el % de ' + prof.nombre };
+      return null;
+    }
+    function actualizarComision() {
+      var s = S.servicio;
+      var precio = enteroDe(s.precio), p = decimalDe(s.porcentaje);
+      var campo = $('#s-comision'), ayuda = $('#s-ayuda');
+      if (!campo) { if (ayuda) ayuda.textContent = 'La comisión la calcula el sistema con la regla vigente.'; return; }
+      campo.value = !isNaN(precio) && !isNaN(p) ? gs(Math.round(precio * p / 100)) : '';
+      var sug = sugerirPorcentaje();
+      ayuda.textContent = sug ? (s.pctManual ? 'Porcentaje ajustado a mano (sugerido: ' + pct(sug.valor) + ', ' + sug.origen + ').' : 'Porcentaje sugerido ' + sug.origen + '. Puede ajustarlo.') :
+        'Elija profesional y servicio: el % de comisión se completa solo.';
+    }
+
+    // ═════════════ Vista: Comisiones ═════════════
+    function vComisiones() {
+      var d = S.datos;
+      var html = cabecera('Comisiones', etiquetaMes(S.mes));
+      var filas = d.comisiones.map(function (c) {
+        return '<tr><td><div class="fuerte">' + esc(c.nombre) + '</div><div class="det">' + esc(c.rol || c.codigo) + '</div></td><td class="num">' + miles(c.servicios) + '</td><td class="num">' +
+          gs(c.facturado) + '</td><td class="num">' + gs(c.comision) + '</td><td class="num">' + gs(c.liquidado) + '</td><td class="num">' +
+          (c.pendiente > 0 ? badge(gs(c.pendiente), 'alerta') : gs(0)) + '</td><td class="acciones">' +
+          (c.pendiente > 0 ? boton('Liquidar', 'liquidar', attr('codigo', c.codigo)) : '') + '</td></tr>';
+      });
+      var tot = d.comisiones.reduce(function (t, c) { t.f += c.facturado; t.c += c.comision; t.l += c.liquidado; t.p += c.pendiente; return t; }, { f: 0, c: 0, l: 0, p: 0 });
+      var pie = filas.length ? '<tfoot><tr><td colspan="2">Total</td><td class="num">' + gs(tot.f) + '</td><td class="num">' + gs(tot.c) + '</td><td class="num">' + gs(tot.l) +
+        '</td><td class="num">' + gs(tot.p) + '</td><td></td></tr></tfoot>' : '';
+      html += '<section class="panel"><h2>Resumen por profesional</h2>' +
+        tabla(['Profesional', ['Servicios', 'num'], ['Facturado', 'num'], ['Comisión', 'num'], ['Liquidado', 'num'], ['Pendiente', 'num'], ''], filas,
+          'Sin servicios registrados en ' + etiquetaMes(S.mes) + '.', pie) + '</section>';
+
+      var opciones = '<option value="">Todos los profesionales</option>' + d.comisiones.map(function (c) {
+        return '<option value="' + esc(c.codigo) + '"' + (S.filtro.profesional === c.codigo ? ' selected' : '') + '>' + esc(c.nombre) + '</option>';
+      }).join('');
+      var detalle = d.realizados.filter(function (r) { return r.estado !== 'Anulado' && (!S.filtro.profesional || r.codigoProfesional === S.filtro.profesional); });
+      var filasD = detalle.map(function (r) {
+        return '<tr><td>' + fecha(r.fecha) + '</td><td class="cod">' + esc(r.id) + '</td><td><div class="fuerte">' + esc(r.servicio) + '</div><div class="det">' + esc(r.profesional) +
+          (r.cliente ? ' · ' + esc(r.cliente) : '') + '</div></td><td class="num">' + gs(r.precio) + '</td><td class="num">' + pct(r.porcentaje) + '</td><td class="num">' + gs(r.comision) +
+          '</td><td>' + (r.liquidado ? badge('Liquidado ' + fecha(r.liquidado), 'ok') : badge('Pendiente', 'alerta')) + '</td></tr>';
+      });
+      html += '<section class="panel mt"><div class="panel-cab"><h2>Detalle de servicios</h2><div style="min-width:220px"><select id="filtro-profesional" aria-label="Filtrar por profesional">' +
+        opciones + '</select></div></div>' +
+        tabla(['Fecha', 'N°', 'Servicio', ['Precio', 'num'], ['%', 'num'], ['Comisión', 'num'], 'Estado'], filasD, 'Sin servicios para mostrar.') + '</section>';
+      return html;
+    }
+
+    // ═════════════ Modales ═════════════
+    function abrirModal(op) {
+      var m = $('#modal');
+      m.innerHTML = '<div class="modal-caja' + (op.ancho ? ' ancho' : '') + '" role="dialog" aria-modal="true" aria-labelledby="modal-titulo"><form id="modal-form" novalidate autocomplete="off">' +
+        '<div class="modal-cab"><h2 id="modal-titulo">' + esc(op.titulo) + '</h2><button type="button" class="btn-icono" data-accion="cerrar-modal" aria-label="Cerrar">×</button></div>' +
+        '<div class="modal-cuerpo">' + op.cuerpo + '</div><div class="modal-pie"><p class="modal-error" id="modal-error" role="alert"></p>' +
+        '<button type="button" class="btn btn-sec" data-accion="cerrar-modal">' + (op.soloCerrar ? 'Cerrar' : 'Cancelar') + '</button>' +
+        (op.soloCerrar ? '' : '<button type="submit" class="btn' + (op.peligro ? ' btn-peligro' : '') + '" id="modal-aceptar">' + esc(op.aceptar || 'Guardar') + '</button>') +
+        '</div></form></div>';
+      m.hidden = false;
+      document.body.classList.add('sin-scroll');
+      S.modal = { id: op.id || uid(), alAceptar: op.alAceptar, alCambiar: op.alCambiar, alCerrar: op.alCerrar, alExito: op.alExito };
+      if (op.alCambiar) op.alCambiar($('#modal-form'));
+      // Foco inmediato (sin demoras): evita que lo escrito vaya a parar a otro campo.
+      var primero = m.querySelector('.modal-cuerpo input:not([readonly]):not([type=checkbox]), .modal-cuerpo select, .modal-cuerpo textarea');
+      if (primero) primero.focus();
+    }
+    function cerrarModal(silencioso) {
+      var m = $('#modal');
+      if (m.hidden) return;
+      var cerrar = S.modal && S.modal.alCerrar;
+      m.hidden = true;
+      m.innerHTML = '';
+      S.modal = null;
+      document.body.classList.remove('sin-scroll');
+      if (cerrar && !silencioso) cerrar();
+    }
+    function leerForm(form) {
+      var o = {};
+      Array.prototype.forEach.call(form.elements, function (el) {
+        if (!el.name) return;
+        o[el.name] = el.type === 'checkbox' ? el.checked : el.value.trim();
+      });
+      return o;
+    }
+    function enviarModal(form) {
+      if (!S.modal || !S.modal.alAceptar) return;
+      var errorEl = $('#modal-error');
+      errorEl.textContent = '';
+      var btn = $('#modal-aceptar');
+      var modalActual = S.modal;
+      conBoton(btn, 'Guardando…', function () {
+        return modalActual.alAceptar(leerForm(form), modalActual.id);
+      }).then(function (r) {
+        if (S.modal !== modalActual) return;
+        S.modal.alCerrar = null;
+        cerrarModal(true);
+        if (r && r.ok) aplicar(r);
+        if (modalActual.alExito) modalActual.alExito(r);
+      }).catch(function (e) {
+        if (e && e.sesion) return;
+        if (S.modal === modalActual) errorEl.textContent = e.message; else fallo(e);
+      });
+    }
+    function confirmar(op) {
+      return new Promise(function (resolve) {
+        abrirModal({
+          titulo: op.titulo, cuerpo: '<p>' + op.mensaje + '</p>', aceptar: op.aceptar || 'Confirmar', peligro: op.peligro,
+          alAceptar: function () { resolve(true); return Promise.resolve(null); },
+          alCerrar: function () { resolve(false); },
+        });
+      });
+    }
+    function campo(etiqueta, control, cls, ayuda) {
+      return '<div class="campo ' + (cls || 'c-12') + '"><label>' + esc(etiqueta) + '</label>' + control + (ayuda ? '<span class="ayuda">' + esc(ayuda) + '</span>' : '') + '</div>';
+    }
+    function inputGs(nombre, valor) {
+      var v = valor === '' || valor === null || valor === undefined ? '' : miles(valor);
+      return '<input name="' + nombre + '" data-tipo="gs" inputmode="numeric" value="' + esc(v) + '">';
+    }
+    function inputEntero(nombre, valor) { return '<input name="' + nombre + '" data-tipo="entero" inputmode="numeric" value="' + esc(valor) + '">'; }
+    function inputPct(nombre, valor, ph) {
+      var v = valor === '' || valor === null || valor === undefined ? '' : String(valor).replace('.', ',');
+      return '<input name="' + nombre + '" data-tipo="pct" inputmode="decimal" value="' + esc(v) + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : '') + '>';
+    }
+    function checkActivo(activo, texto) {
+      return '<label class="check"><input type="checkbox" name="activo"' + (activo ? ' checked' : '') + '> ' + esc(texto || 'Activo (desmarque para ocultarlo sin borrar su historial)') + '</label>';
+    }
+    function datalist(id, valores) {
+      return '<datalist id="' + id + '">' + valores.map(function (v) { return '<option value="' + esc(v) + '">'; }).join('') + '</datalist>';
+    }
+    function requerir(cond, msg) { if (!cond) throw new Error(msg); }
+
+    function modalProducto(codigo) {
+      var p = codigo ? buscar(S.datos.productos, codigo) : null;
+      function v(k, def) { return p ? p[k] : def; }
+      var cuerpo = '<div class="form-grid">' +
+        (p ? '<div class="c-12"><p class="ficha">Código <strong>' + esc(p.codigo) + '</strong> · Stock actual <strong>' + miles(p.stock) + '</strong> · el stock se modifica con «Registrar movimiento».</p></div>'
+          : campo('Código', '<input name="codigo" maxlength="30" placeholder="Automático (P-0001)">', 'c-4', 'Opcional: puede usar el del proveedor.')) +
+        campo('Producto *', '<input name="nombre" maxlength="120" value="' + esc(v('nombre', '')) + '">', p ? 'c-12' : 'c-8') +
+        campo('Marca / Línea', '<input name="marca" maxlength="60" list="dl-marcas" value="' + esc(v('marca', '')) + '">', 'c-6') +
+        campo('Categoría', '<input name="categoria" maxlength="60" list="dl-categorias" value="' + esc(v('categoria', '')) + '">', 'c-6') +
+        campo('Presentación', '<input name="presentacion" maxlength="40" placeholder="Ej.: 1 L, 250 ml" value="' + esc(v('presentacion', '')) + '">', 'c-4') +
+        campo('Costo unitario (Gs.)', inputGs('costo', v('costo', '')), 'c-4') +
+        campo('Precio a peluquerías (Gs.) *', inputGs('precio', v('precio', '')), 'c-4', 'Con IVA incluido.') +
+        campo('IVA', '<select name="iva">' + [['10%', 10], ['5%', 5], ['Exenta', 0]].map(function (o) {
+          return '<option value="' + o[0] + '"' + ((p ? p.iva : 10) === o[1] ? ' selected' : '') + '>' + o[0] + '</option>';
+        }).join('') + '</select>', 'c-4') +
+        campo('Línea / centro de costo', '<input name="linea" maxlength="60" list="dl-lineas" value="' + esc(v('linea', '')) + '">', 'c-8',
+          'Para el margen por línea del cierre. La línea de equipamiento exige más entrega en ventas a crédito.') +
+        campo('Stock mínimo', inputEntero('stockMinimo', v('stockMinimo', '')), 'c-4', 'Avisa cuando el stock llega a este número.') +
+        (p ? campo('Estado', checkActivo(p.activo), 'c-8') : campo('Stock inicial', inputEntero('stockInicial', ''), 'c-4', 'Unidades que tiene hoy.')) +
+        '</div>' + datalist('dl-marcas', S.datos.marcas) + datalist('dl-categorias', S.datos.categorias) + datalist('dl-lineas', lineasProducto());
+      abrirModal({
+        titulo: p ? 'Editar producto' : 'Nuevo producto', cuerpo: cuerpo, aceptar: p ? 'Guardar cambios' : 'Crear producto',
+        alAceptar: function (f, id) {
+          requerir(f.nombre, 'Complete el nombre del producto.');
+          requerir(!isNaN(enteroDe(f.precio)), 'Ingrese el precio a peluquerías.');
+          return api('guardarProducto', {
+            codigoOriginal: p ? p.codigo : '', codigo: p ? '' : f.codigo, nombre: f.nombre, marca: f.marca, categoria: f.categoria,
+            presentacion: f.presentacion, costo: f.costo === '' ? '' : enteroDe(f.costo), precio: enteroDe(f.precio),
+            stockMinimo: f.stockMinimo === '' ? '' : enteroDe(f.stockMinimo),
+            stockInicial: p || f.stockInicial === '' ? '' : enteroDe(f.stockInicial), activo: p ? f.activo : true,
+            iva: f.iva, linea: f.linea,
+          }, id);
+        },
+      });
+    }
+    function lineasProducto() {
+      var vistas = {}, lista = [];
+      var equip = S.datos.cartera && S.datos.cartera.parametros ? S.datos.cartera.parametros.P_LINEA_EQUIPO : '';
+      [equip].concat(S.datos.productos.map(function (p) { return p.linea; })).forEach(function (l) {
+        var k = String(l || '').trim().toUpperCase();
+        if (k && !vistas[k]) { vistas[k] = true; lista.push(k); }
+      });
+      return lista.sort();
+    }
+
+    function modalMovimiento(codigo) {
+      var d = S.datos;
+      if (!d.productos.some(function (p) { return p.activo; })) { toast('Primero cree un producto.', 'aviso'); return; }
+      var cuerpo = '<div class="form-grid">' +
+        campo('Tipo de movimiento *', '<select name="tipo">' + d.tiposMovimiento.map(function (t) { return '<option value="' + esc(t.clave) + '">' + esc(t.etiqueta) + '</option>'; }).join('') + '</select>', 'c-6') +
+        campo('Fecha *', '<input type="date" name="fecha" value="' + hoyISO() + '" max="' + esc(d.hoy) + '">', 'c-6') +
+        campo('Producto *', '<select name="codigo">' + opcionesProductos(codigo || '', false) + '</select>', 'c-12') +
+        campo('Cantidad *', inputEntero('cantidad', ''), 'c-4') +
+        (esAdmin() ? '<div class="campo c-8" id="mov-costo"><label>Costo unitario de esta compra (Gs.)</label>' + inputGs('costoUnitario', '') + '<span class="ayuda">Opcional: si lo completa, se actualiza el costo del producto.</span></div>' : '') +
+        campo('Nota', '<input name="nota" maxlength="300" placeholder="Ej.: N° de factura del proveedor o motivo del ajuste">', 'c-12') +
+        '<div class="c-12"><p class="ficha" id="mov-resumen"></p></div></div>';
+      abrirModal({
+        titulo: 'Registrar movimiento de stock', cuerpo: cuerpo, aceptar: 'Registrar',
+        alCambiar: function (form) {
+          var f = leerForm(form);
+          var tipo = buscarTipo(f.tipo);
+          var p = buscar(S.datos.productos, f.codigo);
+          if ($('#mov-costo')) $('#mov-costo').hidden = f.tipo !== 'ingreso';
+          var cant = enteroDe(f.cantidad);
+          var res = $('#mov-resumen');
+          if (!p) { res.textContent = 'Seleccione el producto.'; return; }
+          var final = isNaN(cant) ? p.stock : p.stock + tipo.signo * cant;
+          res.innerHTML = 'Stock actual de <strong>' + esc(p.nombre) + '</strong>: ' + miles(p.stock) + (isNaN(cant) ? '' : ' → quedará en <strong>' + miles(final) + '</strong>') +
+            (final < 0 ? ' <span class="negativo">(no alcanza)</span>' : '') + (tipo.notaObligatoria ? ' · Los ajustes requieren una nota con el motivo.' : '');
+        },
+        alAceptar: function (f, id) {
+          var tipo = buscarTipo(f.tipo);
+          var p = buscar(S.datos.productos, f.codigo);
+          var cant = enteroDe(f.cantidad);
+          requerir(p, 'Seleccione el producto.');
+          requerir(cant >= 1, 'Ingrese una cantidad mayor que cero.');
+          requerir(tipo.signo > 0 || cant <= p.stock, 'Stock insuficiente: hay ' + miles(p.stock) + ' unidades de «' + p.nombre + '».');
+          requerir(!tipo.notaObligatoria || f.nota.length >= 3, 'Escriba el motivo del ajuste en «Nota».');
+          return api('registrarMovimiento', {
+            tipo: f.tipo, codigo: f.codigo, cantidad: cant, fecha: f.fecha, nota: f.nota,
+            costoUnitario: esAdmin() && f.tipo === 'ingreso' && f.costoUnitario ? enteroDe(f.costoUnitario) : '',
+          }, id);
+        },
+      });
+    }
+    function buscarTipo(clave) {
+      var t = S.datos.tiposMovimiento.filter(function (x) { return x.clave === clave; })[0];
+      return t || { signo: 1, notaObligatoria: false };
+    }
+
+    // Celular paraguayo → 595XXXXXXXXX (igual que el servidor) para mostrar si sirve para WhatsApp.
+    function whatsappDe(tel) {
+      var d = digitos(tel);
+      if (d.indexOf('00595') === 0) d = d.slice(2);
+      if (d.indexOf('595') === 0) d = d.slice(3);
+      if (d.charAt(0) === '0') d = d.slice(1);
+      return /^9\d{8}$/.test(d) ? '595' + d : '';
+    }
+    function modalPeluqueria(codigo, origen) {
+      var c = codigo ? buscar(S.datos.peluquerias, codigo) : null;
+      var admin = esAdmin();
+      function v(k) { return c ? (c[k] === null || c[k] === undefined ? '' : c[k]) : ''; }
+      var cats = ((S.datos.cartera && S.datos.cartera.categorias) || []).map(function (x) { return x.nombre; });
+      var actual = c ? (c.categoria || 'SIN CATEGORÍA') : 'NUEVA';
+      var selectCat = '<select name="categoria">' + cats.concat(['SIN CATEGORÍA']).map(function (n) {
+        return '<option value="' + esc(n) + '"' + (n === actual ? ' selected' : '') + '>' + esc(n) + '</option>';
+      }).join('') + '</select>';
+      var cuerpo = '<div class="form-grid">' +
+        campo('Peluquería *', '<input name="nombre" maxlength="100" value="' + esc(v('nombre')) + '">', 'c-12') +
+        campo('Contacto', '<input name="contacto" maxlength="80" placeholder="Nombre de la propietaria" value="' + esc(v('contacto')) + '">', 'c-6') +
+        '<div class="campo c-6"><label>Teléfono celular</label><input name="telefono" maxlength="40" inputmode="tel" placeholder="0981 000 000" value="' + esc(v('telefono')) +
+        '"><span class="ayuda" id="pel-wa"></span></div>' +
+        campo('Ciudad', '<input name="ciudad" maxlength="60" value="' + esc(v('ciudad')) + '">', 'c-6') +
+        campo('Dirección', '<input name="direccion" maxlength="150" value="' + esc(v('direccion')) + '">', 'c-6') +
+        campo('RUC', '<input name="ruc" maxlength="20" placeholder="1234567-8" value="' + esc(v('ruc')) + '">', 'c-6', 'Con dígito verificador, sin puntos.') +
+        campo('CI (si no tiene RUC)', '<input name="ci" maxlength="15" inputmode="numeric" value="' + esc(v('ci')) + '">', 'c-6', 'RUC o CI: necesario para la factura electrónica.') +
+        (admin ? campo('Categoría de crédito', selectCat, 'c-6', 'Define límite, entrega mínima, cuotas y frecuencia.')
+          : campo('Categoría de crédito', '<input readonly value="' + esc(actual) + '">', 'c-6', 'La asigna o cambia una administradora.')) +
+        campo('Observación', '<input name="observacion" maxlength="400" value="' + esc(v('observacion')) + '">', 'c-6') +
+        (c ? campo('Estado', checkActivo(c.activo, 'Activa (desmarque para ocultarla sin borrar su historial)'), 'c-12') : '') + '</div>';
+      abrirModal({
+        titulo: c ? 'Editar peluquería' : 'Nueva peluquería', cuerpo: cuerpo, aceptar: c ? 'Guardar cambios' : 'Registrar peluquería',
+        alCambiar: function (form) {
+          var tel = form.elements.telefono.value;
+          var wa = whatsappDe(tel);
+          $('#pel-wa').textContent = !tel.trim() ? 'Celular para recordatorios por WhatsApp.' : (wa ? 'WhatsApp: +' + wa : 'No es un celular válido para WhatsApp (ej.: 0981 123 456).');
+        },
+        alAceptar: function (f, id) {
+          requerir(f.nombre, 'Complete el nombre de la peluquería.');
+          var datos = {
+            codigoOriginal: c ? c.codigo : '', nombre: f.nombre, contacto: f.contacto, telefono: f.telefono, ciudad: f.ciudad,
+            ruc: f.ruc, ci: f.ci, direccion: f.direccion, observacion: f.observacion, activo: c ? f.activo : true,
+          };
+          if (admin) datos.categoria = f.categoria;
+          return api('guardarPeluqueria', datos, id).then(function (r) {
+            if (origen === 'venta' && r.codigo && S.venta) S.venta.cliente = r.codigo;
+            return r;
+          });
+        },
+      });
+    }
+
+    function modalProfesional(codigo) {
+      var p = codigo ? buscar(S.datos.personal, codigo) : null;
+      var cuerpo = '<div class="form-grid">' +
+        campo('Nombre *', '<input name="nombre" maxlength="80" value="' + esc(p ? p.nombre : '') + '">', 'c-8') +
+        campo('% Comisión *', inputPct('comision', p ? p.comision : '', 'Ej.: 40'), 'c-4') +
+        campo('Rol', '<input name="rol" maxlength="60" placeholder="Ej.: Estilista, Colorista" value="' + esc(p ? p.rol : '') + '">', 'c-6') +
+        campo('Teléfono', '<input name="telefono" maxlength="40" inputmode="tel" value="' + esc(p ? p.telefono : '') + '">', 'c-6') +
+        (p ? campo('Estado', checkActivo(p.activo), 'c-12') : '') + '</div>';
+      abrirModal({
+        titulo: p ? 'Editar profesional' : 'Nuevo profesional', cuerpo: cuerpo, aceptar: p ? 'Guardar cambios' : 'Registrar profesional',
+        alAceptar: function (f, id) {
+          var c = decimalDe(f.comision);
+          requerir(f.nombre, 'Complete el nombre.');
+          requerir(!isNaN(c) && c >= 0 && c <= 100, 'El % de comisión debe estar entre 0 y 100.');
+          return api('guardarProfesional', { codigoOriginal: p ? p.codigo : '', nombre: f.nombre, comision: c, rol: f.rol, telefono: f.telefono, activo: p ? f.activo : true }, id);
+        },
+      });
+    }
+
+    function modalServicio(codigo) {
+      var s = codigo ? buscar(S.datos.servicios, codigo) : null;
+      var cuerpo = '<div class="form-grid">' +
+        campo('Servicio *', '<input name="nombre" maxlength="100" placeholder="Ej.: Coloración completa" value="' + esc(s ? s.nombre : '') + '">', 'c-12') +
+        campo('Precio base (Gs.) *', inputGs('precio', s ? s.precio : ''), 'c-6') +
+        campo('% Comisión del servicio', inputPct('comision', s && s.comision > 0 ? s.comision : '', 'Vacío = % del profesional'), 'c-6', 'Déjelo vacío para usar el % de cada profesional.') +
+        (s ? campo('Estado', checkActivo(s.activo), 'c-12') : '') + '</div>';
+      abrirModal({
+        titulo: s ? 'Editar servicio' : 'Nuevo servicio', cuerpo: cuerpo, aceptar: s ? 'Guardar cambios' : 'Registrar servicio',
+        alAceptar: function (f, id) {
+          var c = f.comision === '' ? '' : decimalDe(f.comision);
+          requerir(f.nombre, 'Complete el nombre del servicio.');
+          requerir(!isNaN(enteroDe(f.precio)), 'Ingrese el precio base.');
+          requerir(c === '' || (!isNaN(c) && c >= 0 && c <= 100), 'El % de comisión debe estar entre 0 y 100.');
+          return api('guardarServicio', { codigoOriginal: s ? s.codigo : '', nombre: f.nombre, precio: enteroDe(f.precio), comision: c, activo: s ? f.activo : true }, id);
+        },
+      });
+    }
+
+    function buscarVenta(id) {
+      var todas = S.datos.ventas.concat(S.datos.pendientes);
+      for (var i = 0; i < todas.length; i++) if (todas[i].id === id) return todas[i];
+      return null;
+    }
+    function detalleVenta(v) {
+      var filas = v.items.map(function (it) {
+        return '<tr><td><div class="fuerte">' + esc(it.producto) + '</div><div class="det">' + esc(it.codigo) + '</div></td><td class="num">' + miles(it.cantidad) +
+          '</td><td class="num">' + gs(it.precio) + '</td><td class="num">' + gs(it.subtotal) + '</td></tr>';
+      });
+      var c = v.credito;
+      return '<dl class="dl"><dt>Peluquería</dt><dd class="fuerte">' + esc(v.cliente) + '</dd><dt>Fecha</dt><dd>' + fecha(v.fecha) + '</dd><dt>Condición</dt><dd>' + esc(v.condicion) +
+        (v.medioPago ? ' · ' + esc(v.medioPago.toLowerCase()) : '') + (v.nroOperacion ? ' · op. ' + esc(v.nroOperacion) : '') +
+        '</dd><dt>Estado</dt><dd>' + estadoVenta(v.estado) + (v.fechaCobro ? ' <span class="det">cobrada el ' + fecha(v.fechaCobro) + '</span>' : '') + '</dd>' +
+        (c ? '<dt>Crédito</dt><dd>' + esc(c.id) + ' · saldo ' + gs(c.saldo) + ' · ' + estadoCredito(c) + (c.atraso ? ' (' + plural(c.atraso, 'día', 'días') + ' de atraso)' : '') + '</dd>' : '') +
+        (v.nroComprobante ? '<dt>Comprobante</dt><dd>' + esc(v.tipoComprobante || 'Factura') + ' ' + esc(v.nroComprobante) + '</dd>' : '') +
+        (v.autorizadoPor ? '<dt>Excepción autorizada</dt><dd>' + esc(v.autorizadoPor) + '</dd>' : '') +
+        (v.nota ? '<dt>Nota</dt><dd>' + esc(v.nota) + '</dd>' : '') + '<dt>Registrada por</dt><dd>' + esc(v.usuario) + '</dd></dl>' +
+        tabla(['Producto', ['Cant.', 'num'], ['Precio', 'num'], ['Subtotal', 'num']], filas, '', '<tfoot><tr><td colspan="3">Total</td><td class="num">' + gs(v.total) + '</td></tr></tfoot>');
+    }
+
+    // ═════════════ Acciones ═════════════
+    var ACCIONES = {
+      salir: function () { cerrarSesion('', true); },
+      'reenviar-codigo': function (el) {
+        if (!S.email) { ACCIONES['cambiar-correo'](); return; }
+        S.token = '';
+        pedirCodigo(el, 'Enviando…'); // v2.3 Fase 2: corrige «pedirIngreso» (no existía: «Enviar otro código» fallaba)
+      },
+      'cambiar-correo': function () {
+        pasoAcceso('correo');
+        mensajeAcceso('');
+        $('#correo').focus();
+      },
+      'emitir-factura': function (el) {
+        var v = buscarVenta(el.getAttribute('data-id'));
+        if (!v) return;
+        abrirModal({
+          titulo: 'Factura electrónica', aceptar: 'Emitir ahora',
+          cuerpo: '<p>Venta <strong>' + esc(v.id) + '</strong> a <strong>' + esc(v.cliente) + '</strong> por <strong>' + gs(v.total) + '</strong>.</p><p class="mt tenue">Modo actual: ' +
+            esc(String(S.datos.config.sifen || '').toLowerCase()) + '. En simulación se valida el documento y no se envía a SIFEN.</p>',
+          alAceptar: function () { return api('emitirComprobante', { id: v.id }); },
+        });
+      },
+      actualizar: function (el) {
+        conBoton(el, 'Actualizando…', function () { return api('obtenerDatos', {}); }).then(function (r) { aplicar(r); toast('Datos actualizados.', 'ok', 2500); }).catch(fallo);
+      },
+      mes: function (el) {
+        var anterior = S.datos ? S.datos.mes : S.mes;
+        var nuevo = sumarMes(S.mes, Number(el.getAttribute('data-delta')));
+        if (nuevo > mesActual()) return;
+        S.mes = nuevo;
+        $('#periodo-etq').textContent = etiquetaMes(S.mes);
+        var turno = S.turnoMes = (S.turnoMes || 0) + 1;
+        api('obtenerDatos', {}).then(function (r) {
+          if (turno === S.turnoMes) aplicar(r); // ignora respuestas viejas si se cambió de mes varias veces
+        }).catch(function (e) {
+          if (turno === S.turnoMes) { S.mes = anterior; render(); }
+          fallo(e);
+        });
+      },
+      ir: function (el) {
+        var dest = el.getAttribute('data-destino').split(':');
+        S.vista = dest[0];
+        if (dest[1]) S.sub[dest[0]] = dest[1];
+        render();
+      },
+      'cerrar-modal': function () { cerrarModal(); },
+      'nuevo-producto': function () { modalProducto(null); },
+      'editar-producto': function (el) { modalProducto(el.getAttribute('data-codigo')); },
+      movimiento: function (el) { modalMovimiento(el.getAttribute('data-codigo') || ''); },
+      'nueva-peluqueria': function (el) { modalPeluqueria(null, el.getAttribute('data-origen')); },
+      'editar-peluqueria': function (el) { modalPeluqueria(el.getAttribute('data-codigo')); },
+      'nuevo-profesional': function () { modalProfesional(null); },
+      'editar-profesional': function (el) { modalProfesional(el.getAttribute('data-codigo')); },
+      'nuevo-servicio': function () { modalServicio(null); },
+      'editar-servicio': function (el) { modalServicio(el.getAttribute('data-codigo')); },
+      condicion: function (el) { S.venta.condicion = el.getAttribute('data-valor'); render(); },
+      'agregar-linea': agregarLinea,
+      'quitar-linea': function (el) { S.venta.items.splice(Number(el.getAttribute('data-i')), 1); render(); },
+      'limpiar-venta': function () {
+        if (!S.venta.items.length) { S.venta = ventaNueva(); render(); return; }
+        confirmar({ titulo: 'Limpiar venta', mensaje: 'Se quitarán los productos agregados a esta venta. ¿Continuar?', aceptar: 'Limpiar' })
+          .then(function (si) { if (si) { cerrarModal(true); S.venta = ventaNueva(); render(); } });
+      },
+      'limpiar-servicio': function () { S.servicio = servicioNuevo(); render(); },
+      'ver-venta': function (el) {
+        var v = buscarVenta(el.getAttribute('data-id'));
+        if (v) abrirModal({ titulo: 'Venta ' + v.id, cuerpo: detalleVenta(v), soloCerrar: true, ancho: true });
+      },
+      'cobrar-venta': function (el) {
+        var v = buscarVenta(el.getAttribute('data-id'));
+        if (!v) return;
+        // v2.2: las ventas a crédito se cobran con recibo en Cartera (cascada sobre las cuotas).
+        if (v.condicion === 'Crédito' || v.credito) {
+          if (MB && MB.ext.abrirCobro) MB.ext.abrirCobro({ credito: v.credito ? v.credito.id : v.id });
+          else toast('No se pudo cargar el módulo de cartera. Recargue la página.', 'error');
+          return;
+        }
+        abrirModal({
+          titulo: 'Marcar como cobrada', aceptar: 'Marcar cobrada',
+          cuerpo: '<p>Venta <strong>' + esc(v.id) + '</strong> a <strong>' + esc(v.cliente) + '</strong> del ' + fecha(v.fecha) + ' por <strong>' + gs(v.total) + '</strong>.</p><p class="mt tenue">Se registra el cobro con fecha de hoy.</p>',
+          alAceptar: function (f, id) { return api('cambiarEstadoVenta', { id: v.id, accion: 'cobrar' }, id); },
+        });
+      },
+      'anular-venta': function (el) {
+        var v = buscarVenta(el.getAttribute('data-id'));
+        if (!v) return;
+        abrirModal({
+          titulo: 'Anular venta ' + v.id, aceptar: 'Anular venta', peligro: true, ancho: true,
+          cuerpo: '<p class="ficha">La venta no se borra: queda marcada como <strong>Anulada</strong> y el stock de sus productos se repone automáticamente.</p><div class="mt">' +
+            detalleVenta(v) + '</div>' + campo('Motivo de la anulación *', '<textarea name="motivo" maxlength="200" placeholder="Ej.: error de carga, devolución de la peluquería"></textarea>', 'c-12 mt'),
+          alAceptar: function (f, id) {
+            requerir(f.motivo.length >= 3, 'Escriba el motivo de la anulación.');
+            return api('cambiarEstadoVenta', { id: v.id, accion: 'anular', motivo: f.motivo }, id);
+          },
+        });
+      },
+      'anular-servicio': function (el) {
+        var r = S.datos.realizados.filter(function (x) { return x.id === el.getAttribute('data-id'); })[0];
+        if (!r) return;
+        abrirModal({
+          titulo: 'Anular servicio ' + r.id, aceptar: 'Anular servicio', peligro: true,
+          cuerpo: '<p class="ficha"><strong>' + esc(r.servicio) + '</strong> de ' + esc(r.profesional) + ' (' + fecha(r.fecha) + ') · ' + gs(r.precio) + ' · comisión ' + gs(r.comision) +
+            '. Al anularlo, la comisión deja de contabilizarse.</p>' + campo('Motivo de la anulación *', '<textarea name="motivo" maxlength="200"></textarea>', 'c-12 mt'),
+          alAceptar: function (f, id) {
+            requerir(f.motivo.length >= 3, 'Escriba el motivo de la anulación.');
+            return api('anularServicio', { id: r.id, motivo: f.motivo }, id);
+          },
+        });
+      },
+      liquidar: function (el) {
+        var c = S.datos.comisiones.filter(function (x) { return x.codigo === el.getAttribute('data-codigo'); })[0];
+        if (!c) return;
+        abrirModal({
+          titulo: 'Liquidar comisiones', aceptar: 'Liquidar ' + gs(c.pendiente),
+          cuerpo: '<p>Se marcarán como pagadas las comisiones pendientes de <strong>' + esc(c.nombre) + '</strong> en <strong>' + esc(etiquetaMes(S.mes)) +
+            '</strong> por un total de <strong>' + gs(c.pendiente) + '</strong>.</p><p class="mt tenue">Los servicios liquidados ya no se pueden anular.</p>',
+          alAceptar: function (f, id) { return api('liquidarComisiones', { codigoProfesional: c.codigo }, id); },
+        });
+      },
+    };
+
+    function agregarLinea() {
+      var v = S.venta, l = v.linea, err = $('#error-linea');
+      err.textContent = '';
+      var p = buscar(S.datos.productos, l.codigo);
+      if (!p) { err.textContent = 'Seleccione un producto.'; $('#v-producto').focus(); return; }
+      var cant = enteroDe(l.cantidad);
+      if (!(cant >= 1)) { err.textContent = 'Ingrese una cantidad mayor que cero.'; $('#v-cantidad').focus(); return; }
+      var precio = enteroDe(l.precio);
+      if (isNaN(precio)) { err.textContent = 'Ingrese el precio unitario.'; $('#v-precio').focus(); return; }
+      var disponible = p.stock - reservadoEnVenta(p.codigo);
+      if (cant > disponible) { err.textContent = 'Stock insuficiente: quedan ' + miles(disponible) + ' unidades de «' + p.nombre + '».'; return; }
+      var agregar = function () {
+        v.items.push({ codigo: p.codigo, nombre: p.nombre, marca: p.marca, cantidad: cant, precio: precio });
+        v.linea = { codigo: '', cantidad: '1', precio: '' };
+        render();
+        var sel = $('#v-producto');
+        if (sel) sel.focus();
+      };
+      if (p.precio > 0 && (precio > p.precio * 3 || precio < p.precio / 3)) {
+        confirmar({
+          titulo: 'Revise el precio',
+          mensaje: 'El precio ingresado (<strong>' + gs(precio) + '</strong>) es muy distinto del precio de lista de «' + esc(p.nombre) + '» (<strong>' + gs(p.precio) + '</strong>). ¿Agregarlo igual?',
+          aceptar: 'Sí, agregar',
+        }).then(function (si) { cerrarModal(true); if (si) agregar(); });
+        return;
+      }
+      agregar();
+    }
+
+    function registrarVenta(btn) {
+      var v = S.venta;
+      if (!v.cliente) { toast('Seleccione la peluquería.', 'error'); $('#v-cliente').focus(); return; }
+      if (!v.items.length) { toast('Agregue al menos un producto a la venta.', 'error'); return; }
+      var enviar = function () {
+        var datos = {
+          fecha: v.fecha, codigoCliente: v.cliente, condicion: v.condicion, nota: v.nota.trim(),
+          items: v.items.map(function (i) { return { codigo: i.codigo, cantidad: i.cantidad, precio: i.precio }; }),
+        };
+        if (v.condicion === 'Crédito') {
+          // v2.2: el servidor calcula el plan y valida la política; se confirma en una ventana antes de registrar.
+          if (MB && MB.ext.confirmarVentaCredito) MB.ext.confirmarVentaCredito(datos, btn);
+          else toast('No se pudo cargar el módulo de cartera. Recargue la página.', 'error');
+          return;
+        }
+        datos.medioPago = v.medioPago || 'EFECTIVO';
+        datos.nroOperacion = datos.medioPago === 'EFECTIVO' ? '' : v.nroOperacion.trim();
+        datos.nroComprobante = v.nroComprobante.trim();
+        if (datos.nroComprobante && !/^\d{3}-\d{3}-\d{7}$/.test(datos.nroComprobante)) {
+          toast('El N° de factura debe tener el formato 001-001-0000123.', 'error');
+          $('#v-fact').focus();
+          return;
+        }
+        conBoton(btn, 'Registrando…', function () { return api('registrarVenta', datos, v.id); }).then(function (r) {
+          var medio = v.medioPago;
+          S.venta = ventaNueva();
+          S.venta.medioPago = medio;
+          aplicar(r);
+          (r.avisos || []).forEach(function (a) { toast('Revisar precio: ' + a, 'aviso', 12000); });
+        }).catch(fallo);
+      };
+      if (v.linea.codigo) {
+        confirmar({
+          titulo: 'Producto sin agregar',
+          mensaje: 'Hay un producto seleccionado que todavía no se agregó a la venta. ¿Registrar la venta sin ese producto?',
+          aceptar: 'Registrar sin él',
+        }).then(function (si) { cerrarModal(true); if (si) enviar(); });
+        return;
+      }
+      enviar();
+    }
+
+    function registrarServicio(btn) {
+      var s = S.servicio;
+      if (!s.profesional) { toast('Seleccione el profesional.', 'error'); return; }
+      if (!s.servicio) { toast('Seleccione el servicio.', 'error'); return; }
+      var precio = enteroDe(s.precio);
+      if (isNaN(precio)) { toast('Ingrese el precio cobrado.', 'error'); return; }
+      // v2.3: el % lo decide la regla vigente en el servidor; solo una administradora puede indicar otro.
+      var porcentaje = esAdmin() && s.pctManual ? decimalDe(s.porcentaje) : '';
+      if (porcentaje !== '' && (isNaN(porcentaje) || porcentaje < 0 || porcentaje > 100)) { toast('El % de comisión debe estar entre 0 y 100.', 'error'); return; }
+      var base = buscar(S.datos.servicios, s.servicio);
+      var enviar = function () {
+        conBoton(btn, 'Registrando…', function () {
+          return api('registrarServicio', {
+            fecha: s.fecha, codigoProfesional: s.profesional, codigoServicio: s.servicio, precio: precio, porcentaje: porcentaje,
+            cliente: s.cliente.trim(), nota: s.nota.trim(),
+          }, s.id);
+        }).then(function (r) {
+          var anterior = S.servicio;
+          S.servicio = servicioNuevo();
+          S.servicio.fecha = anterior.fecha;
+          S.servicio.profesional = anterior.profesional;
+          aplicar(r);
+        }).catch(fallo);
+      };
+      if (base && base.precio > 0 && (precio > base.precio * 3 || precio < base.precio / 3)) {
+        confirmar({
+          titulo: 'Revise el precio',
+          mensaje: 'El precio cobrado (<strong>' + gs(precio) + '</strong>) es muy distinto del precio base de «' + esc(base.nombre) + '» (<strong>' + gs(base.precio) + '</strong>). ¿Registrar igual?',
+          aceptar: 'Sí, registrar',
+        }).then(function (si) { cerrarModal(true); if (si) enviar(); });
+        return;
+      }
+      enviar();
+    }
+
+    function alCambiarCampo(ruta) {
+      if (ruta === 'venta.linea.codigo') {
+        var p = buscar(S.datos.productos, S.venta.linea.codigo);
+        S.venta.linea.precio = p ? miles(p.precio) : '';
+        $('#v-precio').value = S.venta.linea.precio;
+        $('#v-disponible').textContent = textoDisponible(p);
+        $('#error-linea').textContent = '';
+      } else if (ruta === 'servicio.profesional' || ruta === 'servicio.servicio') {
+        if (ruta === 'servicio.servicio') {
+          var serv = buscar(S.datos.servicios, S.servicio.servicio);
+          S.servicio.precio = serv ? miles(serv.precio) : '';
+          $('#s-precio').value = S.servicio.precio;
+        }
+        if (!S.servicio.pctManual) {
+          var sug = sugerirPorcentaje();
+          S.servicio.porcentaje = sug ? String(sug.valor).replace('.', ',') : '';
+          $('#s-pct').value = S.servicio.porcentaje;
+        }
+        actualizarComision();
+      } else if (ruta === 'servicio.porcentaje') {
+        S.servicio.pctManual = S.servicio.porcentaje !== '';
+        actualizarComision();
+      } else if (ruta === 'servicio.precio') {
+        actualizarComision();
+      } else if (ruta === 'venta.medioPago') {
+        var op = $('#v-op-campo');
+        if (op) op.hidden = S.venta.medioPago === 'EFECTIVO';
+      }
+      if (MB && MB.alCambiarCampo) MB.alCambiarCampo(ruta);
+    }
+
+    // ═════════════ Puente para los módulos (parciales UI_*.html): window.MB_EXT.push(function (MB) { … }) ═════════════
+    MB = window.MB = {
+      version: document.body.getAttribute('data-version') || '',
+      S: S, vistas: VISTAS, acciones: ACCIONES, ext: {},
+      alCambio: {}, alEscribir: {}, alEnviar: {}, alCambiarCampo: null, alRender: null,
+      api: api, aplicar: aplicar, render: render, toast: toast, fallo: fallo, conBoton: conBoton,
+      abrirModal: abrirModal, cerrarModal: cerrarModal, confirmar: confirmar, leerForm: leerForm, requerir: requerir,
+      esc: esc, miles: miles, gs: gs, pct: pct, fecha: fecha, hoyISO: hoyISO, etiquetaMes: etiquetaMes, diasEntre: diasEntre, sumarDias: sumarDias,
+      uid: uid, digitos: digitos, enteroDe: enteroDe, decimalDe: decimalDe, plural: plural, norm: norm, buscar: buscar, $: $,
+      cabecera: cabecera, subtabs: subtabs, tabla: tabla, kpi: kpi, badge: badge, boton: boton, attr: attr, estadoVenta: estadoVenta,
+      campo: campo, inputGs: inputGs, inputEntero: inputEntero, inputPct: inputPct, datalist: datalist,
+      esAdmin: esAdmin, buscarVenta: buscarVenta, whatsappDe: whatsappDe, modalPeluqueria: modalPeluqueria, ventaNueva: ventaNueva,
+    };
+    (window.MB_EXT || []).forEach(function (iniciar) {
+      try { iniciar(MB); } catch (e) { console.error('No se pudo iniciar un módulo de la aplicación:', e); }
+    });
+
+    // ═════════════ Eventos ═════════════
+    $('#form-acceso').addEventListener('submit', ingresar);
+    ACCIONES['usar-codigo'] = function () { pasoAcceso('correo'); mensajeAcceso(''); $('#correo').focus(); };
+    ACCIONES['volver-google'] = function () { pasoAcceso('google'); prepararBotonGoogle(); mensajeAcceso(''); };
+    $('#btn-google').addEventListener('click', function (ev) {
+      if (this.getAttribute('aria-disabled') === 'true') {
+        ev.preventDefault();
+        mensajeAcceso('El ingreso con Google todavía no está activado: la cuenta propietaria debe publicar «MB Acceso» y abrir su enlace una vez.', true);
+      } else {
+        mensajeAcceso('Abriendo la verificación de Google…');
+      }
+    });
+
+    document.addEventListener('click', function (ev) {
+      var vista = ev.target.closest('[data-vista]');
+      if (vista) { S.vista = vista.getAttribute('data-vista'); render(); window.scrollTo(0, 0); return; }
+      var sub = ev.target.closest('[data-sub]');
+      if (sub) { S.sub[S.vista] = sub.getAttribute('data-sub'); render(); return; }
+      var el = ev.target.closest('[data-accion]');
+      if (el && ACCIONES[el.getAttribute('data-accion')]) { ev.preventDefault(); ACCIONES[el.getAttribute('data-accion')](el); return; }
+      if (ev.target.id === 'modal') cerrarModal();
+    });
+
+    document.addEventListener('input', function (ev) {
+      var el = ev.target;
+      if (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio') return; // se atienden en «change»
+      if (el.id === 'codigo') { el.value = digitos(el.value).slice(0, 6); return; }
+      var tipo = el.getAttribute('data-tipo');
+      if (tipo === 'gs') {
+        var d = digitos(el.value).replace(/^0+(?=\d)/, '').slice(0, 12);
+        el.value = d ? miles(Number(d)) : '';
+      } else if (tipo === 'entero') {
+        el.value = digitos(el.value).slice(0, 6);
+      } else if (tipo === 'pct') {
+        var limpio = el.value.replace(/[^0-9.,]/g, '').replace('.', ',');
+        var partes = limpio.split(',');
+        el.value = (partes[0].slice(0, 3) + (partes.length > 1 ? ',' + partes.slice(1).join('').slice(0, 2) : ''));
+      }
+      if (el.id === 'buscar-producto') {
+        S.filtro.productos = el.value;
+        $('#tabla-productos').innerHTML = tablaProductos();
+        return;
+      }
+      var gancho = el.getAttribute('data-al-escribir');
+      if (gancho && MB.alEscribir[gancho]) { MB.alEscribir[gancho](el, ev); return; }
+      var ruta = el.getAttribute('data-campo');
+      if (ruta) { asignar(ruta, el.value); alCambiarCampo(ruta); }
+      if (S.modal && S.modal.alCambiar && el.closest('#modal-form')) S.modal.alCambiar($('#modal-form'), el);
+    });
+
+    document.addEventListener('change', function (ev) {
+      var el = ev.target;
+      if (el.id === 'recordar') { prepararBotonGoogle(); return; }
+      if (el.id === 'ver-inactivos') { S.filtro.inactivos = el.checked; $('#tabla-productos').innerHTML = tablaProductos(); return; }
+      if (el.id === 'filtro-profesional') { S.filtro.profesional = el.value; render(); return; }
+      var gancho = el.getAttribute('data-al-cambiar');
+      if (gancho && MB.alCambio[gancho]) { MB.alCambio[gancho](el, ev); return; }
+      if (el.tagName === 'SELECT' || el.type === 'checkbox' || el.type === 'radio') {
+        var ruta = el.getAttribute('data-campo');
+        if (ruta) { asignar(ruta, el.type === 'checkbox' ? el.checked : el.value); alCambiarCampo(ruta); }
+        if (S.modal && S.modal.alCambiar && el.closest('#modal-form')) S.modal.alCambiar($('#modal-form'), el);
+      }
+    });
+
+    document.addEventListener('submit', function (ev) {
+      var f = ev.target;
+      if (f.id === 'form-acceso') return;
+      ev.preventDefault();
+      if (f.id === 'modal-form') enviarModal(f);
+      else if (f.id === 'form-venta') registrarVenta(f.querySelector('button[type=submit]'));
+      else if (f.id === 'form-servicio') registrarServicio(f.querySelector('button[type=submit]'));
+      else if (MB.alEnviar[f.id]) MB.alEnviar[f.id](f, f.querySelector('button[type=submit]'));
+    });
+
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && !$('#modal').hidden) { cerrarModal(); return; }
+      if (ev.key !== 'Enter' || ev.target.tagName !== 'INPUT') return;
+      // En los formularios de venta y servicio, Enter nunca registra por accidente.
+      if (ev.target.closest('#form-venta, #form-servicio')) {
+        ev.preventDefault();
+        if (ev.target.id === 'v-cantidad' || ev.target.id === 'v-precio') agregarLinea();
+      }
+    });
+
+    // ═════════════ Inicio ═════════════
+    // 1) Recién verificada por Google (?acceso=…): el servidor ya creó la sesión y la entregó en «arranque».
+    // 2) Sesión recordada en este dispositivo: el servidor la valida.
+    // 3) Si no: botón «Ingresar con Google» (MB Acceso).
+    (function arrancar() {
+      prepararBotonGoogle();
+      if (ARRANQUE.sesion && ARRANQUE.sesion.token) {
+        try { window.google.script.history.replace(null, {}, ''); } catch (e) { /* opcional: quita el token de un solo uso de la dirección */ }
+        entrarConSesion(ARRANQUE.sesion.token, ARRANQUE.sesion.email, ARRANQUE.sesion.recordado, 'Identidad verificada por Google. Ingresando…');
+        return;
+      }
+      var guardada = leerSesionLocal();
+      if (guardada && guardada.token) {
+        $('#recordar').checked = !!guardada.recordado;
+        entrarConSesion(guardada.token, guardada.email, guardada.recordado, 'Ingresando…');
+        return;
+      }
+      pasoAcceso('google');
+      if (ARRANQUE.error) mensajeAcceso(ARRANQUE.error, true);
+      else if (!ARRANQUE.enlaceAcceso) mensajeAcceso('El ingreso con Google todavía no está activado: la cuenta propietaria debe publicar «MB Acceso» y abrir su enlace una vez (guía de instalación).', true);
+    })();
+  })();
+  </script>
+</body>
+</html>

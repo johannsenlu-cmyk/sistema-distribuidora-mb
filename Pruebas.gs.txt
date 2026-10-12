@@ -1,0 +1,352 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Pruebas automáticas (testSistema) · v2.3
+ * =====================================================================
+ *  - NUNCA escribe datos de prueba en el libro vivo: los cálculos se prueban en memoria y los escenarios
+ *    (sesiones, roles, escrituras, instalación) corren sobre una COPIA TEMPORAL del libro que se envía a la
+ *    papelera al terminar. Calendar, correo, SIFEN y WhatsApp quedan simulados (MODO_PRUEBA_).
+ *  - Lo único que se escribe en el libro vivo es el INFORME (filas «Prueba · …» en «Estado de instalación»).
+ *  - Cada módulo aporta sus pruebas (pruebasCartera_, escenariosCartera_, …): se ejecutan si están instalados.
+ * =====================================================================
+ */
+
+const CORREO_OPERATIVA_PRUEBA = 'operativa.prueba@mb.invalid';
+
+/** EDITOR: corre todas las pruebas y escribe el informe en «Estado de instalación». */
+function testSistema() {
+  exigirEditorOTrigger_(null);
+  INICIO_EJECUCION_ = Date.now();
+  reiniciarMemoriaEjecucion_();
+  const ss = abrirHoja_();
+  const tz = zonaHoraria_(ss);
+  const r = conBloqueo_(function () { return testSistema_(ss, tz, { corrida: 'Pruebas ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'), email: correoPropietario_() }); });
+  console.log(r.ok + ' de ' + r.total + ' pruebas OK.' + (r.fallos ? '\nFALLAS:\n' + r.detalle.filter(function (x) { return !x.ok; }).map(function (x) { return '✗ ' + x.nombre + ' — ' + x.detalle; }).join('\n') : ''));
+  return r;
+}
+
+/** Probador mínimo: acumula { nombre, ok, detalle }. */
+function crearProbador_(resultados) {
+  function anotar(nombre, ok, detalle) { resultados.push({ nombre: nombre, ok: !!ok, detalle: ok ? '' : String(detalle || '').slice(0, 600) }); }
+  return {
+    ok: function (nombre, condicion, detalle) { anotar(nombre, condicion, detalle || 'condición falsa'); },
+    igual: function (nombre, real, esperado) {
+      const ok = JSON.stringify(real) === JSON.stringify(esperado);
+      anotar(nombre, ok, 'esperado ' + JSON.stringify(esperado) + ', obtenido ' + JSON.stringify(real));
+    },
+    lanza: function (nombre, fn, patron) {
+      try { fn(); anotar(nombre, false, 'no lanzó error'); } catch (e) {
+        const msg = String(e && e.message ? e.message : e);
+        anotar(nombre, !patron || patron.test(msg), 'mensaje inesperado: ' + msg);
+      }
+    },
+    seccion: function (nombre, fn) {
+      try { fn(); } catch (e) { anotar(nombre + ' (error inesperado)', false, String(e && e.stack ? e.stack : e)); }
+    },
+  };
+}
+
+/**
+ * Corre las pruebas. op = { corrida, email, soloMemoria }. Devuelve { total, ok, fallos, omitidas, detalle }.
+ * Debe llamarse dentro de conBloqueo_ (las escrituras de los escenarios usan el mismo bloqueo).
+ */
+function testSistema_(ssVivo, tz, op) {
+  op = op || {};
+  const resultados = [];
+  const t = crearProbador_(resultados);
+  let omitidas = 0;
+
+  // 1) En memoria (sin hoja)
+  t.seccion('Núcleo', function () { pruebasNucleo_(t); });
+  if (typeof pruebasCartera_ === 'function') t.seccion('Cartera', function () { pruebasCartera_(t); });
+  if (typeof pruebasClientes_ === 'function') t.seccion('Clientes', function () { pruebasClientes_(t); });
+  if (typeof pruebasProveedores_ === 'function') t.seccion('Proveedores', function () { pruebasProveedores_(t); });
+  if (typeof pruebasComisiones_ === 'function') t.seccion('Comisiones', function () { pruebasComisiones_(t); });
+  if (typeof pruebasTickets_ === 'function') t.seccion('Tickets', function () { pruebasTickets_(t); });
+  if (typeof pruebasAgenda_ === 'function') t.seccion('Agenda', function () { pruebasAgenda_(t); });
+  if (typeof pruebasFiscal_ === 'function') t.seccion('Fiscal y WhatsApp', function () { pruebasFiscal_(t); });
+
+  // 2) Escenarios sobre una copia temporal del libro
+  if (!op.soloMemoria) {
+    if (tiempoRestante_() < 90000) {
+      omitidas++;
+      t.ok('Escenarios sobre copia temporal', true);
+      resultados[resultados.length - 1].detalle = 'omitidos por tiempo';
+    } else {
+      escenariosEnCopia_(ssVivo, tz, t, function (contexto) {
+        t.seccion('Escenarios · instalación', function () { escenariosInstalacion_(t, contexto); });
+        t.seccion('Escenarios · seguridad', function () { escenariosSeguridad_(t, contexto); });
+        if (typeof escenariosCartera_ === 'function') t.seccion('Escenarios · cartera', function () { escenariosCartera_(t, contexto); });
+        if (typeof escenariosClientes_ === 'function') t.seccion('Escenarios · clientes', function () { escenariosClientes_(t, contexto); });
+        if (typeof escenariosProveedores_ === 'function') t.seccion('Escenarios · proveedores', function () { escenariosProveedores_(t, contexto); });
+        if (typeof escenariosComisiones_ === 'function') t.seccion('Escenarios · comisiones', function () { escenariosComisiones_(t, contexto); });
+        if (typeof escenariosTickets_ === 'function') t.seccion('Escenarios · tickets', function () { escenariosTickets_(t, contexto); });
+        if (typeof escenariosAgenda_ === 'function') t.seccion('Escenarios · agenda', function () { escenariosAgenda_(t, contexto); });
+        if (typeof escenariosFiscal_ === 'function') t.seccion('Escenarios · fiscal', function () { escenariosFiscal_(t, contexto); });
+      });
+    }
+  }
+
+  // 3) Informe (lo único que se escribe en el libro vivo)
+  const fallos = resultados.filter(function (r) { return !r.ok; });
+  const corrida = op.corrida || 'Pruebas ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm');
+  try {
+    anexarFilas_(ssVivo, 'instalacion', resultados.map(function (r) {
+      return { fecha: new Date(), corrida: corrida, paso: 'Prueba · ' + r.nombre, recurso: 'testSistema', resultado: r.ok ? 'OK' : 'FALLO', detalle: r.detalle,
+        accion: r.ok ? '' : 'Revisar (avisar a soporte con esta fila).', version: CONFIG.VERSION, usuario: op.email || '' };
+    }), tz);
+  } catch (e) { console.error('No se pudo escribir el informe de pruebas: ' + e); }
+  const resumen = (resultados.length - fallos.length) + ' de ' + resultados.length + ' OK';
+  try {
+    PropertiesService.getScriptProperties().setProperty('MB_ULTIMAS_PRUEBAS', JSON.stringify({ fecha: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'), resumen: resumen, fallos: fallos.length }));
+  } catch (e) { /* informativo */ }
+  return { total: resultados.length, ok: resultados.length - fallos.length, fallos: fallos.length, omitidas: omitidas, detalle: resultados };
+}
+
+/**
+ * Crea la copia temporal del libro, activa MODO_PRUEBA_ (servicios externos simulados) y garantiza la limpieza:
+ * la copia va a la papelera, se revocan las sesiones de prueba y se borran las marcas de paquetes de la copia.
+ */
+function escenariosEnCopia_(ssVivo, tz, t, fn) {
+  SpreadsheetApp.flush();
+  const carpeta = subcarpeta_('Respaldos', true);
+  const archivo = DriveApp.getFileById(ssVivo.getId()).makeCopy('PRUEBA TEMPORAL MB ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HHmmss') + ' (se borra sola)', carpeta);
+  const libro = SpreadsheetApp.openById(archivo.getId());
+  const tokens = [];
+  MODO_PRUEBA_ = { libro: libro, correos: [], whatsapp: [], calendar: [], sifen: [], archivos: [], compartidos: [], tokens: tokens };
+  try {
+    fn({ ss: libro, tz: tz, vivo: ssVivo, tokens: tokens });
+  } finally {
+    MODO_PRUEBA_ = null;
+    reiniciarMemoriaEjecucion_();
+    tokens.forEach(function (tk) { try { revocarSesion_(tk); } catch (e) { /* nada */ } });
+    try {
+      const props = PropertiesService.getScriptProperties();
+      [CLAVE_PAQUETES, CLAVE_PAQUETES_AVISADOS].forEach(function (k) {
+        const o = leerJsonPropiedad_(props, k);
+        Object.keys(o).forEach(function (x) { if (x.indexOf(archivo.getId()) >= 0) delete o[x]; });
+        props.setProperty(k, JSON.stringify(o));
+      });
+    } catch (e) { console.warn('Limpieza de marcas de prueba: ' + e); }
+    try { CacheService.getScriptCache().remove('mb_usuarios_' + archivo.getId()); } catch (e) { /* nada */ }
+    try { archivo.setTrashed(true); } catch (e) { console.error('No se pudo enviar a la papelera la copia de prueba: ' + e); }
+  }
+}
+
+/** Llama a una función pública como lo haría la página (token de sesión, mes, idSolicitud único). */
+function llamarPrueba_(fn, token, datos, extra) {
+  const req = Object.assign({ token: token || '', mes: hoy_(CONFIG.ZONA_HORARIA).slice(0, 7), idSolicitud: 'prueba_' + Utilities.getUuid().replace(/-/g, '').slice(0, 20),
+    datos: datos || {}, cliente: CONFIG.VERSION }, extra || {});
+  return fn(req);
+}
+
+/** Sesión de prueba (se revoca al terminar). */
+function sesionPrueba_(contexto, email) {
+  const s = crearSesion_(email, false, 'PRUEBA');
+  contexto.tokens.push(s.token);
+  return s.token;
+}
+
+/** Política de referencia (copia del xlsx) para probar fórmulas sin depender de la hoja. */
+function parametrosDeSemilla_() {
+  const P = { _avisos: [], _faltan: [], _nombres: {}, _unidades: {} };
+  semillaParametros_().forEach(function (p) {
+    const r = interpretarParametro_(p[2], p[3]);
+    P[p[0]] = r.ok ? r.valor : null;
+    P._nombres[p[0]] = p[1];
+    P._unidades[p[0]] = p[3];
+  });
+  return P;
+}
+
+function categoriasDeSemilla_() {
+  return semillaCategorias_().map(function (c) {
+    return { nombre: c[0], limite: c[1], entrega: c[2], cuotas: c[3], frecuencia: c[4],
+      frecuencias: String(c[4]).toUpperCase().split(/\s*(?:,|;|\/|\bO\b)\s*/).map(function (s) { return s.trim(); }).filter(String), criterio: c[5] };
+  });
+}
+
+// ─────────────────────── Núcleo: pruebas en memoria ───────────────────────
+
+function pruebasNucleo_(t) {
+  const P = parametrosDeSemilla_();
+  // Redondeos idénticos al xlsx (↑1.000 entrega, ↓1.000 cuota, redondeo a 1.000 recargo, a 100 mora, comisión mitad hacia arriba).
+  t.igual('Redondeo ↑1.000 sin error de coma flotante (690.000 × 30% = 207.000)', redondearArriba_(690000 * 0.3, 1000), 207000);
+  t.igual('Redondeo ↑1.000 (206.001 → 207.000)', redondearArriba_(206001, 1000), 207000);
+  t.igual('Redondeo ↓1.000 (cuota 480.000 ÷ 6 = 80.000)', redondearAbajo_(480000 / 6, 1000), 80000);
+  t.igual('Redondeo ↓1.000 (333.333 → 333.000)', redondearAbajo_(1000000 / 3, 1000), 333000);
+  t.igual('Redondeo a 1.000 (mitad hacia arriba: 12.500 → 13.000)', redondear_(12500, 1000), 13000);
+  t.igual('Redondeo a 100 (mora 1.249,6 → 1.200)', redondear_(1249.6, 100), 1200);
+  t.igual('Comisión mitad hacia arriba (1.003 × 50% = 501,5 → 502)', gsEnteros_(1003 * 50 / 100), 502);
+  t.igual('Comisión exacta (45.500 × 35% = 15.925)', gsEnteros_(45500 * 35 / 100), 15925);
+  // IVA incluido: 10% = ÷ 11; 5% = ÷ 21; exenta = 0.
+  t.igual('IVA 10% incluido (110.000 → 10.000)', ivaIncluido_(110000, 10), 10000);
+  t.igual('IVA 5% incluido (105.000 → 5.000)', ivaIncluido_(105000, 5), 5000);
+  t.igual('IVA exenta', ivaIncluido_(100000, 0), 0);
+  t.igual('IVA 10% redondeado (240.000 → 21.818)', ivaIncluido_(240000, 10), 21818);
+  const d = desgloseIva_([{ total: 110000, tasa: 10 }, { total: 105000, tasa: 5 }, { total: 50000, tasa: 0 }]);
+  t.igual('Desglose IVA mixto', [d.gravada10, d.iva10, d.gravada5, d.iva5, d.exenta, d.total, d.neto], [110000, 10000, 105000, 5000, 50000, 265000, 250000]);
+  // Tasas
+  t.igual('Tasa IVA: vacío = general (10)', tasaIva_('', P), 10);
+  t.igual('Tasa IVA: «5%» = 5', tasaIva_('5%', P), 5);
+  t.igual('Tasa IVA: «Exenta» = 0', tasaIva_('Exenta', P), 0);
+  t.lanza('Tasa IVA inválida rechazada', function () { tasaIva_('12', P); }, /no válida/);
+  // Parámetros (interpretación de la hoja)
+  t.igual('Parámetro % escrito «30%»', interpretarParametro_('30%', '%').valor, 0.3);
+  t.igual('Parámetro % escrito 30', interpretarParametro_(30, '%').valor, 0.3);
+  t.igual('Parámetro % fracción 0,2726', interpretarParametro_(0.2726, '%').valor, 0.2726);
+  t.igual('Parámetro Gs. «15.000.000»', interpretarParametro_('15.000.000', 'Gs./mes').valor, 15000000);
+  t.ok('Parámetro vacío = faltante', interpretarParametro_('', 'Gs.').ok === false);
+  t.lanza('param_ exige el valor (nunca usa uno del código)', function () { param_({ P_X: null, _nombres: { P_X: 'X' } }, 'P_X'); }, /Falta el parámetro/);
+  t.igual('Semilla: 4 categorías del xlsx', categoriasDeSemilla_().map(function (c) { return c.nombre + ':' + c.limite + ':' + c.entrega + ':' + c.cuotas; }),
+    ['NUEVA:1000000:0.5:4', 'C:1500000:0.4:4', 'B:3000000:0.3:6', 'A:5000000:0.2:6']);
+  t.igual('Categoría A admite SEMANAL y QUINCENAL', categoriasDeSemilla_()[3].frecuencias, ['SEMANAL', 'QUINCENAL']);
+  t.ok('Tasas de la semilla dentro del límite BCP', Math.max(P.P_TEA_FIN, P.P_TEA_MORA) <= P.P_LIMITE_BCP);
+  // RUC (módulo 11 de la SET), celular y CI
+  t.igual('RUC: dígito verificador de 1307114 = 9 (INA STYLE)', dvRuc_('1307114'), 9);
+  t.igual('RUC: dígito verificador de 4581379 = 5 (LA PELU)', dvRuc_('4581379'), 5);
+  t.igual('RUC con puntos se normaliza', validarRuc_('1.307.114-9'), '1307114-9');
+  t.lanza('RUC con dígito verificador incorrecto rechazado', function () { validarRuc_('1307114-8'); }, /dígito verificador/);
+  t.igual('RUC con DV incorrecto aceptado si la validación del DV está apagada', validarRuc_('1307114-8', { validarDv: false }), '1307114-8');
+  t.lanza('RUC sin guion rechazado', function () { validarRuc_('13071149'); }, /formato/);
+  t.igual('Celular 0981 123 456 → 595981123456', normalizarCelular_('0981 123 456'), '595981123456');
+  t.igual('Celular +595 981-123-456', normalizarCelular_('+595 981-123-456'), '595981123456');
+  t.igual('Celular 981123456', normalizarCelular_('981123456'), '595981123456');
+  t.igual('Teléfono fijo no es celular', normalizarCelular_('021 555 111'), '');
+  t.igual('CI sin puntos', normalizarCi_('4.123.456'), '4123456');
+  // Precios: descuentos y margen (mensajes literales del xlsx)
+  const base = { nombre: 'Producto', tipo: 'PRODUCTO', lista: 100000, tasa: 10, costoTotal: 50000 };
+  t.igual('Descuento 4%: sin observaciones', controlesPrecios_([Object.assign({}, base, { precio: 96000, total: 96000 })], P).length, 0);
+  const c7 = controlesPrecios_([Object.assign({}, base, { precio: 93000, total: 93000 })], P);
+  t.ok('Descuento 7%: DESCUENTO REQUIERE AUTORIZACIÓN (autorizable)', c7.length === 1 && c7[0].codigo === 'DESCUENTO REQUIERE AUTORIZACIÓN' && c7[0].autorizable, JSON.stringify(c7));
+  const c12 = controlesPrecios_([Object.assign({}, base, { precio: 88000, total: 88000 })], P);
+  t.ok('Descuento 12%: DESCUENTO FUERA DE POLÍTICA (no autorizable)', c12.some(function (x) { return x.codigo === 'DESCUENTO FUERA DE POLÍTICA' && !x.autorizable; }), JSON.stringify(c12));
+  const ozono = margenLinea_(990000, 10, 805000, P);
+  t.igual('Margen de V-00002 (Ozonoterapia 990.000, costo 805.000 sin IVA) = 10,6%', Math.round(ozono * 1000) / 10, 10.6);
+  const cm = controlesPrecios_([{ nombre: 'Ozonoterapia', tipo: 'PRODUCTO', precio: 990000, lista: 990000, total: 990000, tasa: 10, costoTotal: 805000 }], P);
+  t.ok('MARGEN BAJO MÍNIMO requiere administradora', cm.length === 1 && cm[0].codigo === 'MARGEN BAJO MÍNIMO' && cm[0].autorizable);
+  t.ok('Los mensajes de precio no revelan costos', cm.every(function (x) { return !/805/.test(x.mensaje); }));
+  t.igual('Precio mínimo con IVA (costo 100.000) = ↑1.000 [100.000 ÷ 0,7 × 1,1]', precioMinimo_(100000, 10, P), 158000);
+  t.igual('Precio sugerido con IVA (costo 100.000) = redondeo [100.000 ÷ 0,6 × 1,1]', precioSugerido_(100000, 10, P), 183000);
+  // Pagos de contado
+  t.lanza('Contado sin medio: FALTA MEDIO DE PAGO', function () { validarPagos_([], 1000); }, /FALTA MEDIO DE PAGO/);
+  t.lanza('Transferencia sin operación: FALTA N° DE OPERACIÓN DEL PAGO', function () { validarPagos_([{ medio: 'TRANSF. BANCO 1', monto: 1000 }], 1000); }, /FALTA N° DE OPERACIÓN DEL PAGO/);
+  t.igual('Pago dividido en dos medios', validarPagos_([{ medio: 'efectivo', monto: 600 }, { medio: 'QR / BILLETERA', monto: 400, operacion: 'A1' }], 1000).map(function (p) { return p.medio; }), ['EFECTIVO', 'QR / BILLETERA']);
+  // Línea / centro de costo propuesta desde la categoría (R4.4)
+  t.igual('Líneas propuestas', ['Herramientas', 'Herramienta', 'Capilar', 'FACIAL', 'Equipos', 'Blanqueria', 'CORPORAL', 'Saldos', 'Ocasional'].map(function (c) { return lineaPropuesta_(c, false); }),
+    ['HERRAMIENTAS Y ACCESORIOS', 'HERRAMIENTAS Y ACCESORIOS', 'CAPILAR', 'FACIAL Y ROSTRO', 'EQUIPAMIENTO Y MOBILIARIO', 'REVISAR', 'REVISAR', 'REVISAR', 'REVISAR']);
+  t.igual('Duplicados por mayúsculas (W Profesional / W profesional)', duplicadosPorMayusculas_(['W Profesional', 'W profesional', 'Framesi']), ['W Profesional / W profesional']);
+  // Identidad (token de Google): falso, vencido, aud ajena, correo sin verificar
+  const ahora = Date.now();
+  const valido = { iss: 'https://accounts.google.com', aud: '123-abc.apps.googleusercontent.com', exp: String(Math.floor(ahora / 1000) + 600), email: 'Mirian.TallerDeBelleza@gmail.com', email_verified: 'true' };
+  t.igual('Token de Google válido → correo verificado', validarClaimsGoogle_(valido, '123-abc.apps.googleusercontent.com', ahora), 'mirian.tallerdebelleza@gmail.com');
+  t.lanza('Token falso (emisor ajeno) rechazado', function () { validarClaimsGoogle_(Object.assign({}, valido, { iss: 'evil.example' }), valido.aud, ahora); }, /no proviene de Google/);
+  t.lanza('Token vencido rechazado', function () { validarClaimsGoogle_(Object.assign({}, valido, { exp: String(Math.floor(ahora / 1000) - 5) }), valido.aud, ahora); }, /venció/);
+  t.lanza('Token con aud ajena rechazado', function () { validarClaimsGoogle_(Object.assign({}, valido, { aud: '999-zzz.apps.googleusercontent.com' }), valido.aud, ahora); }, /MB Acceso/);
+  t.lanza('Correo sin verificar rechazado', function () { validarClaimsGoogle_(Object.assign({}, valido, { email_verified: 'false' }), valido.aud, ahora); }, /verificado/);
+  t.lanza('Enlace de ingreso mal formado rechazado (antes de consultar a Google)', function () { canjearTokenGoogle_('no-es-un-token', false, ''); }, /incompleto/);
+  // Lista blanca para operativas y HTML seguro
+  const filtrado = filtrarSensibles_({ productos: [{ codigo: 'P-1', costo: 5, precio: 9 }], kpis: { valorInventario: 1, stockBajo: 2 }, x: { margen: 0.3, proveedor: 'PR-001' } }, 0);
+  t.igual('Lista blanca: sin costo, valor del inventario, margen ni proveedor', filtrado, { productos: [{ codigo: 'P-1', precio: 9 }], kpis: { stockBajo: 2 }, x: {} });
+  t.ok('JSON incrustado en la página sin «</script>»', jsonParaHtml_({ a: '</script><b>' }).indexOf('<') < 0);
+  t.igual('Unidad de negocio normalizada', [unidadValida_('salon', ''), unidadValida_('Distribuidora', ''), unidadValida_('', 'SALÓN')], ['SALÓN', 'DISTRIBUIDORA', 'SALÓN']);
+  t.ok('Todos los títulos del ESQUEMA son únicos por hoja', Object.keys(ESQUEMA).every(function (k) {
+    const titulos = ESQUEMA[k].columnas.map(function (c) { return c[1]; });
+    return titulos.length === unicos_(titulos).length;
+  }));
+  t.ok('Todas las hojas del ESQUEMA tienen nombre único', unicos_(Object.keys(ESQUEMA).map(function (k) { return ESQUEMA[k].hoja; })).length === Object.keys(ESQUEMA).length);
+}
+
+// ─────────────────────── Núcleo: escenarios sobre la copia temporal ───────────────────────
+
+function escenariosInstalacion_(t, c) {
+  const ss = c.ss;
+  const tz = c.tz;
+  const antes = { ventas: leerTabla_(ss, 'ventas', tz).filas.length, realizados: leerTabla_(ss, 'realizados', tz).filas.length, productos: leerTabla_(ss, 'productos', tz).filas.length };
+  const creadas1 = asegurarEstructura_(ss);
+  const creadas2 = asegurarEstructura_(ss);
+  t.igual('Esquema: re-aplicar no crea hojas ni columnas', creadas2.length, 0);
+  t.ok('Esquema: todas las hojas legibles por título', Object.keys(ESQUEMA).every(function (k) { try { leerTabla_(ss, k, tz); return true; } catch (e) { return false; } }), creadas1.join(','));
+  const s1 = sembrarParametros_(ss, tz, 'prueba');
+  const s2 = sembrarParametros_(ss, tz, 'prueba');
+  t.igual('Parámetros y categorías: re-sembrar no duplica', [s2.parametros, s2.categorias], [0, 0]);
+  t.ok('Parámetros sembrados completos', leerTabla_(ss, 'parametros', tz).filas.length >= semillaParametros_().length, JSON.stringify(s1));
+  sembrarEntidades_(ss, tz, 'prueba');
+  sembrarEntidades_(ss, tz, 'prueba');
+  t.igual('Entidades fiscales: una fila por unidad', leerTabla_(ss, 'entidades', tz).filas.map(function (e) { return e.unidad; }).sort(), ['DISTRIBUIDORA', 'SALÓN']);
+  completarUnidadesExistentes_(ss, tz, 'prueba');
+  const n2 = completarUnidadesExistentes_(ss, tz, 'prueba');
+  t.igual('Unidad de negocio: re-ejecutar no cambia nada', n2, 0);
+  t.ok('Unidad de negocio: Ventas = DISTRIBUIDORA, Servicios realizados = SALÓN',
+    leerTabla_(ss, 'ventas', tz).filas.every(function (v) { return v.unidad === 'DISTRIBUIDORA'; }) && leerTabla_(ss, 'realizados', tz).filas.every(function (r) { return r.unidad === 'SALÓN'; }));
+  t.igual('Compatibilidad: ventas, servicios y productos existentes intactos',
+    [leerTabla_(ss, 'ventas', tz).filas.length, leerTabla_(ss, 'realizados', tz).filas.length, leerTabla_(ss, 'productos', tz).filas.length], [antes.ventas, antes.realizados, antes.productos]);
+  const filas = compartirYVerificar_(ss, tz).filter(function (f) { return f.resultado !== 'INFO'; });
+  t.ok('Compartir con las administradoras: cada recurso verificado OK', filas.length > 0 && filas.every(function (f) { return f.resultado === 'OK'; }), JSON.stringify(filas));
+  t.ok('Compartir no envía invitaciones por correo', MODO_PRUEBA_.correos.every(function (m) { return !/Invitaci/.test(m.subject || ''); }));
+  const hoja = ss.getSheetByName(HOJA_CONFIG);
+  const valores = hoja.getRange(1, 1, hoja.getLastRow(), 2).getValues();
+  let fila = 0;
+  valores.forEach(function (v, i) { if (String(v[0]).trim() === PARAM_REGISTRO) fila = i + 1; });
+  if (fila) {
+    const previo = hoja.getRange(fila, 2).getValue();
+    hoja.getRange(fila, 2).setValue('');
+    t.ok('Registro de nuevos correos sin valor = Cerrado (R6.3)', registroAbierto_(ss) === false);
+    hoja.getRange(fila, 2).setValue(previo);
+  }
+}
+
+function escenariosSeguridad_(t, c) {
+  const ss = c.ss;
+  const tz = c.tz;
+  // Una operativa de prueba en «Usuarios» de la COPIA.
+  const usuarios = leerTabla_(ss, 'usuarios', tz);
+  if (!usuarios.filas.some(function (u) { return u.correo === CORREO_OPERATIVA_PRUEBA; })) {
+    agregarFilas_(usuarios, [{ correo: CORREO_OPERATIVA_PRUEBA, activo: 'Sí', rol: ROLES.OPERATIVO, nombre: 'Operativa de prueba', notas: 'Solo en la copia de prueba' }], tz);
+  }
+  olvidarUsuariosEnCache_(ss);
+  const tokAdmin = sesionPrueba_(c, CONFIG.CORREO_ADMIN);
+  const tokOper = sesionPrueba_(c, CORREO_OPERATIVA_PRUEBA);
+
+  const rOper = llamarPrueba_(obtenerDatos, tokOper);
+  const json = JSON.stringify(rOper);
+  t.ok('Operativa: el JSON no trae costos, márgenes, valor del inventario ni comisiones',
+    !/"costo"|"costoUnitario"|"valorInventario"|"margen|"comision"|"porcentaje"|"proveedor"|"utilidad"/.test(json), json.slice(0, 300));
+  t.ok('Operativa: no recibe el enlace a la hoja ni el panel de administración', !rOper.datos.admin && !/docs\.google\.com\/spreadsheets/.test(json));
+  const rAdmin = llamarPrueba_(obtenerDatos, tokAdmin);
+  t.ok('Administradora: recibe valor del inventario y comisiones', rAdmin.datos.kpis.valorInventario !== undefined && Array.isArray(rAdmin.datos.comisiones));
+  let error = '';
+  try { llamarPrueba_(guardarProducto, tokOper, { nombre: 'Prueba', precio: 1000 }); } catch (e) { error = e.message; }
+  t.ok('Operativa: escritura reservada a administradoras rechazada en el servidor', /solo para administradoras/.test(error), error);
+  error = '';
+  try { llamarPrueba_(obtenerDatos, 'x'.repeat(64)); } catch (e) { error = e.message; }
+  t.ok('Token de sesión falso rechazado con [SESION]', error.indexOf(PREFIJO_SESION) === 0, error);
+  const vencida = crearSesion_(CONFIG.CORREO_ADMIN, false, 'PRUEBA');
+  c.tokens.push(vencida.token);
+  const clave = claveSesion_(vencida.token);
+  const s = JSON.parse(PropertiesService.getScriptProperties().getProperty(clave));
+  s.x = Date.now() - 1000;
+  PropertiesService.getScriptProperties().setProperty(clave, JSON.stringify(s));
+  CacheService.getScriptCache().remove(clave);
+  error = '';
+  try { llamarPrueba_(obtenerDatos, vencida.token); } catch (e) { error = e.message; }
+  t.ok('Sesión vencida rechazada con [SESION]', error.indexOf(PREFIJO_SESION) === 0, error);
+  error = '';
+  try { iniciarSesion({ token: tokAdmin, mes: hoy_(tz).slice(0, 7), datos: {} }); } catch (e) { error = e.message; }
+  t.ok('Página vieja (sin versión) recibe [SESION] y se le pide recargar', error.indexOf(PREFIJO_SESION) === 0 && /Recargue/.test(error), error);
+  // Auditoría: una escritura deja rastro con correo verificado, función y unidad.
+  const prod = leerTabla_(ss, 'productos', tz).filas.filter(function (p) { return esActivo_(p.activo); })[0];
+  if (prod) {
+    const hoja = ss.getSheetByName(ESQUEMA.auditoria.hoja);
+    const antes = hoja.getLastRow();
+    const id = 'prueba_' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
+    const req = { token: tokAdmin, mes: hoy_(tz).slice(0, 7), idSolicitud: id, cliente: CONFIG.VERSION,
+      datos: { tipo: 'ajuste_mas', codigo: prod.codigo, cantidad: 1, fecha: hoy_(tz), nota: 'Prueba automática (copia temporal)' } };
+    const r1 = registrarMovimiento(req);
+    const r2 = registrarMovimiento(req);
+    t.ok('Doble envío (misma solicitud) no duplica el movimiento', r1.ok && r2.repetida === true);
+    const aud = leerTabla_(ss, 'auditoria', tz).filas.slice(antes - 1);
+    t.ok('Auditoría: alta con correo verificado, función, hoja y unidad', aud.some(function (a) {
+      return a.usuario === CONFIG.CORREO_ADMIN && a.operacion === 'registrarMovimiento' && a.hoja === 'Movimientos de stock' && a.unidad === 'DISTRIBUIDORA' && a.solicitud === id;
+    }), JSON.stringify(aud.slice(-3)));
+  }
+}

@@ -1,0 +1,1867 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Cartera de crédito y cobranzas (v2.3 · Fase 2 · R0)
+ * =====================================================================
+ *  Réplica de las hojas CREDITOS, COBROS y CLIENTES del xlsx «MB_Control_Ventas_Creditos_Cobranzas»:
+ *   - Plan de pagos (entrega mínima, recargo financiero, cuotas y vencimientos) con las fórmulas del xlsx.
+ *   - Controles con los mensajes literales del xlsx; solo lo que el xlsx marca «requiere autorización» lo aprueba
+ *     una administradora con motivo; lo demás fuera de política lo rechaza el servidor.
+ *   - Cascada de cobros (entrega → cuotas en orden), vencido, días de atraso, estado del crédito y de la clienta,
+ *     sugerencia de categoría, antigüedad por tramos, top 10 por monto vencido.
+ *   - Venta a crédito (R0.4), cobros y su anulación con reversa (R0.5), conciliación, categorías, saldos
+ *     históricos, cobros a confirmar y estado por clienta (R0.6).
+ *  Diferencias deliberadas con el xlsx (declaradas en FASE_2.md):
+ *   1. Plan A CONFIRMAR: sin cuotas, sin atraso, sin bloqueo y sin alertas (el xlsx asume 1 cuota a 7 días).
+ *   2. El recargo se agrega solo como línea «REC-FIN» (en el xlsx la vendedora la carga a mano).
+ *   3. Si el redondeo del recargo a 1.000 dejara una tasa efectiva mayor al límite BCP, el recargo se baja al
+ *      múltiplo de 1.000 que lo respeta (Ninguna tasa puede superarlo).
+ *   4. La antigüedad suma un tramo «PLAN A CONFIRMAR» (saldos sin plan todavía).
+ *   5. Al confirmar el plan de un crédito ya existente (VIGENTE PREVIO / HISTÓRICO) lo que el xlsx controla al
+ *      otorgar (entrega mínima, monto mínimo, cuotas de la categoría, límite) queda como ALERTA: el crédito ya
+ *      se otorgó y no se corrige nada; la estructura del plan nuevo (cuotas, cuota mínima) sí debe cumplir.
+ *  Ninguna cifra de política vive aquí: todo sale de «Parámetros de crédito» y «Categorías de crédito».
+ *  Este archivo no usa al cargarse nada de otros archivos (solo literales).
+ * =====================================================================
+ */
+
+/** Literales de las FÓRMULAS del xlsx (redondeos, tramos y nombres de categoría): no son cifras de política. */
+const XLSX_FORMULA_ = Object.freeze({
+  RED_ENTREGA: 1000, // CREDITOS!AS: REDONDEAR.MAS(subtotal × % / 1000; 0) × 1000
+  RED_RECARGO: 1000, // CREDITOS!AK: REDONDEAR(…; −3)
+  RED_MORA: 100, // CREDITOS!AU: REDONDEAR(…; −2)
+  TRAMOS: Object.freeze([7, 15, 30, 60]), // CREDITOS!AC: estado del crédito y tramos de antigüedad
+  ATRASO_BAJAR_A_C: 30, // CLIENTES!R: sugerencia de categoría
+  CATEGORIA_BASE: 'NUEVA', // INDEX(P_CAT_…; 1): sin categoría se usa la de NUEVA
+  CATEGORIA_C: 'C',
+  CATEGORIA_A: 'A',
+  FRECUENCIA_ESTANDAR: 'SEMANAL', // CREDITOS!AD: SEMANAL nunca requiere autorización
+});
+
+const PLAN_ = Object.freeze({ A_CONFIRMAR: 'A CONFIRMAR', VIGENTE: 'VIGENTE', CANCELADO: 'CANCELADO', ANULADO: 'ANULADO' });
+const ORIGEN_CREDITO_ = Object.freeze({ NUEVO: 'NUEVO', PREVIO: 'VIGENTE PREVIO', HISTORICO: 'HISTÓRICO' });
+const TRAMO_A_CONFIRMAR_ = 'PLAN A CONFIRMAR';
+/** La app recibe los cobros y los créditos cancelados de los últimos 120 días (el resto se pide con «Ver todo»). */
+const DIAS_RECIENTES_CARTERA_ = 120;
+
+/** «Sí» / «SÍ» / «si» → true. */
+function esSi_(v) {
+  return /^s[ií]/i.test(String(v === null || v === undefined ? '' : v).trim());
+}
+
+// ─────────────────────── 1. Fórmulas del xlsx (funciones puras, se prueban en memoria) ───────────────────────
+
+/** Categoría que usa el xlsx cuando la clienta no tiene categoría: NUEVA (o la primera de la lista). */
+function categoriaBase_(cats) {
+  const lista = cats || [];
+  return lista.filter(function (c) { return c.nombre === XLSX_FORMULA_.CATEGORIA_BASE; })[0] || lista[0] || null;
+}
+
+/**
+ * Entrega mínima (CREDITOS!AS) = REDONDEAR.MAS [subtotal × MAX(entrega de la categoría —si está vacía, la de NUEVA—;
+ * P_ENTREGA_EQUIPO si la venta tiene alguna línea de P_LINEA_EQUIPO)] al múltiplo de 1.000.
+ * Devuelve { monto, pct, equipamiento }.
+ */
+function entregaMinimaCredito_(subtotal, cat, cats, equipamiento, P) {
+  const base = cat || categoriaBase_(cats);
+  if (!base) throw errorUsuario_('Falta la hoja «Categorías de crédito» (o está vacía): no se puede calcular la entrega mínima.');
+  const pct = Math.max(Number(base.entrega) || 0, equipamiento ? param_(P, 'P_ENTREGA_EQUIPO') : 0);
+  return { monto: redondearArriba_(Math.max(0, Number(subtotal) || 0) * pct, XLSX_FORMULA_.RED_ENTREGA), pct: pct, equipamiento: !!equipamiento };
+}
+
+/** Tasa anual efectiva que implica un recargo sobre una base y un plazo promedio en días. */
+function tasaEfectivaRecargo_(recargo, base, promedioDias) {
+  if (!(recargo > 0) || !(base > 0) || !(promedioDias > 0)) return 0;
+  return Math.pow(1 + recargo / base, 365 / promedioDias) - 1;
+}
+
+/**
+ * Plan de pagos con las fórmulas de CREDITOS. e = { fecha, subtotal, entrega, cuotas, frecuencia, primerVto }.
+ *  - Recargo (AK), solo si n × días > P_PLAZO_SIN_REC: REDONDEAR(MAX(0; subtotal − entrega) × ((1 + P_TEA_FIN)^((días × (n + 1) / 2) / 365) − 1); −3).
+ *  - Saldo financiado (AM) = subtotal + recargo − entrega. Cuota (I) = ↓P_RED_CUOTA (financiado / n); con n = 1, todo el saldo.
+ *  - Última cuota (AL) = financiado − (n − 1) × cuota. 1er vencimiento (AP) = fecha + días (salvo que se indique otro).
+ *  - Vencimiento k = 1er vencimiento + (k − 1) × días. La entrega (cuota 0) vence el día de la venta.
+ */
+function calcularPlanCredito_(e, P) {
+  const frecuencia = normalizarFrecuencia_(e.frecuencia || XLSX_FORMULA_.FRECUENCIA_ESTANDAR);
+  const dias = diasFrecuencia_(P, frecuencia);
+  const n = Math.max(1, Math.floor(Number(e.cuotas) || 1)); // AO (el máximo lo controla «MÁS CUOTAS QUE LA POLÍTICA»)
+  const subtotal = Math.max(0, Math.round(Number(e.subtotal) || 0));
+  const entrega = Math.max(0, Math.round(Number(e.entrega) || 0));
+  const plazo = n * dias;
+  const promedio = dias * (n + 1) / 2;
+  const base = Math.max(0, subtotal - entrega);
+  let recargo = 0;
+  let recargoLimitado = false;
+  if (plazo > param_(P, 'P_PLAZO_SIN_REC') && base > 0) {
+    recargo = redondear_(base * (Math.pow(1 + param_(P, 'P_TEA_FIN'), promedio / 365) - 1), XLSX_FORMULA_.RED_RECARGO);
+    const limite = param_(P, 'P_LIMITE_BCP');
+    if (recargo > 0 && tasaEfectivaRecargo_(recargo, base, promedio) > limite + 1e-12) {
+      recargo = Math.max(0, redondearAbajo_(base * (Math.pow(1 + limite, promedio / 365) - 1), XLSX_FORMULA_.RED_RECARGO));
+      recargoLimitado = true;
+    }
+  }
+  const total = subtotal + recargo;
+  const financiado = Math.max(0, total - entrega);
+  const cuota = n <= 1 ? financiado : redondearAbajo_(financiado / n, param_(P, 'P_RED_CUOTA'));
+  const ultima = financiado - (n - 1) * cuota;
+  const primerVto = e.primerVto || sumarDias_(e.fecha, dias);
+  const cuotas = [];
+  if (entrega > 0) cuotas.push({ n: 0, vto: e.fecha, monto: entrega });
+  for (let k = 1; k <= n; k++) cuotas.push({ n: k, vto: sumarDias_(primerVto, (k - 1) * dias), monto: k < n ? cuota : ultima });
+  return {
+    fecha: e.fecha, frecuencia: frecuencia, dias: dias, n: n, subtotal: subtotal, entrega: entrega, base: base,
+    recargo: recargo, recargoLimitado: recargoLimitado, tasaEfectiva: tasaEfectivaRecargo_(recargo, base, promedio),
+    total: total, financiado: financiado, cuota: cuota, ultima: ultima, primerVto: primerVto,
+    ultimoVto: cuotas[cuotas.length - 1].vto, plazo: plazo, promedio: promedio, cuotas: cuotas,
+  };
+}
+
+/** Resumen del plan para la app y los mensajes. */
+function resumenPlan_(plan) {
+  return {
+    subtotal: plan.subtotal, recargo: plan.recargo, recargoLimitado: plan.recargoLimitado, tasaEfectiva: plan.tasaEfectiva,
+    total: plan.total, entrega: plan.entrega, financiado: plan.financiado, n: plan.n, cuota: plan.cuota, ultima: plan.ultima,
+    frecuencia: plan.frecuencia, dias: plan.dias, primerVto: plan.primerVto, ultimoVto: plan.ultimoVto, plazo: plan.plazo,
+    cuotas: plan.cuotas.map(function (q) { return { n: q.n, vto: q.vto, monto: q.monto }; }),
+  };
+}
+
+function textoPlan_(plan) {
+  const f = plan.frecuencia.toLowerCase();
+  return (plan.entrega ? 'entrega Gs. ' + miles_(plan.entrega) + ' + ' : '') + plan.n + (plan.n === 1 ? ' pago' : ' cuotas ' + (f === 'mensual' ? 'mensuales' : f + 'es')) +
+    ' de Gs. ' + miles_(plan.cuota) + (plan.ultima !== plan.cuota ? ' (última Gs. ' + miles_(plan.ultima) + ')' : '') +
+    (plan.n === 1 ? ', el ' + formatoFecha_(plan.primerVto) : ', del ' + formatoFecha_(plan.primerVto) + ' al ' + formatoFecha_(plan.ultimoVto)) +
+    (plan.recargo ? '; recargo financiero Gs. ' + miles_(plan.recargo) + (plan.recargoLimitado ? ' (ajustado al límite BCP)' : '') : '; sin recargo') + '.';
+}
+
+/** ¿La frecuencia necesita autorización? (CREDITOS!AD: SEMANAL nunca; las demás solo si la categoría no las permite). */
+function frecuenciaRequiereAutorizacion_(cat, frecuencia) {
+  if (frecuencia === XLSX_FORMULA_.FRECUENCIA_ESTANDAR) return false;
+  return !frecuenciaPermitida_(cat, frecuencia);
+}
+
+/** Agrega un problema { codigo (texto literal del xlsx), mensaje, autorizable, severidad }. */
+function problema_(lista, codigo, detalle, autorizable, severidad) {
+  lista.push({ codigo: codigo, mensaje: codigo + (detalle ? ': ' + detalle : '.'), autorizable: !!autorizable, severidad: severidad || (autorizable ? 'AUTORIZAR' : 'RECHAZO') });
+}
+
+/**
+ * Controles de un crédito NUEVO (venta a crédito), en el orden de CREDITOS!AD, con los mensajes literales del xlsx.
+ * v = { P, cats, cat, clienta: { saldo, atraso, estado }, plan, cuotasPedidas, entregaMinima, lineasPrecio,
+ *       entregaCobradaAhora, moraPactada }.
+ * Autorizables (administradora + motivo): FRECUENCIA REQUIERE AUTORIZACIÓN y, por precio, DESCUENTO REQUIERE
+ * AUTORIZACIÓN y MARGEN BAJO MÍNIMO. Todo lo demás se rechaza (aunque se manipule el navegador).
+ */
+function controlesCreditoNuevo_(v) {
+  const P = v.P;
+  const plan = v.plan;
+  const pr = [];
+  const maxCuotas = param_(P, 'P_MAX_CUOTAS');
+  if (!(v.cuotasPedidas >= 1)) problema_(pr, 'DEFINIR N° DE CUOTAS', 'indique de 1 a ' + maxCuotas + ' cuotas, además de la entrega');
+  else if (v.cuotasPedidas > maxCuotas) problema_(pr, 'MÁS CUOTAS QUE LA POLÍTICA', 'la política permite hasta ' + maxCuotas + ' cuotas además de la entrega');
+  if (!v.cat) problema_(pr, 'ASIGNAR CATEGORÍA A LA CLIENTA', 'una administradora debe asignarla (Cartera › Clientas) antes de venderle a crédito');
+  if (plan.entrega < v.entregaMinima.monto) {
+    problema_(pr, 'ENTREGA MENOR AL MÍNIMO', 'la entrega es Gs. ' + miles_(plan.entrega) + ' y la mínima es Gs. ' + miles_(v.entregaMinima.monto) + ' (' +
+      porcentajeTexto_(v.entregaMinima.pct) + (v.entregaMinima.equipamiento ? ', la venta incluye equipamiento' : '') + ')');
+  }
+  if (plan.subtotal < param_(P, 'P_MIN_CREDITO')) problema_(pr, 'MONTO MENOR AL MÍNIMO PARA CRÉDITO', 'el mínimo para vender a crédito es Gs. ' + miles_(param_(P, 'P_MIN_CREDITO')));
+  const catCuotas = v.cat || categoriaBase_(v.cats);
+  if (v.cuotasPedidas >= 1 && catCuotas && v.cuotasPedidas > catCuotas.cuotas) {
+    problema_(pr, 'CUOTAS SOBRE EL MÁXIMO DE SU CATEGORÍA', 'la categoría ' + catCuotas.nombre + ' permite hasta ' + catCuotas.cuotas + ' cuotas');
+  }
+  if (plan.n > 1 && plan.cuota < param_(P, 'P_CUOTA_MIN')) {
+    problema_(pr, 'CUOTA MENOR A LA MÍNIMA', 'la cuota queda en Gs. ' + miles_(plan.cuota) + ' y la mínima es Gs. ' + miles_(param_(P, 'P_CUOTA_MIN')));
+  }
+  if (frecuenciaRequiereAutorizacion_(v.cat, plan.frecuencia)) {
+    problema_(pr, 'FRECUENCIA REQUIERE AUTORIZACIÓN', 'la frecuencia ' + plan.frecuencia + (v.cat ? ' no está prevista para la categoría ' + v.cat.nombre : ''), true);
+  }
+  const clienta = v.clienta || {};
+  if ((clienta.atraso || 0) > param_(P, 'P_DIAS_BLOQUEO')) {
+    problema_(pr, 'CLIENTA BLOQUEADA', 'tiene ' + clienta.atraso + ' días de atraso y se bloquean los créditos nuevos con más de ' + param_(P, 'P_DIAS_BLOQUEO'));
+  }
+  if (v.cat) {
+    const exposicion = (clienta.saldo || 0) + plan.total - (v.entregaCobradaAhora || 0);
+    if (exposicion > v.cat.limite) {
+      problema_(pr, 'CLIENTA EXCEDE SU LÍMITE', 'saldo con esta venta Gs. ' + miles_(exposicion) + '; límite de la categoría ' + v.cat.nombre + ' Gs. ' + miles_(v.cat.limite));
+    }
+  }
+  const limite = param_(P, 'P_LIMITE_BCP');
+  if ((plan.recargo > 0 && param_(P, 'P_TEA_FIN') > limite + 1e-12) || (v.moraPactada && param_(P, 'P_TEA_MORA') > limite + 1e-12)) {
+    problema_(pr, 'REVISAR: una tasa supera el límite BCP', 'corrija «Parámetros de crédito» antes de otorgar este crédito');
+  }
+  if (plan.total > 0 && plan.entrega >= plan.total) problema_(pr, 'LA ENTREGA CUBRE EL TOTAL', 'registre la venta al contado');
+  (v.lineasPrecio && v.lineasPrecio.length ? controlesPrecios_(v.lineasPrecio, P) : []).forEach(function (p) {
+    pr.push({ codigo: p.codigo, mensaje: p.mensaje, autorizable: p.autorizable, severidad: p.autorizable ? 'AUTORIZAR' : 'RECHAZO' });
+  });
+  return pr;
+}
+
+/**
+ * Controles al CONFIRMAR el plan de un crédito ya existente (VIGENTE PREVIO o HISTÓRICO, plan A CONFIRMAR).
+ * La estructura del plan nuevo debe cumplir (rechazo); FRECUENCIA requiere autorización; lo que el xlsx controla al
+ * otorgar un crédito de VENTA (entrega mínima, monto mínimo, cuotas de la categoría, límite) queda como ALERTA.
+ */
+function controlesConfirmarPlan_(v) {
+  const P = v.P;
+  const plan = v.plan;
+  const pr = [];
+  const maxCuotas = param_(P, 'P_MAX_CUOTAS');
+  if (!(v.cuotasPedidas >= 1)) problema_(pr, 'DEFINIR N° DE CUOTAS', 'indique de 1 a ' + maxCuotas + ' cuotas');
+  else if (v.cuotasPedidas > maxCuotas) problema_(pr, 'MÁS CUOTAS QUE LA POLÍTICA', 'la política permite hasta ' + maxCuotas + ' cuotas además de la entrega');
+  if (!v.cat) problema_(pr, 'ASIGNAR CATEGORÍA A LA CLIENTA', 'define las cuotas y frecuencias permitidas; asígnela antes de confirmar el plan');
+  if (plan.n > 1 && plan.cuota < param_(P, 'P_CUOTA_MIN')) {
+    problema_(pr, 'CUOTA MENOR A LA MÍNIMA', 'la cuota queda en Gs. ' + miles_(plan.cuota) + ' y la mínima es Gs. ' + miles_(param_(P, 'P_CUOTA_MIN')));
+  }
+  if (frecuenciaRequiereAutorizacion_(v.cat, plan.frecuencia)) {
+    problema_(pr, 'FRECUENCIA REQUIERE AUTORIZACIÓN', 'la frecuencia ' + plan.frecuencia + (v.cat ? ' no está prevista para la categoría ' + v.cat.nombre : ''), true);
+  }
+  const limite = param_(P, 'P_LIMITE_BCP');
+  if ((plan.recargo > 0 && param_(P, 'P_TEA_FIN') > limite + 1e-12) || (v.moraPactada && param_(P, 'P_TEA_MORA') > limite + 1e-12)) {
+    problema_(pr, 'REVISAR: una tasa supera el límite BCP', 'corrija «Parámetros de crédito» antes de confirmar el plan');
+  }
+  if (plan.total > 0 && plan.entrega > plan.total) problema_(pr, 'LA ENTREGA SUPERA EL TOTAL', 'revise el monto de la entrega');
+  if (v.origen === ORIGEN_CREDITO_.PREVIO) {
+    if (v.entregaMinima && plan.entrega < v.entregaMinima.monto) {
+      problema_(pr, 'ENTREGA MENOR AL MÍNIMO', 'Gs. ' + miles_(plan.entrega) + ' (' + porcentajeTexto_(plan.subtotal ? plan.entrega / plan.subtotal : 0) + ') frente a la mínima de Gs. ' +
+        miles_(v.entregaMinima.monto) + ' (' + porcentajeTexto_(v.entregaMinima.pct) + '); el crédito ya estaba otorgado: no se corrige', false, 'ALERTA');
+    }
+    if (plan.subtotal < param_(P, 'P_MIN_CREDITO')) problema_(pr, 'MONTO MENOR AL MÍNIMO PARA CRÉDITO', 'crédito ya otorgado: no se corrige', false, 'ALERTA');
+    const catCuotas = v.cat || categoriaBase_(v.cats);
+    if (v.cuotasPedidas >= 1 && catCuotas && v.cuotasPedidas > catCuotas.cuotas) {
+      problema_(pr, 'CUOTAS SOBRE EL MÁXIMO DE SU CATEGORÍA', 'la categoría ' + catCuotas.nombre + ' permite hasta ' + catCuotas.cuotas + ' cuotas; crédito ya otorgado', false, 'ALERTA');
+    }
+  }
+  if (v.cat && v.clienta && (v.clienta.saldo || 0) > v.cat.limite) {
+    problema_(pr, 'CLIENTA EXCEDE SU LÍMITE', 'saldo Gs. ' + miles_(v.clienta.saldo) + '; límite de la categoría ' + v.cat.nombre + ' Gs. ' + miles_(v.cat.limite), false, 'ALERTA');
+  }
+  return pr;
+}
+
+/**
+ * Decide si se puede seguir: lo que se rechaza lanza el error con todos los motivos; lo autorizable exige una
+ * administradora que marque «autorizar» y escriba el motivo (mínimo 5 letras). Las ALERTAS no detienen.
+ * Devuelve { por, motivo, codigos, alertas } (por = '' si no hizo falta autorizar).
+ */
+function resolverAutorizacion_(problemas, ctx, d) {
+  const rechazos = problemas.filter(function (p) { return p.severidad === 'RECHAZO'; });
+  if (rechazos.length) throw errorUsuario_(rechazos.map(function (p) { return p.mensaje; }).join(' · '));
+  const autorizables = problemas.filter(function (p) { return p.severidad === 'AUTORIZAR'; });
+  const alertas = problemas.filter(function (p) { return p.severidad === 'ALERTA'; }).map(function (p) { return p.mensaje; });
+  if (!autorizables.length) return { por: '', motivo: '', codigos: [], alertas: alertas };
+  const lista = autorizables.map(function (p) { return p.mensaje; }).join(' · ');
+  if (!esAdministradora_(ctx.usuario)) throw errorUsuario_(lista + ' · Requiere la autorización de una administradora.');
+  const motivo = texto_(d && d.motivoAutorizacion, 200);
+  if (!d || d.autorizar !== true || motivo.length < 5) {
+    throw errorUsuario_('Necesita autorización: ' + lista + ' · Marque «Autorizo la excepción» y escriba el motivo (mínimo 5 letras).');
+  }
+  const codigos = autorizables.map(function (p) { return p.codigo; });
+  return {
+    por: ctx.email + ' · ' + Utilities.formatDate(new Date(), ctx.tz || CONFIG.ZONA_HORARIA, 'dd/MM/yyyy HH:mm'),
+    motivo: motivo + ' (' + codigos.join(', ') + ')', codigos: codigos, alertas: alertas,
+  };
+}
+
+/**
+ * Cascada de cobros (CREDITOS!J, L…V): los cobros (salvo RECARGO POR MORA) cubren primero la entrega y después las
+ * cuotas en orden. Equivale a «pagado k = MIN(monto k; MAX(0; cobrado a cuotas − (k − 1) × cuota))».
+ * cuotas: [{ numero, monto }]; cobros: [{ id, fecha, monto }] ya ordenados por fecha. Devuelve
+ * { pagado: { numero: monto }, cobrado, aplicaciones: { id: { texto, saldoDespues } }, fechaCancelacion }.
+ */
+function aplicarCascada_(total, cuotas, cobros) {
+  const orden = cuotas.slice().sort(function (a, b) { return a.numero - b.numero; });
+  const pagado = {};
+  orden.forEach(function (q) { pagado[q.numero] = 0; });
+  let cobrado = 0;
+  let fechaCancelacion = '';
+  const aplicaciones = {};
+  cobros.forEach(function (cb) {
+    let resto = cb.monto;
+    const partes = [];
+    orden.forEach(function (q) {
+      if (resto <= 0) return;
+      const falta = q.monto - pagado[q.numero];
+      if (falta <= 0) return;
+      const a = Math.min(falta, resto);
+      pagado[q.numero] += a;
+      resto -= a;
+      partes.push((q.numero === 0 ? 'Entrega' : 'Cuota ' + q.numero) + ' ' + miles_(a) + (a < falta ? ' (parcial)' : ''));
+    });
+    if (resto > 0) partes.push((orden.length ? 'Excedente ' : 'A cuenta del saldo ') + miles_(resto));
+    cobrado += cb.monto;
+    const saldoDespues = total - cobrado;
+    if (saldoDespues <= 0 && !fechaCancelacion) fechaCancelacion = cb.fecha;
+    aplicaciones[cb.id] = { texto: partes.join('; '), saldoDespues: saldoDespues };
+  });
+  return { pagado: pagado, cobrado: cobrado, aplicaciones: aplicaciones, fechaCancelacion: fechaCancelacion };
+}
+
+/** Estado del crédito (CREDITOS!AC) según el saldo y los días de atraso. */
+function estadoCreditoPorAtraso_(saldo, atraso, P) {
+  if (saldo <= 0) return 'CANCELADO';
+  if (atraso <= param_(P, 'P_GRACIA')) return 'AL DÍA';
+  const t = XLSX_FORMULA_.TRAMOS;
+  if (atraso <= t[0]) return 'ATRASO HASTA 7';
+  if (atraso <= t[1]) return 'ATRASO 8-15';
+  if (atraso <= t[2]) return 'ATRASO 16-30';
+  if (atraso <= t[3]) return 'ATRASO 31-60';
+  return 'ATRASO +60';
+}
+
+/** Estado de una cuota a la fecha de corte (columna «Estado» de «Cuotas»). */
+function estadoCuota_(q, pagado, corte, gracia) {
+  if (pagado >= q.monto) return 'PAGADA';
+  if (q.vencimiento && sumarDias_(q.vencimiento, gracia) < corte) return pagado > 0 ? 'VENCIDA (PARCIAL)' : 'VENCIDA';
+  if (q.vencimiento && q.vencimiento < corte) return 'EN GRACIA';
+  return pagado > 0 ? 'PARCIAL' : 'PENDIENTE';
+}
+
+/**
+ * ¿Se puede cobrar mora? Solo si el plan firmado la prevé («Mora pactada en el plan» = Sí) y existe la política de
+ * crédito firmada (P_POLITICA_FIRMADA no vacía).
+ */
+function moraCobrable_(credito, P) {
+  return esSi_(credito.moraPactada) && P.P_POLITICA_FIRMADA !== null && P.P_POLITICA_FIRMADA !== undefined && String(P.P_POLITICA_FIRMADA) !== '';
+}
+
+/**
+ * Situación de UN crédito a la fecha de corte (función pura). c = fila de «Créditos»; cuotas = sus filas de «Cuotas»;
+ * cobros = sus cobros válidos (no anulados, no mora, fecha ≤ corte) ORDENADOS por fecha.
+ *  - Vencido (AA): la entrega impaga si fecha de venta + gracia < corte; cada cuota impaga si vencimiento + gracia < corte.
+ *  - Días de atraso (AB) = MAX(0; corte − próximo vencimiento impago). Mora sugerida (AU) = REDONDEAR(vencido ×
+ *    ((1 + P_TEA_MORA)^(atraso / 365) − 1); −2), solo si moraCobrable_.
+ *  - Plan A CONFIRMAR (sin cuotas): sin vencido, sin atraso, estado «A CONFIRMAR» (diferencia deliberada con el xlsx).
+ */
+function situacionCredito_(c, cuotas, cobros, corte, P) {
+  const anulado = clave_(c.estadoPlan) === PLAN_.ANULADO;
+  const gracia = param_(P, 'P_GRACIA');
+  const conPlan = !anulado && cuotas.length > 0;
+  const total = Number(c.total) || 0;
+  const cascada = aplicarCascada_(total, conPlan ? cuotas : [], anulado ? [] : cobros);
+  const saldo = anulado ? 0 : total - cascada.cobrado;
+  let vencido = 0;
+  let proximo = null;
+  const detalleCuotas = (conPlan ? cuotas : []).slice().sort(function (a, b) { return a.numero - b.numero; }).map(function (q) {
+    const pag = cascada.pagado[q.numero] || 0;
+    const falta = Math.max(0, q.monto - pag);
+    if (falta > 0 && saldo > 0) {
+      if (!proximo) proximo = { vto: q.vencimiento, falta: falta, numero: q.numero };
+      if (q.vencimiento && sumarDias_(q.vencimiento, gracia) < corte) vencido += falta;
+    }
+    return { fila: q._fila, numero: q.numero, vencimiento: q.vencimiento, monto: q.monto, pagado: pag, falta: falta, estado: estadoCuota_(q, pag, corte, gracia) };
+  });
+  const atraso = proximo && proximo.vto && saldo > 0 ? Math.max(0, diasEntre_(proximo.vto, corte)) : 0;
+  let estado;
+  if (anulado) estado = 'ANULADO';
+  else if (saldo <= 0) estado = 'CANCELADO';
+  else if (!conPlan) estado = PLAN_.A_CONFIRMAR;
+  else estado = estadoCreditoPorAtraso_(saldo, atraso, P);
+  const mora = conPlan && vencido > 0 && moraCobrable_(c, P) ? redondear_(vencido * (Math.pow(1 + param_(P, 'P_TEA_MORA'), atraso / 365) - 1), XLSX_FORMULA_.RED_MORA) : 0;
+  return {
+    anulado: anulado, conPlan: conPlan, total: total, cobrado: cascada.cobrado, saldo: saldo, vencido: vencido, atraso: atraso,
+    proximoVto: proximo ? proximo.vto : '', aCobrar: proximo ? proximo.falta : 0, estado: estado, cuotas: detalleCuotas,
+    moraSugerida: mora, aplicaciones: cascada.aplicaciones, fechaCancelacion: cascada.fechaCancelacion, cobradoDeMas: !anulado && saldo < 0,
+  };
+}
+
+/** Estado de crédito de la clienta (CLIENTES!Q): la primera condición que se cumpla. */
+function estadoClienta_(activo, cat, saldo, atraso, P) {
+  if (!activo) return 'INACTIVA';
+  if (atraso > param_(P, 'P_DIAS_BLOQUEO')) return 'BLOQUEADA';
+  if (!cat) return 'ASIGNAR CATEGORÍA';
+  if (saldo > cat.limite) return 'EXCEDE LÍMITE';
+  if (saldo <= 0) return 'SIN DEUDA';
+  return 'HABILITADA';
+}
+
+/** Sugerencia de categoría (CLIENTES!R). Sin categoría: vacío. */
+function sugerenciaCategoria_(cat, atraso, P) {
+  if (!cat) return '';
+  if (atraso > XLSX_FORMULA_.ATRASO_BAJAR_A_C) return cat.nombre === XLSX_FORMULA_.CATEGORIA_C ? 'MANTENER EN C' : 'BAJAR A C';
+  if (atraso > param_(P, 'P_DIAS_BLOQUEO') && cat.nombre === XLSX_FORMULA_.CATEGORIA_A) return 'BAJAR A B';
+  return 'MANTENER';
+}
+
+/**
+ * PLAN SUGERIDO para regularizar un saldo (R0.8 b): nunca se aplica solo. Sin categoría no se calcula (se pide
+ * asignarla). Con categoría: sin entrega, frecuencia SEMANAL, la mayor cantidad de cuotas que permiten la política y
+ * la categoría sin bajar de la cuota mínima. Devuelve { texto, plan }.
+ */
+function planSugerido_(saldo, cat, P, fechaBase) {
+  if (!(saldo > 0)) return { texto: '', plan: null };
+  if (!cat) return { texto: 'Asigne la categoría de la clienta: el plan sugerido se calcula según su categoría (nunca se aplica solo).', plan: null };
+  const minimo = param_(P, 'P_CUOTA_MIN');
+  let n = Math.max(1, Math.min(cat.cuotas, param_(P, 'P_MAX_CUOTAS'), Math.floor(saldo / minimo) || 1));
+  let plan = calcularPlanCredito_({ fecha: fechaBase, subtotal: saldo, entrega: 0, cuotas: n, frecuencia: XLSX_FORMULA_.FRECUENCIA_ESTANDAR }, P);
+  while (n > 1 && plan.cuota < minimo) {
+    n--;
+    plan = calcularPlanCredito_({ fecha: fechaBase, subtotal: saldo, entrega: 0, cuotas: n, frecuencia: XLSX_FORMULA_.FRECUENCIA_ESTANDAR }, P);
+  }
+  const texto = 'PLAN SUGERIDO (categoría ' + cat.nombre + '; no se aplica solo): sin entrega, ' + n + (n === 1 ? ' pago' : ' cuotas semanales') + ' de Gs. ' + miles_(plan.cuota) +
+    (plan.ultima !== plan.cuota ? ' (última Gs. ' + miles_(plan.ultima) + ')' : '') + ', 1er vencimiento ' + plan.dias + ' días después de confirmarlo' +
+    (plan.recargo ? '; recargo financiero Gs. ' + miles_(plan.recargo) : '; sin recargo') + '.';
+  return { texto: texto, plan: plan };
+}
+
+// ─────────────────────── 2. Modelo de cartera (fuente única: «Créditos», «Cuotas» y «Cobros») ───────────────────────
+
+/** Hojas de clientes con el mismo contrato de columnas: «Peluquerías» (C-) y «Clientas salón» (CS-). */
+function tablasClientes_(ss, tz) {
+  const lista = [{ clave: 'peluquerias', tabla: leerTabla_(ss, 'peluquerias', tz) }];
+  try { lista.push({ clave: 'clientasSalon', tabla: leerTabla_(ss, 'clientasSalon', tz) }); } catch (e) { /* la hoja se crea con la instalación */ }
+  return lista;
+}
+
+/** Fecha en que el recargo pasó a formar parte de la deuda: la de la venta (NUEVO) o la de la confirmación del plan. */
+function fechaRecargoCredito_(c) {
+  if (clave_(c.origen) === ORIGEN_CREDITO_.NUEVO || !c.confirmadoEl) return c.fecha;
+  return String(c.confirmadoEl).slice(0, 10);
+}
+
+/** ¿El plan (cuotas) ya existía a la fecha de corte? Los planes confirmados después del corte todavía eran A CONFIRMAR. */
+function planExistiaEn_(c, corte) {
+  if (clave_(c.origen) === ORIGEN_CREDITO_.NUEVO || !c.confirmadoEl) return true;
+  return String(c.confirmadoEl).slice(0, 10) <= corte;
+}
+
+/**
+ * Lee «Créditos», «Cuotas», «Cobros», «Peluquerías» y «Clientas salón» y calcula todo SIN escribir.
+ * corteForzado ('AAAA-MM-DD', opcional): situación a esa fecha (excluye créditos y cobros posteriores). Por defecto, hoy
+ * en America/Asuncion. Devuelve { P, cats, hoy, corte, creditos, cobros, clientes, clientesPorCodigo, aplicacionPorCobro,
+ * antiguedad, top10, totales, sinClienta, tablas }.
+ */
+function modeloCartera_(ss, tz, corteForzado) {
+  const P = leerParametros_(ss, tz);
+  const cats = leerCategorias_(ss, tz);
+  const hoy = hoy_(tz);
+  const corte = corteForzado || hoy;
+  const historico = corte < hoy;
+  const tCred = leerTabla_(ss, 'creditos', tz);
+  const tCuo = leerTabla_(ss, 'cuotas', tz);
+  const tCob = leerTabla_(ss, 'cobros', tz);
+  const tablasCli = tablasClientes_(ss, tz);
+  const conceptoMora = clave_(param_(P, 'P_CONC_MORA'));
+
+  const cuotasPorCredito = {};
+  tCuo.filas.forEach(function (q) {
+    const k = clave_(q.credito);
+    if (k) (cuotasPorCredito[k] = cuotasPorCredito[k] || []).push(q);
+  });
+  const validosPorCredito = {};
+  const moraPorCredito = {};
+  const cobros = tCob.filas.filter(function (c) { return clave_(c.id); }).map(function (c) {
+    const o = Object.assign({}, c);
+    o.esAnulado = esSi_(c.anulado);
+    o.esMora = clave_(c.concepto) === conceptoMora;
+    o.esConciliado = esSi_(c.conciliado);
+    o.enCorte = !!c.fecha && c.fecha <= corte;
+    const k = clave_(c.credito);
+    if (!o.esAnulado && o.enCorte) {
+      if (o.esMora) moraPorCredito[k] = (moraPorCredito[k] || 0) + (Number(c.monto) || 0);
+      else (validosPorCredito[k] = validosPorCredito[k] || []).push(o);
+    }
+    return o;
+  });
+  Object.keys(validosPorCredito).forEach(function (k) {
+    validosPorCredito[k].sort(function (a, b) { return a.fecha < b.fecha ? -1 : (a.fecha > b.fecha ? 1 : (String(a.id) < String(b.id) ? -1 : 1)); });
+  });
+
+  const aplicacionPorCobro = {};
+  const creditos = [];
+  tCred.filas.forEach(function (c) {
+    const k = clave_(c.id);
+    if (!k || (historico && c.fecha && c.fecha > corte)) return;
+    const conPlan = planExistiaEn_(c, corte);
+    const subtotal = Number(c.subtotal) || Math.max(0, (Number(c.total) || 0) - (Number(c.recargo) || 0));
+    const recargoEnCorte = (Number(c.recargo) || 0) > 0 && fechaRecargoCredito_(c) <= corte ? Number(c.recargo) : 0;
+    const total = historico ? subtotal + recargoEnCorte : (Number(c.total) || subtotal + recargoEnCorte);
+    const s = situacionCredito_(Object.assign({}, c, { total: total }), conPlan ? (cuotasPorCredito[k] || []) : [], validosPorCredito[k] || [], corte, P);
+    Object.keys(s.aplicaciones).forEach(function (id) { aplicacionPorCobro[id] = s.aplicaciones[id]; });
+    creditos.push({
+      fila: c._fila, id: c.id, venta: c.venta, ticket: c.ticket, codigoCliente: c.codigoCliente, cliente: c.cliente, fecha: c.fecha,
+      subtotal: subtotal, recargo: Number(c.recargo) || 0, total: total, entrega: c.entrega, nCuotas: c.cuotas, frecuencia: c.frecuencia,
+      primerVto: c.primerVto, montoCuota: c.montoCuota, ultimaCuota: c.ultimaCuota, estadoPlanHoja: clave_(c.estadoPlan), categoria: c.categoria,
+      origen: clave_(c.origen), legado: c.legado, autorizadoPor: c.autorizadoPor, motivoAutorizacion: c.motivoAutorizacion,
+      observacion: c.observacion, unidad: c.unidad, usuario: c.usuario, registrado: c.registrado, moraPactada: c.moraPactada,
+      planSugerido: c.planSugerido, lectura: c.lectura, alertas: c.alertas, confirmadoPor: c.confirmadoPor, confirmadoEl: c.confirmadoEl,
+      motivoAnulacion: c.motivoAnulacion, fechaRecargo: fechaRecargoCredito_(c),
+      anulado: s.anulado, conPlan: s.conPlan, cobrado: s.cobrado, saldo: s.saldo, vencido: s.vencido, atraso: s.atraso, proximoVto: s.proximoVto,
+      aCobrar: s.aCobrar, estado: s.estado, cuotas: s.cuotas, moraSugerida: s.moraSugerida, moraCobrada: moraPorCredito[k] || 0,
+      fechaCancelacion: s.fechaCancelacion, cobradoDeMas: s.cobradoDeMas, moraCobrable: moraCobrable_(c, P),
+    });
+  });
+
+  const porCliente = {};
+  creditos.forEach(function (c) {
+    if (c.anulado) return;
+    const k = clave_(c.codigoCliente);
+    (porCliente[k] = porCliente[k] || []).push(c);
+  });
+  const clientes = [];
+  const clientesPorCodigo = {};
+  tablasCli.forEach(function (tc) {
+    tc.tabla.filas.forEach(function (p) {
+      const k = clave_(p.codigo);
+      if (!k || clientesPorCodigo[k]) return;
+      const lista = porCliente[k] || [];
+      const cat = categoriaPorNombre_(cats, p.categoria);
+      const saldo = lista.reduce(function (t, c) { return t + c.saldo; }, 0);
+      const atraso = lista.reduce(function (mx, c) { return Math.max(mx, c.atraso); }, 0);
+      const activo = esActivo_(p.activo);
+      const o = {
+        hoja: tc.clave, fila: p._fila, codigo: p.codigo, nombre: p.nombre, contacto: p.contacto, telefono: p.telefono, celular: p.celular,
+        categoria: cat ? cat.nombre : '', categoriaHoja: p.categoria, cat: cat, activo: activo, legado: p.legado, alias: p.alias, ruc: p.ruc, ci: p.ci,
+        tipo: p.tipo, completitud: p.completitud,
+        saldo: saldo, vencido: lista.reduce(function (t, c) { return t + c.vencido; }, 0), atraso: atraso,
+        creditosAbiertos: lista.filter(function (c) { return c.saldo > 0; }).length,
+        aConfirmar: lista.filter(function (c) { return c.saldo > 0 && c.estado === PLAN_.A_CONFIRMAR; }).length,
+        limite: cat ? cat.limite : '', disponible: cat ? cat.limite - saldo : '',
+        estado: estadoClienta_(activo, cat, saldo, atraso, P), sugerencia: sugerenciaCategoria_(cat, atraso, P),
+        whatsapp: normalizarCelular_(p.celular) || normalizarCelular_(p.telefono),
+      };
+      clientes.push(o);
+      clientesPorCodigo[k] = o;
+    });
+  });
+  const sinClienta = creditos.filter(function (c) { return !c.anulado && !clientesPorCodigo[clave_(c.codigoCliente)]; });
+
+  const tramos = ['AL DÍA', 'ATRASO HASTA 7', 'ATRASO 8-15', 'ATRASO 16-30', 'ATRASO 31-60', 'ATRASO +60', TRAMO_A_CONFIRMAR_];
+  const antiguedad = tramos.map(function (t) { return { tramo: t, saldo: 0, n: 0, vencido: 0, pct: 0 }; });
+  const totales = { cartera: 0, vencido: 0, creditosConSaldo: 0, aConfirmar: 0, aConfirmarN: 0, porConciliar: 0, porConciliarN: 0, cobradoDeMas: 0, cobradoDeMasN: 0 };
+  creditos.forEach(function (c) {
+    if (c.anulado) return;
+    if (c.cobradoDeMas) { totales.cobradoDeMas += -c.saldo; totales.cobradoDeMasN++; }
+    if (c.saldo <= 0) return;
+    totales.cartera += c.saldo;
+    totales.vencido += c.vencido;
+    totales.creditosConSaldo++;
+    const tramo = c.estado === PLAN_.A_CONFIRMAR ? TRAMO_A_CONFIRMAR_ : c.estado;
+    const a = antiguedad[tramos.indexOf(tramo)];
+    if (a) { a.saldo += c.saldo; a.n++; a.vencido += c.vencido; }
+    if (c.estado === PLAN_.A_CONFIRMAR) { totales.aConfirmar += c.saldo; totales.aConfirmarN++; }
+  });
+  antiguedad.forEach(function (a) { a.pct = totales.cartera ? a.saldo / totales.cartera : 0; });
+  cobros.forEach(function (c) {
+    if (!c.esAnulado && c.enCorte && !c.esConciliado) { totales.porConciliar += Number(c.monto) || 0; totales.porConciliarN++; }
+  });
+  ['BLOQUEADA', 'EXCEDE LÍMITE', 'ASIGNAR CATEGORÍA', 'HABILITADA', 'SIN DEUDA', 'INACTIVA'].forEach(function (e) {
+    totales[e] = clientes.filter(function (c) { return c.estado === e; }).length;
+  });
+  const top10 = clientes.filter(function (c) { return c.vencido > 0; }).sort(function (a, b) { return b.vencido - a.vencido; }).slice(0, 10).map(function (c) {
+    return { codigo: c.codigo, nombre: c.nombre, vencido: c.vencido, atraso: c.atraso, saldo: c.saldo, whatsapp: c.whatsapp, estado: c.estado };
+  });
+  return {
+    P: P, cats: cats, hoy: hoy, corte: corte, creditos: creditos, cobros: cobros, clientes: clientes, clientesPorCodigo: clientesPorCodigo,
+    aplicacionPorCobro: aplicacionPorCobro, antiguedad: antiguedad, top10: top10, totales: totales, sinClienta: sinClienta,
+    tablas: { creditos: tCred, cuotas: tCuo, cobros: tCob, clientes: tablasCli },
+  };
+}
+
+/** Busca un crédito por N° crédito, N° venta o código legado (9001…). */
+function resolverCredito_(m, ref) {
+  const k = clave_(ref);
+  if (!k) throw errorUsuario_('Indique el crédito.');
+  const c = m.creditos.filter(function (x) { return clave_(x.id) === k; })[0] ||
+    m.creditos.filter(function (x) { return !x.anulado && (clave_(x.venta) === k || clave_(x.legado) === k); })[0];
+  if (!c) throw errorUsuario_('No se encontró el crédito «' + ref + '».');
+  return c;
+}
+
+/** Clienta (Peluquerías o Clientas salón) por código, con su tabla y fila. */
+function buscarClientaCartera_(ss, tz, codigo) {
+  const k = clave_(codigo);
+  const tablas = tablasClientes_(ss, tz);
+  for (let i = 0; i < tablas.length; i++) {
+    const f = buscarPorCodigo_(tablas[i].tabla.filas, k);
+    if (f) return { tabla: tablas[i].tabla, fila: f, hoja: tablas[i].clave };
+  }
+  return null;
+}
+
+/**
+ * Recalcula y ESCRIBE las columnas automáticas (Créditos, Cuotas, Cobros, Peluquerías, Clientas salón) y el estado de las
+ * ventas a crédito: «Cobrada» solo cuando los cobros registrados cancelan la deuda (vuelve a «Pendiente» si se anula
+ * un cobro). Idempotente: escribe solo lo que cambió. Devuelve el modelo.
+ */
+function recalcularCartera_(ss, tz) {
+  const m = modeloCartera_(ss, tz);
+  const t = m.tablas;
+  const cr = { saldo: {}, estadoCredito: {}, cobrado: {}, vencido: {}, atraso: {}, proximoVto: {}, planSugerido: {} };
+  const cambiosPlan = [];
+  m.creditos.forEach(function (c) {
+    cr.saldo[c.fila] = c.saldo;
+    cr.estadoCredito[c.fila] = c.estado + (c.cobradoDeMas ? ' · COBRADO DE MÁS: REVISAR' : '');
+    cr.cobrado[c.fila] = c.cobrado;
+    cr.vencido[c.fila] = c.vencido;
+    cr.atraso[c.fila] = c.atraso;
+    cr.proximoVto[c.fila] = c.proximoVto;
+    if (!c.anulado && !c.conPlan && c.saldo > 0) {
+      const cli = m.clientesPorCodigo[clave_(c.codigoCliente)];
+      cr.planSugerido[c.fila] = planSugerido_(c.saldo, cli ? cli.cat : null, m.P, m.hoy).texto;
+    }
+    const objetivo = c.anulado ? PLAN_.ANULADO : (c.saldo <= 0 ? PLAN_.CANCELADO : (c.conPlan ? PLAN_.VIGENTE : PLAN_.A_CONFIRMAR));
+    if (objetivo !== c.estadoPlanHoja) cambiosPlan.push({ fila: c.fila, valores: { estadoPlan: objetivo } });
+  });
+  Object.keys(cr).forEach(function (k) { escribirColumna_(t.creditos, k, cr[k], tz); });
+  actualizarFilas_(t.creditos, cambiosPlan, tz);
+
+  const cu = { pagado: {}, estado: {} };
+  m.creditos.forEach(function (c) {
+    c.cuotas.forEach(function (q) { cu.pagado[q.fila] = q.pagado; cu.estado[q.fila] = c.anulado ? 'ANULADA' : q.estado; });
+  });
+  escribirColumna_(t.cuotas, 'pagado', cu.pagado, tz);
+  escribirColumna_(t.cuotas, 'estado', cu.estado, tz);
+
+  const cb = { aplicacion: {}, saldoDespues: {} };
+  m.cobros.forEach(function (c) {
+    const a = m.aplicacionPorCobro[c.id];
+    if (c.esAnulado) { cb.aplicacion[c._fila] = 'ANULADO'; cb.saldoDespues[c._fila] = ''; }
+    else if (c.esMora) { cb.aplicacion[c._fila] = 'Recargo por mora (no amortiza el saldo)'; cb.saldoDespues[c._fila] = ''; }
+    else if (a) { cb.aplicacion[c._fila] = a.texto; cb.saldoDespues[c._fila] = a.saldoDespues; }
+  });
+  escribirColumna_(t.cobros, 'aplicacion', cb.aplicacion, tz);
+  escribirColumna_(t.cobros, 'saldoDespues', cb.saldoDespues, tz);
+
+  t.clientes.forEach(function (tc) {
+    const col = { limite: {}, saldo: {}, vencido: {}, atraso: {}, estadoCredito: {}, disponible: {}, sugerencia: {} };
+    m.clientes.filter(function (c) { return c.hoja === tc.clave; }).forEach(function (c) {
+      col.limite[c.fila] = c.limite;
+      col.saldo[c.fila] = c.saldo;
+      col.vencido[c.fila] = c.vencido;
+      col.atraso[c.fila] = c.atraso;
+      col.estadoCredito[c.fila] = c.estado;
+      col.disponible[c.fila] = c.disponible;
+      col.sugerencia[c.fila] = c.sugerencia;
+    });
+    Object.keys(col).forEach(function (k) { escribirColumna_(tc.tabla, k, col[k], tz); });
+  });
+
+  // Ventas a crédito: «Cobrada» solo cuando los cobros cancelan la deuda (R0.5).
+  const porId = {};
+  m.creditos.forEach(function (c) { if (!c.anulado) porId[clave_(c.id)] = c; });
+  const porVenta = {};
+  m.creditos.forEach(function (c) { if (!c.anulado && c.venta) porVenta[clave_(c.venta)] = c; });
+  if (Object.keys(porId).length) {
+    const ventas = leerTabla_(ss, 'ventas', tz);
+    const lote = [];
+    ventas.filas.forEach(function (v) {
+      if (v.estado === 'Anulada' || v.condicion !== 'Crédito') return;
+      const c = porId[clave_(v.nroCredito)] || porVenta[clave_(v.id)];
+      if (!c) return;
+      const estado = c.saldo <= 0 ? 'Cobrada' : 'Pendiente';
+      const fecha = c.saldo <= 0 ? (c.fechaCancelacion || m.hoy) : '';
+      if (v.estado !== estado || v.fechaCobro !== fecha) lote.push({ fila: v._fila, valores: { estado: estado, fechaCobro: fecha } });
+    });
+    actualizarFilas_(ventas, lote, tz);
+  }
+  // v2.3 · Fase 3 (R1.4): «Completitud» y «Campos faltantes» al día (también lo editado a mano en la hoja).
+  if (typeof recalcularCompletitud_ === 'function') recalcularCompletitud_(ss, tz, t.clientes);
+  return m;
+}
+
+// ─────────────────────── 3. API (llamadas desde la app; el rol se valida en el servidor con PERMISOS) ───────────────────────
+
+function calcularPlanCredito(req) { return ejecutar_('calcularPlanCredito', req, 'lectura', vistaPreviaPlan_); }
+function registrarCobro(req) { return ejecutar_('registrarCobro', req, 'escritura', registrarCobro_); }
+function anularCobro(req) { return ejecutar_('anularCobro', req, 'escritura', anularCobro_); }
+function conciliarCobros(req) { return ejecutar_('conciliarCobros', req, 'escritura', conciliarCobros_); }
+function guardarCategoriaCliente(req) { return ejecutar_('guardarCategoriaCliente', req, 'escritura', guardarCategoriaCliente_); }
+function confirmarSaldoHistorico(req) { return ejecutar_('confirmarSaldoHistorico', req, 'escritura', confirmarSaldoHistorico_); }
+function confirmarPlanCredito(req) { return ejecutar_('confirmarPlanCredito', req, 'escritura', confirmarPlanCredito_); }
+function resolverCobroAConfirmar(req) { return ejecutar_('resolverCobroAConfirmar', req, 'escritura', resolverCobroAConfirmar_); }
+function obtenerFichaCliente(req) { return ejecutar_('obtenerFichaCliente', req, 'lectura', obtenerFichaCliente_); }
+function obtenerCartera(req) { return ejecutar_('obtenerCartera', req, 'lectura', obtenerCartera_); }
+
+// ─────────────────────── 4. Venta a crédito (R0.4) ───────────────────────
+
+/** IVA del recargo financiero y de la mora: P_IVA_RECARGO (PENDIENTE con el contador) o, mientras esté vacío, la tasa general. */
+function tasaRecargo_(P) {
+  return P.P_IVA_RECARGO !== null && P.P_IVA_RECARGO !== undefined && String(P.P_IVA_RECARGO) !== '' ? tasaIva_(P.P_IVA_RECARGO, P) : ivaGeneral_(P);
+}
+
+/** Línea de sistema «REC-FIN» (sin movimiento de stock) para escribirVenta_ (op.extras). */
+function lineasRecargo_(plan, P) {
+  if (!(plan.recargo > 0)) return [];
+  return [{
+    codigo: param_(P, 'P_COD_REC'), producto: 'Recargo financiero (' + plan.n + ' cuotas, ' + plan.frecuencia.toLowerCase() + ')', cantidad: 1,
+    precio: plan.recargo, subtotal: plan.recargo, tasa: tasaRecargo_(P), linea: param_(P, 'P_LINEA_FIN'),
+  }];
+}
+
+/** 1er vencimiento indicado a mano: fecha real, posterior a la base y dentro del año. */
+function validarPrimerVto_(valor, desde) {
+  const s = String(valor || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw errorUsuario_('Ingrese una fecha válida para el 1er vencimiento.');
+  const p = s.split('-').map(Number);
+  const f = new Date(Date.UTC(p[0], p[1] - 1, p[2]));
+  if (f.getUTCFullYear() !== p[0] || f.getUTCMonth() !== p[1] - 1 || f.getUTCDate() !== p[2]) throw errorUsuario_('La fecha ' + formatoFecha_(s) + ' no existe.');
+  if (s <= desde) throw errorUsuario_('El 1er vencimiento debe ser posterior a ' + formatoFecha_(desde) + '.');
+  if (diasEntre_(desde, s) > 366) throw errorUsuario_('Revise el 1er vencimiento (' + formatoFecha_(s) + '): está a más de un año.');
+  return s;
+}
+
+/**
+ * Evalúa un crédito NUEVO sin escribir nada (la usan la vista previa, la venta a crédito y, en la Fase 4, el ticket).
+ * e = { cliente (fila de clientes), fecha, subtotal, equipamiento, lineasPrecio, plan: { entrega, cuotas, frecuencia,
+ * primerVto, moraPactada }, entregaCobro: { cobrar, medio, recibo, operacion } }.
+ */
+function evaluarCredito_(ctx, e) {
+  const P = leerParametros_(ctx.ss, ctx.tz);
+  const m = modeloCartera_(ctx.ss, ctx.tz);
+  const cats = m.cats;
+  const est = m.clientesPorCodigo[clave_(e.cliente.codigo)] || { saldo: 0, atraso: 0, estado: '', cat: null };
+  const cat = categoriaPorNombre_(cats, e.cliente.categoria);
+  const p0 = e.plan || {};
+  const frecuencia = normalizarFrecuencia_(p0.frecuencia || XLSX_FORMULA_.FRECUENCIA_ESTANDAR);
+  const cuotasPedidas = entero_(p0.cuotas);
+  const entrega = enteroOpcional_(p0.entrega, 'Entrega', LIMITES.PRECIO_UNITARIO * LIMITES.ITEMS_POR_VENTA);
+  const primerVto = p0.primerVto ? validarPrimerVto_(p0.primerVto, e.fecha) : '';
+  const plan = calcularPlanCredito_({ fecha: e.fecha, subtotal: e.subtotal, entrega: entrega, cuotas: cuotasPedidas >= 1 ? cuotasPedidas : 1, frecuencia: frecuencia, primerVto: primerVto }, P);
+  const entregaMinima = entregaMinimaCredito_(e.subtotal, cat, cats, e.equipamiento, P);
+  const cobraEntrega = !!(e.entregaCobro && e.entregaCobro.cobrar === true && plan.entrega > 0);
+  const moraPactada = p0.moraPactada === true;
+  const problemas = controlesCreditoNuevo_({
+    P: P, cats: cats, cat: cat, clienta: est, plan: plan, cuotasPedidas: isNaN(cuotasPedidas) ? 0 : cuotasPedidas, entregaMinima: entregaMinima,
+    lineasPrecio: e.lineasPrecio, entregaCobradaAhora: cobraEntrega ? plan.entrega : 0, moraPactada: moraPactada,
+  });
+  // v2.3 · Fase 3 (R1.4): una ficha INCOMPLETA no compra a crédito hasta completar sus datos (rechazo, no autorizable).
+  if (typeof faltantesCliente_ === 'function') {
+    const faltan = faltantesCliente_(e.cliente, null, configSi_(ctx.ss, CFG.RUC_DV));
+    if (faltan.length) {
+      problemas.unshift({ codigo: 'CLIENTA INCOMPLETA', autorizable: false, severidad: 'RECHAZO',
+        mensaje: 'CLIENTA INCOMPLETA: falta ' + faltan.join(', ') + '. Complete sus datos en «Base de datos» antes de venderle a crédito.' });
+    }
+  }
+  return { P: P, modelo: m, cats: cats, clienta: est, cat: cat, plan: plan, entregaMinima: entregaMinima, problemas: problemas, cobraEntrega: cobraEntrega, moraPactada: moraPactada };
+}
+
+/** Evalúa la venta a crédito de productos armada por prepararVenta_ (Código.gs). */
+function evaluarVentaCredito_(ctx, prep, d) {
+  const P = prep.P;
+  return evaluarCredito_(ctx, {
+    cliente: prep.cliente, fecha: prep.fecha, subtotal: prep.subtotal,
+    equipamiento: prep.lineas.some(function (l) { return esEquipamiento_({ linea: l.linea, categoria: l.p.categoria }, P); }),
+    lineasPrecio: prep.lineas.map(function (l) {
+      return { nombre: l.p.nombre, tipo: 'PRODUCTO', precio: l.precio, lista: l.lista, total: l.subtotal, tasa: l.tasa, costoTotal: (Number(l.p.costo) || 0) * l.cantidad };
+    }),
+    plan: d.plan, entregaCobro: d.entregaCobro,
+  });
+}
+
+/** Vista previa (sin escribir): el plan calculado por el servidor y lo que no cumple la política. */
+function vistaPreviaPlan_(ctx) {
+  const prep = prepararVenta_(ctx);
+  const ev = evaluarVentaCredito_(ctx, prep, ctx.datos);
+  const est = ev.clienta;
+  return {
+    ok: true, plan: resumenPlan_(ev.plan), entregaMinima: ev.entregaMinima,
+    problemas: ev.problemas.map(function (p) { return { codigo: p.codigo, mensaje: p.mensaje, autorizable: p.autorizable, severidad: p.severidad }; }),
+    clienta: { codigo: prep.cliente.codigo, nombre: prep.cliente.nombre, categoria: ev.cat ? ev.cat.nombre : '', estado: est.estado || '', saldo: est.saldo || 0,
+      limite: ev.cat ? ev.cat.limite : '', disponible: ev.cat ? ev.cat.limite - (est.saldo || 0) : '', atraso: est.atraso || 0 },
+    puedeAutorizar: esAdministradora_(ctx.usuario),
+  };
+}
+
+/**
+ * Venta a crédito (R0.4): valida TODO antes de escribir (política, precios, stock, recibo de la entrega) y escribe
+ * venta (+ «REC-FIN» si corresponde) + stock + Crédito + Cuotas (+ el cobro de la entrega, si se cobra en el acto).
+ * Código.gs la llama desde registrarVenta_ cuando la condición es «Crédito».
+ */
+function registrarVentaCredito_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const prep = prepararVenta_(ctx);
+  const ev = evaluarVentaCredito_(ctx, prep, d);
+  const aut = resolverAutorizacion_(ev.problemas, ctx, d);
+  const cobro = ev.cobraEntrega ? validarDatosCobro_(ctx, d.entregaCobro) : null;
+  const creditos = leerTabla_(ctx.ss, 'creditos', tz);
+  const idCredito = siguienteCodigo_(creditos.filas.map(function (c) { return c.id; }), 'CR-', 5);
+  const r = escribirVenta_(ctx, prep, {
+    condicion: 'Crédito', nroCredito: idCredito, extras: lineasRecargo_(ev.plan, ev.P), autorizadoPor: aut.por, motivoAutorizacion: aut.motivo, unidad: 'DISTRIBUIDORA',
+  });
+  escribirCredito_(ctx, creditos, {
+    id: idCredito, venta: r.id, ticket: '', cliente: prep.cliente, fecha: prep.fecha, plan: ev.plan, cat: ev.cat, origen: ORIGEN_CREDITO_.NUEVO,
+    autorizadoPor: aut.por, motivoAutorizacion: aut.motivo, observacion: prep.nota, unidad: 'DISTRIBUIDORA', moraPactada: ev.moraPactada,
+    alertas: ev.plan.recargoLimitado ? 'Recargo ajustado al límite BCP (el redondeo a 1.000 superaba la tasa permitida).' : '',
+  });
+  let textoCobro = '';
+  if (cobro) {
+    const idCobro = escribirCobro_(ctx, {
+      fecha: prep.fecha, recibo: cobro.recibo, credito: idCredito, venta: r.id, cliente: prep.cliente.nombre, codigoCliente: prep.cliente.codigo,
+      monto: ev.plan.entrega, medio: cobro.medio, operacion: cobro.operacion, concepto: 'ENTREGA', unidad: 'DISTRIBUIDORA', nota: 'Entrega cobrada al registrar la venta ' + r.id,
+    });
+    textoCobro = ' Entrega cobrada (' + idCobro + ', ' + cobro.medio.toLowerCase() + ').';
+  }
+  recalcularCartera_(ctx.ss, tz);
+  return {
+    mensaje: 'Venta ' + r.id + ' a crédito registrada (' + idCredito + '): ' + prep.cliente.nombre + ', total Gs. ' + miles_(ev.plan.total) + ' — ' + textoPlan_(ev.plan) + textoCobro +
+      (aut.por ? ' Excepción autorizada por ' + ctx.email + '.' : ''),
+    id: r.id, credito: idCredito, plan: resumenPlan_(ev.plan),
+  };
+}
+
+/**
+ * Escribe un crédito con plan VIGENTE y sus cuotas. o = { id, venta, ticket, cliente, fecha, plan, cat, origen, legado,
+ * autorizadoPor, motivoAutorizacion, observacion, unidad, moraPactada, alertas }. La usan la venta a crédito y el ticket (Fase 4).
+ */
+function escribirCredito_(ctx, tabla, o) {
+  const plan = o.plan;
+  agregarFilas_(tabla, [{
+    id: o.id, venta: o.venta || '', ticket: o.ticket || '', codigoCliente: o.cliente.codigo, cliente: o.cliente.nombre, fecha: o.fecha,
+    subtotal: plan.subtotal, recargo: plan.recargo, total: plan.total, entrega: plan.entrega, cuotas: plan.n, frecuencia: plan.frecuencia,
+    primerVto: plan.primerVto, montoCuota: plan.cuota, ultimaCuota: plan.ultima, saldo: plan.total, estadoPlan: PLAN_.VIGENTE,
+    categoria: o.cat ? o.cat.nombre : '', origen: o.origen, legado: o.legado || '', autorizadoPor: o.autorizadoPor || '',
+    motivoAutorizacion: o.motivoAutorizacion || '', observacion: o.observacion || '', unidad: o.unidad || 'DISTRIBUIDORA',
+    usuario: ctx.email, registrado: new Date(), cobrado: 0, vencido: 0, atraso: 0, proximoVto: plan.cuotas.length ? plan.cuotas[0].vto : '',
+    moraPactada: o.moraPactada ? 'Sí' : 'No', alertas: o.alertas || '',
+  }], ctx.tz);
+  const cuotas = leerTabla_(ctx.ss, 'cuotas', ctx.tz);
+  agregarFilas_(cuotas, plan.cuotas.map(function (q) {
+    return { credito: o.id, numero: q.n, vencimiento: q.vto, monto: q.monto, pagado: 0, estado: 'PENDIENTE', codigoCliente: o.cliente.codigo, cliente: o.cliente.nombre };
+  }), ctx.tz);
+}
+
+// ─────────────────────── 5. Cobros (R0.5) ───────────────────────
+
+/** Recibos y N° de operación ya usados en cobros y pagos de ticket vigentes: { recibos: {N: dónde}, operaciones: {N: dónde} }. */
+function recibosYOperacionesUsados_(ss, tz) {
+  const r = { recibos: {}, operaciones: {} };
+  leerTabla_(ss, 'cobros', tz).filas.forEach(function (c) {
+    if (esSi_(c.anulado)) return;
+    if (clave_(c.recibo)) r.recibos[clave_(c.recibo)] = 'el cobro ' + c.id;
+    if (clave_(c.operacion)) r.operaciones[clave_(c.operacion)] = 'el cobro ' + c.id;
+  });
+  let pagos = [];
+  try { pagos = leerTabla_(ss, 'pagosTicket', tz).filas; } catch (e) { pagos = []; }
+  pagos.forEach(function (p) {
+    if (esSi_(p.anulado)) return;
+    if (clave_(p.recibo)) r.recibos[clave_(p.recibo)] = 'el pago del ticket ' + p.ticket;
+    if (clave_(p.operacion)) r.operaciones[clave_(p.operacion)] = 'el pago del ticket ' + p.ticket;
+  });
+  return r;
+}
+
+/** Medio, recibo y N° de operación de un cobro (mensajes literales de COBROS!N, sin repetidos). */
+function validarDatosCobro_(ctx, d) {
+  d = d || {};
+  if (!String(d.medio || '').trim()) throw errorUsuario_('FALTA MEDIO DE PAGO.');
+  const medio = normalizarMedioPago_(d.medio);
+  const recibo = texto_(d.recibo, 30);
+  const operacion = texto_(d.operacion, 40);
+  if (medio === 'EFECTIVO' && !recibo) throw errorUsuario_('FALTA N° DE RECIBO: un cobro en efectivo lleva el número del recibo entregado a la clienta.');
+  if (medio !== 'EFECTIVO' && !operacion) throw errorUsuario_('FALTA N° DE OPERACIÓN: anote el número de la operación (' + medio + ').');
+  const usados = recibosYOperacionesUsados_(ctx.ss, ctx.tz);
+  if (recibo && usados.recibos[clave_(recibo)]) throw errorUsuario_('RECIBO REPETIDO: el N° ' + recibo + ' ya figura en ' + usados.recibos[clave_(recibo)] + '.');
+  if (operacion && usados.operaciones[clave_(operacion)]) throw errorUsuario_('N° DE OPERACIÓN REPETIDO: el N° ' + operacion + ' ya figura en ' + usados.operaciones[clave_(operacion)] + '.');
+  return { medio: medio, recibo: recibo, operacion: operacion };
+}
+
+/** Escribe una fila de «Cobros» (conciliado = No, anulado = No). Devuelve su N° (CB-00001). */
+function escribirCobro_(ctx, o) {
+  const tabla = leerTabla_(ctx.ss, 'cobros', ctx.tz);
+  const id = siguienteCodigo_(tabla.filas.map(function (c) { return c.id; }), 'CB-', 5);
+  agregarFilas_(tabla, [{
+    id: id, fecha: o.fecha, recibo: o.recibo || '', credito: o.credito, venta: o.venta || '', cliente: o.cliente, monto: o.monto, medio: o.medio,
+    operacion: o.operacion || '', concepto: o.concepto, conciliado: 'No', fechaConciliacion: '', anulado: 'No', motivoAnulacion: '',
+    unidad: o.unidad || 'DISTRIBUIDORA', usuario: ctx.email, registrado: new Date(), codigoCliente: o.codigoCliente, ticket: o.ticket || '', nota: o.nota || '',
+  }], ctx.tz);
+  return id;
+}
+
+/**
+ * Concepto de un cobro según a qué se aplica (ENTREGA / CUOTA / CANCELACIÓN). Sobre un plan A CONFIRMAR (sin cuotas) vale
+ * el concepto sugerido (un «cobro a confirmar» que la nota describe como entrega queda como ENTREGA).
+ */
+function conceptoCobro_(c, monto, sugerido) {
+  if (monto >= c.saldo) return 'CANCELACIÓN';
+  if (!c.conPlan && sugerido) return sugerido;
+  const pendiente = c.cuotas.filter(function (q) { return q.falta > 0; })[0];
+  if (pendiente && pendiente.numero === 0 && monto <= pendiente.falta) return 'ENTREGA';
+  return 'CUOTA';
+}
+
+/**
+ * Registra un cobro con cascada (la usan registrarCobro_ y resolverCobroAConfirmar_). Se puede cobrar un crédito
+ * A CONFIRMAR: reduce el saldo y, al confirmar el plan, se re-aplica por fecha a las primeras cuotas.
+ * Devuelve { id, credito, concepto, saldo, aplicacion, cancelado, medio }.
+ */
+function registrarCobroInterno_(ctx, d) {
+  const tz = ctx.tz;
+  const m = modeloCartera_(ctx.ss, tz);
+  const P = m.P;
+  const c = resolverCredito_(m, d.credito);
+  if (c.anulado) throw errorUsuario_('El crédito ' + c.id + ' está anulado: no admite cobros.');
+  if (!String(d.fecha || '').trim()) throw errorUsuario_('FALTA FECHA del cobro.');
+  const fecha = validarFecha_(d.fecha, tz, 'el cobro');
+  if (fecha < c.fecha) throw errorUsuario_('La fecha del cobro (' + formatoFecha_(fecha) + ') es anterior al crédito ' + c.id + ' (' + formatoFecha_(c.fecha) + ').');
+  const monto = entero_(d.monto);
+  if (!(monto > 0)) throw errorUsuario_('FALTA MONTO del cobro.');
+  if (monto > LIMITES.PRECIO_UNITARIO * LIMITES.ITEMS_POR_VENTA) throw errorUsuario_('Revise el monto del cobro: parece tener ceros de más.');
+  const conceptoMora = param_(P, 'P_CONC_MORA');
+  const esMora = clave_(d.concepto) === clave_(conceptoMora);
+  if (esMora) {
+    if (!c.moraCobrable) {
+      throw errorUsuario_('Este crédito no admite ' + conceptoMora + ': el plan firmado debe preverla («Mora pactada en el plan» = Sí) y la política de crédito firmada debe estar cargada en «Parámetros de crédito».');
+    }
+  } else {
+    if (c.saldo <= 0) throw errorUsuario_('El crédito ' + c.id + ' ya está cancelado.');
+    if (monto > c.saldo) throw errorUsuario_('PAGO MAYOR AL SALDO: el cobro (Gs. ' + miles_(monto) + ') supera el saldo de ' + c.id + ' (Gs. ' + miles_(c.saldo) + ').');
+  }
+  const datos = validarDatosCobro_(ctx, d);
+  const concepto = esMora ? conceptoMora : conceptoCobro_(c, monto, d.conceptoSugerido === 'ENTREGA' ? 'ENTREGA' : '');
+  const id = escribirCobro_(ctx, {
+    fecha: fecha, recibo: datos.recibo, credito: c.id, venta: c.venta, cliente: c.cliente, codigoCliente: c.codigoCliente, ticket: c.ticket,
+    monto: monto, medio: datos.medio, operacion: datos.operacion, concepto: concepto, unidad: c.unidad, nota: texto_(d.nota, 200),
+  });
+  const m2 = recalcularCartera_(ctx.ss, tz);
+  const c2 = resolverCredito_(m2, c.id);
+  const ap = m2.aplicacionPorCobro[id];
+  return { id: id, credito: c.id, cliente: c.cliente, concepto: concepto, monto: monto, saldo: c2.saldo, aplicacion: ap ? ap.texto : '', cancelado: c2.saldo <= 0 && !esMora, medio: datos.medio, esMora: esMora };
+}
+
+function registrarCobro_(ctx) {
+  const r = registrarCobroInterno_(ctx, ctx.datos);
+  return {
+    mensaje: 'Cobro ' + r.id + ' registrado: Gs. ' + miles_(r.monto) + ' (' + r.concepto.toLowerCase() + ', ' + r.cliente + ').' +
+      (r.esMora ? ' El recargo por mora no descuenta del saldo.' : (r.aplicacion ? ' Aplicado: ' + r.aplicacion + '.' : '')) +
+      ' Saldo de ' + r.credito + ': Gs. ' + miles_(Math.max(0, r.saldo)) + '.' + (r.cancelado ? ' ¡Crédito cancelado!' : '') +
+      ' Queda PENDIENTE DE CONCILIAR con ' + (r.medio === 'EFECTIVO' ? 'el arqueo de caja.' : 'el extracto.'),
+    id: r.id, credito: r.credito, saldo: r.saldo,
+  };
+}
+
+/** Anulación con motivo (solo administradoras): el cobro no se borra y la cascada se recalcula sola (reversa). */
+function anularCobro_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tabla = leerTabla_(ctx.ss, 'cobros', tz);
+  const id = clave_(d.id);
+  const f = tabla.filas.filter(function (x) { return clave_(x.id) === id; })[0];
+  if (!id || !f) throw errorUsuario_('No se encontró el cobro ' + id + '.');
+  if (esSi_(f.anulado)) return 'El cobro ' + id + ' ya estaba anulado.';
+  const motivo = texto_(d.motivo, 200);
+  if (motivo.length < 3) throw errorUsuario_('Escriba el motivo de la anulación.');
+  const conciliado = esSi_(f.conciliado);
+  actualizarCeldas_(tabla, f._fila, { anulado: 'Sí', motivoAnulacion: motivo + (conciliado ? ' (estaba conciliado)' : '') }, tz);
+  const m = recalcularCartera_(ctx.ss, tz);
+  const c = m.creditos.filter(function (x) { return clave_(x.id) === clave_(f.credito); })[0];
+  return 'Cobro ' + id + ' anulado. La aplicación a las cuotas se recalculó' + (c ? ': saldo de ' + c.id + ' Gs. ' + miles_(c.saldo) + '.' : '.') +
+    (conciliado ? ' Atención: estaba conciliado; revise el extracto o el arqueo.' : '');
+}
+
+/** Conciliación de cobros (Conciliado, Fecha conciliación, Conciliado por). accion: 'conciliar' | 'desconciliar'. */
+function conciliarCobros_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const ids = (Array.isArray(d.ids) ? d.ids : []).map(clave_).filter(String);
+  if (!ids.length) throw errorUsuario_('Seleccione al menos un cobro.');
+  const conciliar = d.accion !== 'desconciliar';
+  const fecha = conciliar ? validarFecha_(d.fecha || hoy_(tz), tz, 'la conciliación') : '';
+  const tabla = leerTabla_(ctx.ss, 'cobros', tz);
+  const lote = tabla.filas.filter(function (f) { return ids.indexOf(clave_(f.id)) >= 0 && !esSi_(f.anulado); }).map(function (f) {
+    return { fila: f._fila, valores: conciliar ? { conciliado: 'Sí', fechaConciliacion: fecha, conciliadoPor: ctx.email } : { conciliado: 'No', fechaConciliacion: '', conciliadoPor: '' } };
+  });
+  const n = actualizarFilas_(tabla, lote, tz);
+  return conciliar ? plural_(n, 'cobro conciliado', 'cobros conciliados') + ' al ' + formatoFecha_(fecha) + '.' : plural_(n, 'cobro marcado', 'cobros marcados') + ' como pendiente de conciliar.';
+}
+
+function plural_(n, uno, varios) { return miles_(n) + ' ' + (n === 1 ? uno : varios); }
+
+// ─────────────────────── 6. Categoría, saldos históricos, planes y cobros a confirmar ───────────────────────
+
+/** Asigna, cambia o quita la categoría de crédito (solo administradoras). Vacío / SIN CATEGORÍA = sin categoría. */
+function guardarCategoriaCliente_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const r = buscarClientaCartera_(ctx.ss, tz, d.codigo);
+  if (!r) throw errorUsuario_('No se encontró la clienta ' + d.codigo + '.');
+  const categoria = validarCategoria_(ctx.ss, tz, d.categoria);
+  if (categoria === clave_(r.fila.categoria)) return 'La categoría de «' + r.fila.nombre + '» ya era ' + (categoria || SIN_CATEGORIA) + '.';
+  actualizarCeldas_(r.tabla, r.fila._fila, { categoria: categoria, actualizado: new Date(), usuario: ctx.email }, tz);
+  const m = recalcularCartera_(ctx.ss, tz);
+  const e = m.clientesPorCodigo[clave_(r.fila.codigo)];
+  if (!categoria) return 'Se quitó la categoría de «' + r.fila.nombre + '»: no puede comprar a crédito hasta que se le asigne una.';
+  return 'Categoría de «' + r.fila.nombre + '»: ' + categoria + (e ? ' (límite Gs. ' + miles_(e.limite) + ', disponible Gs. ' + miles_(e.disponible) + ', estado ' + e.estado + ').' : '.');
+}
+
+/** Fila de «Saldos iniciales» de un crédito HISTÓRICO (por N° de crédito o por su N° de migración). */
+function filaSaldoInicial_(saldos, c) {
+  return saldos.filas.filter(function (s) { return clave_(s.credito) === clave_(c.id); })[0] ||
+    saldos.filas.filter(function (s) { return s.tipo === 'SALDO INICIAL' && clave_(s.numero) === clave_(c.legado); })[0] || null;
+}
+
+/** Saldo HISTÓRICO confirmado con la clienta (o EN DISPUTA). Solo mientras el plan esté A CONFIRMAR. */
+function confirmarSaldoHistorico_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const m = modeloCartera_(ctx.ss, tz);
+  const c = resolverCredito_(m, d.credito);
+  if (c.origen !== ORIGEN_CREDITO_.HISTORICO) throw errorUsuario_('Solo los saldos HISTÓRICOS (hojas manuscritas) se confirman aquí.');
+  if (c.anulado || c.conPlan) throw errorUsuario_('El plan de ' + c.id + ' ya está confirmado: el saldo inicial ya no se cambia.');
+  const estado = clave_(d.estado) === 'EN DISPUTA' ? 'EN DISPUTA' : 'CONFIRMADO';
+  const saldo = estado === 'CONFIRMADO' ? requerirEntero_(d.saldo, 'Saldo confirmado', 0, LIMITES.PRECIO_UNITARIO * LIMITES.ITEMS_POR_VENTA) : null;
+  const obs = texto_(d.observacion, 300);
+  const fecha = Utilities.formatDate(new Date(), tz, 'dd/MM/yyyy');
+  const saldos = leerTabla_(ctx.ss, 'saldos', tz);
+  const fila = filaSaldoInicial_(saldos, c);
+  if (fila) {
+    const cambios = { estado: estado, actualizado: new Date(), usuario: ctx.email, observacion: [fila.observacion, obs].filter(String).join(' · ') };
+    if (saldo !== null) { cambios.saldoConfirmado = saldo; cambios.saldoMigrar = saldo; }
+    actualizarCeldas_(saldos, fila._fila, cambios, tz);
+  }
+  const cambiosCredito = {
+    observacion: [c.observacion, (estado === 'EN DISPUTA' ? 'Saldo EN DISPUTA (' : 'Saldo confirmado con la clienta: Gs. ' + miles_(saldo) + ' (') + fecha + ', ' + ctx.email + ')' + (obs ? ': ' + obs : '')].filter(String).join(' · '),
+  };
+  if (saldo !== null) { cambiosCredito.subtotal = saldo; cambiosCredito.total = saldo; }
+  if (estado === 'EN DISPUTA') cambiosCredito.alertas = [c.alertas, 'SALDO EN DISPUTA: no confirmar el plan hasta resolverlo.'].filter(String).join(' · ');
+  actualizarCeldas_(m.tablas.creditos, c.fila, cambiosCredito, tz);
+  recalcularCartera_(ctx.ss, tz);
+  return estado === 'EN DISPUTA' ? 'El saldo de ' + c.cliente + ' quedó EN DISPUTA.' :
+    'Saldo de ' + c.cliente + ' confirmado: Gs. ' + miles_(saldo) + (saldo === 0 ? ' (sin deuda).' : '. Ya puede confirmar el plan de pagos.');
+}
+
+/** ¿La venta tiene alguna línea de equipamiento? (para la entrega mínima de un crédito VIGENTE PREVIO) */
+function ventaTieneEquipamiento_(ss, tz, idVenta, P) {
+  if (!idVenta) return false;
+  const productos = leerTabla_(ss, 'productos', tz).filas;
+  return leerTabla_(ss, 'ventas', tz).filas.some(function (v) {
+    if (clave_(v.id) !== clave_(idVenta)) return false;
+    const p = buscarPorCodigo_(productos, v.codigo) || {};
+    return esEquipamiento_({ linea: v.linea || p.linea || lineaPropuesta_(p.categoria, false), categoria: p.categoria }, P);
+  });
+}
+
+/**
+ * Recargo de un plan confirmado sobre un crédito existente: se factura HOY como venta aparte (línea «REC-FIN», sin stock),
+ * vinculada al crédito por «N° crédito». Devuelve el N° de venta.
+ */
+function escribirVentaRecargo_(ctx, c, plan, P) {
+  const ventas = leerTabla_(ctx.ss, 'ventas', ctx.tz);
+  const id = siguienteCodigo_(ventas.filas.map(function (v) { return v.id; }), 'V-', 5);
+  const tasa = tasaRecargo_(P);
+  agregarFilas_(ventas, [{
+    id: id, fecha: hoy_(ctx.tz), codigoCliente: c.codigoCliente, cliente: c.cliente, codigo: param_(P, 'P_COD_REC'),
+    producto: 'Recargo financiero del plan de ' + c.id + (c.venta ? ' (venta ' + c.venta + ')' : ''), cantidad: 1, precio: plan.recargo, subtotal: plan.recargo,
+    costoUnitario: 0, condicion: 'Crédito', estado: 'Pendiente', fechaCobro: '', nota: 'Recargo del plan confirmado de ' + c.id, usuario: ctx.email,
+    registrado: new Date(), ticket: '', unidad: c.unidad || 'DISTRIBUIDORA', origen: 'NUEVO', precioLista: plan.recargo, descuento: 0,
+    iva: textoTasa_(tasa), ivaMonto: ivaIncluido_(plan.recargo, tasa), linea: param_(P, 'P_LINEA_FIN'), nroCredito: c.id,
+  }], ctx.tz);
+  return id;
+}
+
+/**
+ * Confirma el plan de un crédito A CONFIRMAR (VIGENTE PREVIO o HISTÓRICO) y genera sus cuotas. El plan se arma sobre el
+ * total del crédito: los cobros ya registrados se re-aplican por fecha a las primeras cuotas. Base: la fecha de la venta
+ * (VIGENTE PREVIO, para reflejar lo acordado) o hoy (HISTÓRICO, regularización).
+ */
+function confirmarPlanCredito_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const m = modeloCartera_(ctx.ss, tz);
+  const P = m.P;
+  const c = resolverCredito_(m, d.credito);
+  if (c.anulado) throw errorUsuario_('El crédito ' + c.id + ' está anulado.');
+  if (c.conPlan) throw errorUsuario_('El crédito ' + c.id + ' ya tiene plan de pagos.');
+  if (c.saldo <= 0) throw errorUsuario_('El crédito ' + c.id + ' no tiene saldo pendiente.');
+  if (c.origen === ORIGEN_CREDITO_.HISTORICO) {
+    const fila = filaSaldoInicial_(leerTabla_(ctx.ss, 'saldos', tz), c);
+    if (fila && fila.estado === 'EN DISPUTA') throw errorUsuario_('El saldo de ' + c.cliente + ' está EN DISPUTA: confírmelo antes de acordar el plan.');
+  }
+  const cli = m.clientesPorCodigo[clave_(c.codigoCliente)] || null;
+  const cat = cli ? cli.cat : null;
+  const fechaBase = c.origen === ORIGEN_CREDITO_.PREVIO ? c.fecha : m.hoy;
+  const cuotasPedidas = entero_(d.cuotas);
+  const entrega = enteroOpcional_(d.entrega, 'Entrega', c.subtotal);
+  const primerVto = d.primerVto ? validarPrimerVto_(d.primerVto, fechaBase) : '';
+  const plan = calcularPlanCredito_({ fecha: fechaBase, subtotal: c.subtotal, entrega: entrega, cuotas: cuotasPedidas >= 1 ? cuotasPedidas : 1,
+    frecuencia: d.frecuencia || XLSX_FORMULA_.FRECUENCIA_ESTANDAR, primerVto: primerVto }, P);
+  const entregaMinima = c.origen === ORIGEN_CREDITO_.PREVIO ? entregaMinimaCredito_(c.subtotal, cat, m.cats, ventaTieneEquipamiento_(ctx.ss, tz, c.venta, P), P) : null;
+  const problemas = controlesConfirmarPlan_({ P: P, cats: m.cats, cat: cat, clienta: cli, plan: plan, cuotasPedidas: isNaN(cuotasPedidas) ? 0 : cuotasPedidas,
+    entregaMinima: entregaMinima, origen: c.origen, moraPactada: d.moraPactada === true });
+  const aut = resolverAutorizacion_(problemas, ctx, d);
+  const ventaRecargo = plan.recargo > 0 ? escribirVentaRecargo_(ctx, c, plan, P) : '';
+  const fechaTxt = Utilities.formatDate(new Date(), tz, 'dd/MM/yyyy');
+  const alertas = [c.alertas].concat(aut.alertas).concat(plan.recargoLimitado ? ['Recargo ajustado al límite BCP.'] : []).filter(String).join(' · ');
+  actualizarCeldas_(m.tablas.creditos, c.fila, {
+    entrega: plan.entrega, cuotas: plan.n, frecuencia: plan.frecuencia, primerVto: plan.primerVto, montoCuota: plan.cuota, ultimaCuota: plan.ultima,
+    recargo: plan.recargo, total: plan.total, estadoPlan: PLAN_.VIGENTE, categoria: cat ? cat.nombre : '', moraPactada: d.moraPactada === true ? 'Sí' : 'No',
+    autorizadoPor: aut.por || c.autorizadoPor, motivoAutorizacion: aut.motivo || c.motivoAutorizacion, confirmadoPor: ctx.email, confirmadoEl: new Date(),
+    alertas: alertas, observacion: [c.observacion, 'Plan confirmado el ' + fechaTxt + ': ' + textoPlan_(plan) + (ventaRecargo ? ' Recargo facturado en ' + ventaRecargo + '.' : '')].filter(String).join(' · '),
+  }, tz);
+  const cuotas = leerTabla_(ctx.ss, 'cuotas', tz);
+  agregarFilas_(cuotas, plan.cuotas.map(function (q) {
+    return { credito: c.id, numero: q.n, vencimiento: q.vto, monto: q.monto, pagado: 0, estado: 'PENDIENTE', codigoCliente: c.codigoCliente, cliente: c.cliente };
+  }), tz);
+  if (c.origen === ORIGEN_CREDITO_.HISTORICO) {
+    const saldos = leerTabla_(ctx.ss, 'saldos', tz);
+    const fila = filaSaldoInicial_(saldos, c);
+    if (fila && fila.estado !== 'CONFIRMADO') {
+      actualizarCeldas_(saldos, fila._fila, { estado: 'CONFIRMADO', saldoConfirmado: fila.saldoConfirmado === '' ? c.subtotal : fila.saldoConfirmado,
+        saldoMigrar: fila.saldoConfirmado === '' ? c.subtotal : fila.saldoConfirmado, actualizado: new Date(), usuario: ctx.email }, tz);
+    }
+  }
+  const m2 = recalcularCartera_(ctx.ss, tz);
+  const c2 = resolverCredito_(m2, c.id);
+  return 'Plan de ' + c.cliente + ' confirmado (' + c.id + '): ' + textoPlan_(plan) + (c.cobrado ? ' Los cobros ya registrados (Gs. ' + miles_(c.cobrado) + ') se aplicaron a las primeras cuotas.' : '') +
+    ' Saldo Gs. ' + miles_(c2.saldo) + '.' + (aut.alertas.length ? ' Alertas: ' + aut.alertas.join(' · ') : '') + (aut.por ? ' Excepción autorizada.' : '');
+}
+
+/**
+ * «Cobros a confirmar» (R0.8 c): pagos mencionados en notas sin fecha, medio ni recibo. accion = 'registrar' (crea el
+ * cobro con los datos confirmados) | 'descartar' (con motivo). Nunca mueve saldos por sí solo.
+ */
+function resolverCobroAConfirmar_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tabla = leerTabla_(ctx.ss, 'cobrosConfirmar', tz);
+  const f = tabla.filas.filter(function (x) { return clave_(x.id) === clave_(d.id); })[0];
+  if (!f) throw errorUsuario_('No se encontró el cobro a confirmar ' + d.id + '.');
+  if (f.estado !== 'PENDIENTE') return 'El cobro a confirmar ' + f.id + ' ya estaba ' + String(f.estado).toLowerCase() + '.';
+  if (d.accion === 'descartar') {
+    const motivo = texto_(d.motivo, 200);
+    if (motivo.length < 5) throw errorUsuario_('Escriba por qué se descarta (mínimo 5 letras).');
+    actualizarCeldas_(tabla, f._fila, { estado: 'DESCARTADO', resueltoPor: ctx.email, resuelto: new Date(), observacion: [f.observacion, 'Descartado: ' + motivo].filter(String).join(' · ') }, tz);
+    return 'Cobro a confirmar ' + f.id + ' descartado (no se registró ningún cobro).';
+  }
+  const r = registrarCobroInterno_(ctx, {
+    credito: f.credito || f.venta, fecha: d.fecha, monto: d.monto === '' || d.monto === undefined || d.monto === null ? f.monto : d.monto,
+    medio: d.medio, recibo: d.recibo, operacion: d.operacion, nota: 'Confirmado desde ' + f.id + ' (' + f.fuente + ')',
+    conceptoSugerido: /entreg/i.test(String(f.fuente || '')) ? 'ENTREGA' : '',
+  });
+  actualizarCeldas_(tabla, f._fila, { estado: 'REGISTRADO', cobro: r.id, resueltoPor: ctx.email, resuelto: new Date(),
+    observacion: [f.observacion, 'Registrado como ' + r.id + ' (' + r.medio + ')'].filter(String).join(' · ') }, tz);
+  return 'Cobro a confirmar ' + f.id + ' registrado como ' + r.id + ': Gs. ' + miles_(r.monto) + '. Saldo de ' + r.credito + ': Gs. ' + miles_(Math.max(0, r.saldo)) + '.';
+}
+
+/**
+ * Anula el crédito de una venta que se anula (Código.gs → anularVentaFilas_). Exige que no tenga cobros vigentes.
+ * Devuelve el texto para el mensaje ('' si la venta no tenía crédito).
+ */
+function anularCreditoDeVenta_(ctx, idVenta, motivo) {
+  const tz = ctx.tz;
+  const m = modeloCartera_(ctx.ss, tz);
+  const c = m.creditos.filter(function (x) { return !x.anulado && clave_(x.venta) === clave_(idVenta); })[0];
+  if (!c) return '';
+  const vivos = m.cobros.filter(function (cb) { return clave_(cb.credito) === clave_(c.id) && !cb.esAnulado; });
+  if (vivos.length) {
+    throw errorUsuario_('La venta ' + idVenta + ' tiene ' + plural_(vivos.length, 'cobro registrado', 'cobros registrados') + ' en el crédito ' + c.id + ' (' +
+      vivos.map(function (x) { return x.id; }).join(', ') + '). Anúlelos primero en «Cartera › Cobros».');
+  }
+  actualizarCeldas_(m.tablas.creditos, c.fila, { estadoPlan: PLAN_.ANULADO, motivoAnulacion: motivo,
+    observacion: [c.observacion, 'Anulado con la venta ' + idVenta].filter(String).join(' · ') }, tz);
+  return 'El crédito ' + c.id + ' quedó anulado.';
+}
+
+// ─────────────────────── 7. Estado de cuenta, datos para la app y pendientes ───────────────────────
+
+/** Crédito para la app (lista blanca: sin costos ni márgenes; la sugerencia de categoría solo para administradoras). */
+function creditoParaApp_(c) {
+  return {
+    id: c.id, venta: c.venta, ticket: c.ticket, codigoCliente: c.codigoCliente, cliente: c.cliente, fecha: c.fecha, subtotal: c.subtotal, recargo: c.recargo,
+    total: c.total, entrega: c.entrega, nCuotas: c.nCuotas, frecuencia: c.frecuencia, primerVto: c.primerVto, montoCuota: c.montoCuota, ultimaCuota: c.ultimaCuota,
+    estadoPlan: c.anulado ? PLAN_.ANULADO : (c.saldo <= 0 ? PLAN_.CANCELADO : (c.conPlan ? PLAN_.VIGENTE : PLAN_.A_CONFIRMAR)), estado: c.estado,
+    categoria: c.categoria, origen: c.origen, legado: c.legado, lectura: c.lectura, alertas: c.alertas, observacion: c.observacion, planSugerido: c.planSugerido,
+    saldo: c.saldo, cobrado: c.cobrado, vencido: c.vencido, atraso: c.atraso, proximoVto: c.proximoVto, aCobrar: c.aCobrar, moraPactada: c.moraPactada,
+    moraCobrable: c.moraCobrable, moraSugerida: c.moraSugerida, moraCobrada: c.moraCobrada, fechaCancelacion: c.fechaCancelacion, cobradoDeMas: c.cobradoDeMas,
+    autorizadoPor: c.autorizadoPor, unidad: c.unidad, confirmadoEl: c.confirmadoEl,
+    cuotas: c.cuotas.map(function (q) { return { n: q.numero, vto: q.vencimiento, monto: q.monto, pagado: q.pagado, falta: q.falta, estado: q.estado }; }),
+  };
+}
+
+function cobroParaApp_(c, m) {
+  const a = m.aplicacionPorCobro[c.id];
+  return {
+    id: c.id, fecha: c.fecha, recibo: c.recibo, credito: c.credito, venta: c.venta, codigoCliente: c.codigoCliente, cliente: c.cliente, monto: c.monto,
+    medio: c.medio, operacion: c.operacion, concepto: c.concepto, conciliado: c.esConciliado, fechaConciliacion: c.fechaConciliacion, conciliadoPor: c.conciliadoPor,
+    anulado: c.esAnulado, motivoAnulacion: c.motivoAnulacion, esMora: c.esMora, usuario: c.usuario, registrado: c.registrado, nota: c.nota,
+    aplicacion: c.esAnulado ? 'ANULADO' : (c.esMora ? 'Recargo por mora (no amortiza el saldo)' : (a ? a.texto : '')),
+    saldoDespues: a && !c.esAnulado ? a.saldoDespues : '',
+    control: c.esAnulado ? 'ANULADO' : (c.esConciliado ? 'OK' : 'PENDIENTE DE CONCILIAR'),
+  };
+}
+
+/** Siguiente N° de recibo libre (sugerencia; el que vale es el del talonario). */
+function siguienteRecibo_(ss, tz) {
+  const usados = recibosYOperacionesUsados_(ss, tz);
+  let max = 0;
+  Object.keys(usados.recibos).forEach(function (r) { const n = parseInt(r.replace(/\D/g, ''), 10); if (n > max) max = n; });
+  return ('0000' + (max + 1)).slice(-4);
+}
+
+/**
+ * Estado de cuenta de una clienta (R0.6): créditos (con cuotas), ventas a crédito, cobros, recargos (financieros y por
+ * mora), cobros por confirmar y saldo, a la fecha de corte (hoy). admin = incluye la sugerencia de categoría.
+ */
+function estadoCuentaCliente_(ss, tz, codigo, admin) {
+  const m = modeloCartera_(ss, tz);
+  const k = clave_(codigo);
+  const cli = m.clientesPorCodigo[k];
+  if (!cli) throw errorUsuario_('No se encontró la clienta ' + codigo + '.');
+  const P = m.P;
+  const creditos = m.creditos.filter(function (c) { return clave_(c.codigoCliente) === k; })
+    .sort(function (a, b) { return a.fecha < b.fecha ? 1 : (a.fecha > b.fecha ? -1 : 0); }).map(creditoParaApp_);
+  const ids = {};
+  creditos.forEach(function (c) { ids[clave_(c.id)] = true; });
+  const cobros = m.cobros.filter(function (c) { return ids[clave_(c.credito)] || clave_(c.codigoCliente) === k; })
+    .sort(function (a, b) { return a.fecha < b.fecha ? 1 : (a.fecha > b.fecha ? -1 : (String(a.id) < String(b.id) ? 1 : -1)); })
+    .map(function (c) { return cobroParaApp_(c, m); });
+  const codRec = clave_(P.P_COD_REC || '');
+  const filasVentas = leerTabla_(ss, 'ventas', tz).filas.filter(function (v) { return clave_(v.codigoCliente) === k && v.condicion === 'Crédito'; });
+  const ventas = agruparVentas_(filasVentas).sort(porFechaDesc_).map(function (v) {
+    return { id: v.id, fecha: v.fecha, total: v.total, estado: v.estado, nroCredito: v.nroCredito, items: v.items.length, nota: v.nota };
+  });
+  const recargos = filasVentas.filter(function (v) { return codRec && clave_(v.codigo) === codRec && v.estado !== 'Anulada'; }).map(function (v) {
+    return { tipo: 'FINANCIERO', fecha: v.fecha, credito: v.nroCredito, venta: v.id, monto: v.subtotal, detalle: v.producto };
+  }).concat(cobros.filter(function (c) { return c.esMora && !c.anulado; }).map(function (c) {
+    return { tipo: 'MORA', fecha: c.fecha, credito: c.credito, venta: c.venta, monto: c.monto, detalle: 'Cobro ' + c.id + ' (' + c.medio + ')' };
+  }));
+  let porConfirmar = [];
+  try {
+    porConfirmar = leerTabla_(ss, 'cobrosConfirmar', tz).filas.filter(function (x) { return clave_(x.codigoCliente) === k && x.estado === 'PENDIENTE'; })
+      .map(function (x) { return { id: x.id, credito: x.credito, venta: x.venta, monto: x.monto, fuente: x.fuente, observacion: x.observacion }; });
+  } catch (e) { porConfirmar = []; }
+  const abiertos = creditos.filter(function (c) { return c.saldo > 0; });
+  const proximo = abiertos.filter(function (c) { return c.proximoVto; }).sort(function (a, b) { return a.proximoVto < b.proximoVto ? -1 : 1; })[0] || null;
+  return {
+    corte: m.corte, emitido: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'), empresa: P.P_EMPRESA || 'Distribuidora MB',
+    cliente: {
+      codigo: cli.codigo, nombre: cli.nombre, contacto: cli.contacto, ruc: cli.ruc, ci: cli.ci, whatsapp: cli.whatsapp, celular: cli.celular,
+      categoria: cli.categoria, limite: cli.limite, disponible: cli.disponible, estado: cli.estado, sugerencia: admin ? cli.sugerencia : '', legado: cli.legado,
+      alias: cli.alias, tipo: cli.tipo, completitud: cli.completitud, activo: cli.activo, hoja: cli.hoja,
+    },
+    resumen: {
+      saldo: cli.saldo, vencido: cli.vencido, atraso: cli.atraso, creditosAbiertos: abiertos.length, aConfirmar: cli.aConfirmar,
+      proximoVto: proximo ? proximo.proximoVto : '', aCobrar: proximo ? proximo.aCobrar : 0,
+      moraSugerida: abiertos.reduce(function (t, c) { return t + (c.moraSugerida || 0); }, 0),
+      totalCobrado: cobros.filter(function (c) { return !c.anulado && !c.esMora; }).reduce(function (t, c) { return t + c.monto; }, 0),
+    },
+    creditos: creditos, cobros: cobros, ventas: ventas, recargos: recargos, porConfirmar: porConfirmar,
+    gracia: P.P_GRACIA, moraHabilitada: P.P_POLITICA_FIRMADA !== null && String(P.P_POLITICA_FIRMADA || '') !== '',
+  };
+}
+
+/** Pantalla de estado de cuenta: datos + el mismo HTML que se imprime en A4 y se exporta a PDF (Reportes.gs). */
+function obtenerFichaCliente_(ctx) {
+  const ec = estadoCuentaCliente_(ctx.ss, ctx.tz, ctx.datos.codigo, esAdministradora_(ctx.usuario));
+  return { ok: true, ficha: ec, html: typeof htmlEstadoCuenta_ === 'function' ? htmlEstadoCuenta_(ec) : null };
+}
+
+/** Listas completas a pedido («Ver todo»): tipo = 'creditos' | 'cobros', con filtro opcional de clienta y fechas. */
+function obtenerCartera_(ctx) {
+  const d = ctx.datos;
+  const m = modeloCartera_(ctx.ss, ctx.tz);
+  const cli = clave_(d.cliente);
+  const desde = /^\d{4}-\d{2}-\d{2}$/.test(String(d.desde || '')) ? d.desde : '';
+  const hasta = /^\d{4}-\d{2}-\d{2}$/.test(String(d.hasta || '')) ? d.hasta : '';
+  if (d.tipo === 'cobros') {
+    return { ok: true, tipo: 'cobros', cobros: m.cobros.filter(function (c) {
+      return (!cli || clave_(c.codigoCliente) === cli) && (!desde || c.fecha >= desde) && (!hasta || c.fecha <= hasta);
+    }).sort(function (a, b) { return a.fecha < b.fecha ? 1 : -1; }).slice(0, 2000).map(function (c) { return cobroParaApp_(c, m); }) };
+  }
+  return { ok: true, tipo: 'creditos', creditos: m.creditos.filter(function (c) {
+    return (!cli || clave_(c.codigoCliente) === cli) && (!desde || c.fecha >= desde) && (!hasta || c.fecha <= hasta);
+  }).map(creditoParaApp_) };
+}
+
+/**
+ * Cartera para la app (construirDatos_, ambos roles). Además completa en cada venta agrupada (contexto.grupos) un
+ * resumen de su crédito (v.credito) y deja el modelo en contexto.modeloCartera para el panel de pendientes.
+ */
+function datosCartera_(ss, tz, usuario, contexto) {
+  const admin = esAdministradora_(usuario);
+  const m = modeloCartera_(ss, tz);
+  if (contexto) contexto.modeloCartera = m;
+  const P = m.P;
+  const desde = sumarDias_(m.hoy, -DIAS_RECIENTES_CARTERA_);
+  if (contexto && contexto.grupos) {
+    const porId = {};
+    const porVenta = {};
+    m.creditos.forEach(function (c) { if (!c.anulado) { porId[clave_(c.id)] = c; if (c.venta) porVenta[clave_(c.venta)] = c; } });
+    contexto.grupos.forEach(function (v) {
+      const c = porId[clave_(v.nroCredito)] || porVenta[clave_(v.id)];
+      if (c) v.credito = { id: c.id, saldo: c.saldo, estado: c.estado, atraso: c.atraso, vencido: c.vencido, conPlan: c.conPlan };
+    });
+  }
+  const parametros = {};
+  ['P_MIN_CREDITO', 'P_CUOTA_MIN', 'P_MAX_CUOTAS', 'P_GRACIA', 'P_DIAS_BLOQUEO', 'P_ENTREGA_EQUIPO', 'P_RED_CUOTA', 'P_PLAZO_SIN_REC', 'P_TEA_FIN', 'P_TEA_MORA',
+    'P_LIMITE_BCP', 'P_DESC_VEND', 'P_DESC_MAX', 'P_LINEA_EQUIPO', 'P_LINEA_FIN', 'P_COD_REC', 'P_CONC_MORA', 'P_FREC_SEMANAL', 'P_FREC_QUINCENAL', 'P_FREC_MENSUAL']
+    .forEach(function (k) { parametros[k] = P[k] === undefined ? null : P[k]; });
+  parametros.moraHabilitada = P.P_POLITICA_FIRMADA !== null && String(P.P_POLITICA_FIRMADA || '') !== '';
+  parametros.faltan = P._faltan.map(function (k) { return P._nombres[k] || k; });
+  const d = {
+    hoy: m.hoy, corte: m.corte, parametros: parametros, medios: LISTAS.MEDIOS_PAGO.slice(), frecuencias: LISTAS.FRECUENCIAS.slice(),
+    categorias: m.cats.map(function (c) { return { nombre: c.nombre, limite: c.limite, entrega: c.entrega, cuotas: c.cuotas, frecuencia: c.frecuencia, frecuencias: c.frecuencias, criterio: c.criterio }; }),
+    clientes: m.clientes.filter(function (c) { return c.activo || c.saldo !== 0; }).map(function (c) {
+      return {
+        codigo: c.codigo, nombre: c.nombre, contacto: c.contacto, hoja: c.hoja, categoria: c.categoria, limite: c.limite, disponible: c.disponible, saldo: c.saldo,
+        vencido: c.vencido, atraso: c.atraso, estado: c.estado, sugerencia: admin ? c.sugerencia : '', whatsapp: c.whatsapp, legado: c.legado, alias: c.alias,
+        creditosAbiertos: c.creditosAbiertos, aConfirmar: c.aConfirmar, activo: c.activo, ruc: c.ruc, ci: c.ci,
+      };
+    }).sort(function (a, b) { return b.vencido - a.vencido || b.saldo - a.saldo || (normalizar_(a.nombre) < normalizar_(b.nombre) ? -1 : 1); }),
+    creditos: m.creditos.filter(function (c) {
+      return !c.anulado && (c.saldo !== 0 || c.fecha >= desde || (c.fechaCancelacion && c.fechaCancelacion >= desde));
+    }).map(creditoParaApp_).sort(function (a, b) {
+      if (b.atraso !== a.atraso) return b.atraso - a.atraso;
+      const x = a.proximoVto || '9999-99-99';
+      const y = b.proximoVto || '9999-99-99';
+      return x < y ? -1 : (x > y ? 1 : 0);
+    }),
+    cobros: m.cobros.filter(function (c) { return c.fecha >= desde; }).map(function (c) { return cobroParaApp_(c, m); })
+      .sort(function (a, b) { return a.fecha < b.fecha ? 1 : (a.fecha > b.fecha ? -1 : (String(a.id) < String(b.id) ? 1 : -1)); }),
+    antiguedad: m.antiguedad, top10: m.top10, totales: m.totales, siguienteRecibo: siguienteRecibo_(ss, tz),
+    sinClienta: m.sinClienta.map(function (c) { return c.id + ' (' + c.codigoCliente + ')'; }),
+  };
+  if (admin) {
+    try {
+      d.cobrosConfirmar = leerTabla_(ss, 'cobrosConfirmar', tz).filas.filter(function (x) { return x.estado === 'PENDIENTE'; }).map(function (x) {
+        return { id: x.id, credito: x.credito, venta: x.venta, codigoCliente: x.codigoCliente, cliente: x.cliente, monto: x.monto, fuente: x.fuente, observacion: x.observacion };
+      });
+    } catch (e) { d.cobrosConfirmar = []; }
+    try {
+      d.saldosIniciales = leerTabla_(ss, 'saldos', tz).filas.map(function (s) {
+        return { numero: s.numero, legado: s.legado, clienta: s.clienta, saldoHoja: s.saldoHoja, saldoConfirmado: s.saldoConfirmado, saldoMigrar: s.saldoMigrar,
+          lectura: s.lectura, detalle: s.detalle, estado: s.estado, observacion: s.observacion, tipo: s.tipo, ultimoVisto: s.ultimoVisto, hojaFecha: s.hojaFecha,
+          codigoCliente: s.codigoCliente, credito: s.credito };
+      });
+    } catch (e) { d.saldosIniciales = []; }
+  }
+  return d;
+}
+
+/** Ventas a crédito «Pendiente» sin crédito en «Créditos» (antes de la migración: V-00003 y V-00005). */
+function ventasCreditoSinPlan_(grupos, creditos) {
+  const conCredito = {};
+  creditos.forEach(function (c) { if (!c.anulado && c.venta) conCredito[clave_(c.venta)] = true; });
+  return grupos.filter(function (v) { return v.condicion === 'Crédito' && v.estado === 'Pendiente' && !conCredito[clave_(v.id)] && !clave_(v.nroCredito); });
+}
+
+/** Panel «Pendientes» (solo administradoras): lo de cartera que falta confirmar o completar. Nunca se completa con supuestos. */
+function pendientesCartera_(ss, tz, c) {
+  const m = (c && c.modeloCartera) || modeloCartera_(ss, tz);
+  const lista = [];
+  function agregar(clave, titulo, items, accion) {
+    if (items.length) lista.push({ clave: clave, titulo: titulo, cantidad: items.length, detalle: items.slice(0, 30), accion: accion || '' });
+  }
+  const grupos = c && c.grupos && c.grupos.length ? c.grupos : agruparVentas_(leerTabla_(ss, 'ventas', tz).filas);
+  const sinPlan = ventasCreditoSinPlan_(grupos, m.creditos);
+  let saldos = [];
+  try { saldos = leerTabla_(ss, 'saldos', tz).filas; } catch (e) { saldos = []; }
+  const historicos = m.creditos.filter(function (x) { return x.origen === ORIGEN_CREDITO_.HISTORICO; });
+  if (!historicos.length && !saldos.length) {
+    agregar('migracion', 'Migración de la cartera histórica pendiente', ['41 clientas, 20 saldos al 25/09/2026 y los créditos ya cargados'], 'Sistema › Migración: vista previa y confirmar.');
+  }
+  agregar('ventasSinPlan', 'Ventas a crédito sin plan en «Créditos»', sinPlan.map(function (v) { return v.id + ' ' + v.cliente + ' Gs. ' + miles_(v.total); }),
+    'Sistema › Migración (las pasa a Créditos como VIGENTE PREVIO, plan A CONFIRMAR).');
+  agregar('aConfirmar', 'Saldos y créditos con plan A CONFIRMAR', m.creditos.filter(function (x) { return !x.anulado && x.estado === PLAN_.A_CONFIRMAR; })
+    .map(function (x) { return x.id + ' ' + x.cliente + ' Gs. ' + miles_(x.saldo) + (x.lectura ? ' (' + x.lectura + ')' : '') + (x.origen ? ' · ' + x.origen : ''); }),
+    'Cartera › Pendientes: confirmar el saldo con la clienta y después el plan.');
+  agregar('dudosos', 'Saldos iniciales DUDOSOS sin confirmar', saldos.filter(function (s) { return s.tipo === 'SALDO INICIAL' && s.lectura === 'DUDOSA' && s.estado !== 'CONFIRMADO'; })
+    .map(function (s) { return s.numero + ' ' + s.clienta + ' Gs. ' + miles_(s.saldoHoja) + ': ' + s.detalle; }), 'Confirmar con la clienta (Cartera › Pendientes).');
+  agregar('investigar', 'Saldos a investigar (no suman a la cartera)', saldos.filter(function (s) { return s.tipo === 'A INVESTIGAR'; })
+    .map(function (s) { return s.clienta + ' Gs. ' + miles_(s.ultimoVisto) + ' (hoja ' + s.hojaFecha + '): ' + s.observacion; }), 'Revisar las hojas originales.');
+  let porConfirmar = [];
+  try { porConfirmar = leerTabla_(ss, 'cobrosConfirmar', tz).filas.filter(function (x) { return x.estado === 'PENDIENTE'; }); } catch (e) { porConfirmar = []; }
+  agregar('cobrosConfirmar', 'Cobros a confirmar (sin fecha, medio ni recibo)', porConfirmar.map(function (x) { return x.id + ' ' + x.cliente + ' Gs. ' + miles_(x.monto) + ' (' + x.venta + ')'; }),
+    'Cartera › Pendientes: registrar con los datos confirmados o descartar.');
+  agregar('sinCategoria', 'Categorías de crédito sin asignar', m.clientes.filter(function (x) { return x.activo && !x.cat; })
+    .sort(function (a, b) { return b.saldo - a.saldo; }).map(function (x) { return x.codigo + ' ' + x.nombre + (x.saldo > 0 ? ' (saldo Gs. ' + miles_(x.saldo) + ')' : ''); }),
+    'Asignar la categoría (Cartera › Clientas › Categoría).');
+  agregar('cobradoDeMas', 'COBRADO DE MÁS: REVISAR', m.creditos.filter(function (x) { return x.cobradoDeMas; }).map(function (x) { return x.id + ' ' + x.cliente + ' Gs. ' + miles_(-x.saldo); }),
+    'Revisar los cobros del crédito.');
+  agregar('sinConciliar', 'Cobros PENDIENTES DE CONCILIAR', m.cobros.filter(function (x) { return !x.esAnulado && !x.esConciliado; })
+    .map(function (x) { return x.id + ' ' + formatoFecha_(x.fecha) + ' ' + x.medio + ' Gs. ' + miles_(x.monto); }), 'Cartera › Cobros: conciliar con el extracto o el arqueo.');
+  agregar('sinClienta', 'Créditos sin clienta registrada', m.sinClienta.map(function (x) { return x.id + ' (' + x.codigoCliente + ')'; }), 'Vincular el crédito a su clienta.');
+  const mes = m.hoy.slice(0, 7);
+  if (String(m.P.P_LIMITE_BCP_MES || '') < mes) {
+    agregar('limiteBcp', 'Límite de tasa usuraria BCP sin verificar este mes', ['Verificado: ' + (m.P.P_LIMITE_BCP_MES || 'nunca') + ' (hoy ' + mes + ')'], 'Actualizar P_LIMITE_BCP y P_LIMITE_BCP_MES en «Parámetros de crédito».');
+  }
+  return lista;
+}
+
+/** Paquete «v23-f2-cartera»: estructura, parámetros y columnas automáticas de la cartera. La migración se hace aparte (vista previa + confirmación). */
+function aplicarPaqueteCartera_(ss, email, tz) {
+  respaldoUnaVez_(ss, tz, 'paquete v23-f2-cartera');
+  asegurarEstructura_(ss);
+  sembrarParametros_(ss, tz, email);
+  const m = recalcularCartera_(ss, tz);
+  const migrada = typeof migracionAplicada_ === 'function' ? migracionAplicada_(ss, tz) : true;
+  return 'Cartera v' + CONFIG.VERSION + ': ' + plural_(m.creditos.length, 'crédito', 'créditos') + ', cartera Gs. ' + miles_(m.totales.cartera) + ' (vencido Gs. ' + miles_(m.totales.vencido) +
+    '); columnas automáticas de Créditos, Cuotas, Cobros y clientas recalculadas.' +
+    (migrada ? '' : ' PENDIENTE: «Migrar datos antiguos» (Sistema › Migración, con vista previa) para cargar las clientas, los saldos históricos y los créditos ya cargados.');
+}
+
+// ─────────────────────── 8. Pruebas (testSistema · Pruebas.gs) ───────────────────────
+
+/**
+ * Pruebas EN MEMORIA (sin hoja): fórmulas de CREDITOS con el ejemplo 1001 del xlsx, controles y autorizaciones,
+ * cascada contra la fórmula del xlsx, estados por fecha de corte, mora, estado de la clienta, plan sugerido y los
+ * datos literales de la migración. La política sale de la semilla (copia del xlsx), nunca de cifras del código.
+ */
+function pruebasCartera_(t) {
+  const P = parametrosDeSemilla_();
+  const cats = categoriasDeSemilla_();
+  const cat = function (n) { return categoriaPorNombre_(cats, n); };
+  const codigos = function (lista) { return lista.map(function (p) { return p.codigo; }); };
+  const cuotasHoja = function (plan) { return plan.cuotas.map(function (q, i) { return { _fila: i + 2, numero: q.n, vencimiento: q.vto, monto: q.monto }; }); };
+
+  // ── Plan de pagos: ejemplo 1001 del xlsx (CREDITOS fila 6: 690.000, entrega 210.000, 6 cuotas semanales de 80.000) ──
+  const p1001 = calcularPlanCredito_({ fecha: '2026-10-02', subtotal: 690000, entrega: 210000, cuotas: 6, frecuencia: 'SEMANAL' }, P);
+  t.igual('Ejemplo 1001: sin recargo (6 × 7 = 42 días, no supera P_PLAZO_SIN_REC)', [p1001.recargo, p1001.total], [0, 690000]);
+  t.igual('Ejemplo 1001: financiado 480.000 en 6 cuotas de 80.000', [p1001.financiado, p1001.n, p1001.cuota, p1001.ultima], [480000, 6, 80000, 80000]);
+  t.igual('Ejemplo 1001: 1er vencimiento 09/10/2026 (fecha + 7) y último 13/11/2026', [p1001.primerVto, p1001.ultimoVto], ['2026-10-09', '2026-11-13']);
+  t.igual('Ejemplo 1001: la entrega es la cuota 0 y vence el día de la venta', [p1001.cuotas[0].n, p1001.cuotas[0].vto, p1001.cuotas[0].monto], [0, '2026-10-02', 210000]);
+  t.igual('Ejemplo 1001: texto del plan', textoPlan_(p1001), 'entrega Gs. 210.000 + 6 cuotas semanales de Gs. 80.000, del 09/10/2026 al 13/11/2026; sin recargo.');
+  t.igual('Entrega mínima categoría B = ↑1.000 (690.000 × 30%) = 207.000 (CREDITOS!AS del ejemplo)', entregaMinimaCredito_(690000, cat('B'), cats, false, P).monto, 207000);
+  t.igual('Entrega mínima sin categoría = la de NUEVA (50%): 345.000', entregaMinimaCredito_(690000, null, cats, false, P).monto, 345000);
+  t.igual('Entrega mínima con equipamiento y categoría B = 40% (P_ENTREGA_EQUIPO): 276.000', entregaMinimaCredito_(690000, cat('B'), cats, true, P).monto, 276000);
+  t.igual('Entrega mínima con equipamiento sin categoría = la mayor (NUEVA 50%): 675.000', entregaMinimaCredito_(1350000, null, cats, true, P).monto, 675000);
+  const pQ = calcularPlanCredito_({ fecha: '2026-10-02', subtotal: 690000, entrega: 210000, cuotas: 4, frecuencia: 'QUINCENAL' }, P);
+  t.igual('Recargo QUINCENAL × 4 (56 días) sobre 480.000 = REDONDEAR(480.000 × (1,24^(35/365) − 1); −3) = 10.000', [pQ.recargo, pQ.recargoLimitado, pQ.total], [10000, false, 700000]);
+  t.igual('Plan QUINCENAL × 4: cuota ↓1.000 = 122.000, última 124.000, cada 14 días', [pQ.cuota, pQ.ultima, pQ.primerVto, pQ.ultimoVto], [122000, 124000, '2026-10-16', '2026-11-27']);
+  t.ok('Tasa efectiva del recargo dentro del límite BCP', pQ.tasaEfectiva > 0 && pQ.tasaEfectiva <= P.P_LIMITE_BCP, String(pQ.tasaEfectiva));
+  const pBcp = calcularPlanCredito_({ fecha: '2026-10-02', subtotal: 125000, entrega: 0, cuotas: 4, frecuencia: 'QUINCENAL' }, P);
+  t.igual('Recargo que por redondeo superaría el límite BCP (3.000 → 28,1%) se baja a 2.000', [pBcp.recargo, pBcp.recargoLimitado], [2000, true]);
+  t.ok('Ningún recargo supera el límite BCP', pBcp.tasaEfectiva <= P.P_LIMITE_BCP, String(pBcp.tasaEfectiva));
+  t.igual('Plan de 1 pago: todo el saldo en un vencimiento', [calcularPlanCredito_({ fecha: '2026-10-02', subtotal: 300000, entrega: 0, cuotas: 1 }, P).cuota], [300000]);
+  t.igual('1er vencimiento indicado a mano', calcularPlanCredito_({ fecha: '2026-10-02', subtotal: 690000, entrega: 210000, cuotas: 6, primerVto: '2026-10-12' }, P).ultimoVto, '2026-11-16');
+  t.lanza('1er vencimiento inexistente rechazado', function () { validarPrimerVto_('2026-02-30', '2026-01-10'); }, /no existe/);
+  t.lanza('1er vencimiento anterior a la venta rechazado', function () { validarPrimerVto_('2026-10-01', '2026-10-02'); }, /posterior/);
+  t.igual('Recargo como línea «REC-FIN» (sin stock, línea INGRESOS FINANCIEROS, IVA general mientras P_IVA_RECARGO esté vacío)',
+    lineasRecargo_(pQ, P).map(function (l) { return [l.codigo, l.subtotal, l.linea, l.tasa]; }), [['REC-FIN', 10000, 'INGRESOS FINANCIEROS', 10]]);
+  t.igual('Sin recargo no hay línea REC-FIN', lineasRecargo_(p1001, P).length, 0);
+
+  // ── Controles al otorgar (mensajes literales del xlsx) y autorizaciones ──
+  const base = function (cambios) {
+    const e = Object.assign({ subtotal: 690000, entrega: 210000, cuotas: 6, frecuencia: 'SEMANAL', cat: cat('B'), saldo: 0, atraso: 0, cobrada: 0, lineas: [], mora: false }, cambios || {});
+    const plan = calcularPlanCredito_({ fecha: '2026-10-02', subtotal: e.subtotal, entrega: e.entrega, cuotas: e.cuotas >= 1 ? e.cuotas : 1, frecuencia: e.frecuencia }, e.P || P);
+    return controlesCreditoNuevo_({ P: e.P || P, cats: cats, cat: e.cat, clienta: { saldo: e.saldo, atraso: e.atraso }, plan: plan, cuotasPedidas: e.cuotas,
+      entregaMinima: entregaMinimaCredito_(e.subtotal, e.cat, cats, !!e.equipo, P), lineasPrecio: e.lineas, entregaCobradaAhora: e.cobrada, moraPactada: e.mora });
+  };
+  t.igual('Crédito dentro de la política: sin observaciones', codigos(base()), []);
+  t.igual('Sin N° de cuotas: DEFINIR N° DE CUOTAS', codigos(base({ cuotas: 0 })), ['DEFINIR N° DE CUOTAS']);
+  t.ok('7 cuotas: MÁS CUOTAS QUE LA POLÍTICA', codigos(base({ cuotas: 7 })).indexOf('MÁS CUOTAS QUE LA POLÍTICA') >= 0);
+  t.ok('Sin categoría: ASIGNAR CATEGORÍA A LA CLIENTA', codigos(base({ cat: null, entrega: 345000 })).indexOf('ASIGNAR CATEGORÍA A LA CLIENTA') >= 0);
+  t.igual('Entrega 200.000 < 207.000: ENTREGA MENOR AL MÍNIMO', codigos(base({ entrega: 200000 })), ['ENTREGA MENOR AL MÍNIMO']);
+  t.ok('Venta de 150.000: MONTO MENOR AL MÍNIMO PARA CRÉDITO', codigos(base({ subtotal: 150000, entrega: 45000, cuotas: 1 })).indexOf('MONTO MENOR AL MÍNIMO PARA CRÉDITO') >= 0);
+  t.igual('Categoría C con 6 cuotas: CUOTAS SOBRE EL MÁXIMO DE SU CATEGORÍA', codigos(base({ cat: cat('C'), entrega: 276000 })), ['CUOTAS SOBRE EL MÁXIMO DE SU CATEGORÍA']);
+  t.igual('Cuota de 35.000: CUOTA MENOR A LA MÍNIMA', codigos(base({ subtotal: 300000, entrega: 90000 })), ['CUOTA MENOR A LA MÍNIMA']);
+  t.igual('Atraso de 8 días: CLIENTA BLOQUEADA', codigos(base({ atraso: 8 })), ['CLIENTA BLOQUEADA']);
+  t.igual('Saldo 2.500.000 + esta venta > límite B: CLIENTA EXCEDE SU LÍMITE', codigos(base({ saldo: 2500000 })), ['CLIENTA EXCEDE SU LÍMITE']);
+  t.igual('La entrega cobrada en el acto reduce la exposición (2.500.000 + 690.000 − 210.000 ≤ 3.000.000)', codigos(base({ saldo: 2500000, cobrada: 210000 })), []);
+  t.ok('Entrega igual al total: LA ENTREGA CUBRE EL TOTAL', codigos(base({ entrega: 690000 })).indexOf('LA ENTREGA CUBRE EL TOTAL') >= 0);
+  const pAlto = Object.assign({}, P, { P_TEA_FIN: 0.3 });
+  t.ok('Tasa de financiación sobre el límite BCP: REVISAR', codigos(base({ P: pAlto, cuotas: 4, frecuencia: 'QUINCENAL', cat: cat('A'), entrega: 138000 })).indexOf('REVISAR: una tasa supera el límite BCP') >= 0);
+  t.ok('Tasa de mora sobre el límite BCP con mora pactada: REVISAR', codigos(base({ P: Object.assign({}, P, { P_TEA_MORA: 0.3 }), mora: true })).indexOf('REVISAR: una tasa supera el límite BCP') >= 0);
+  t.igual('QUINCENAL con categoría B: requiere autorización (y nada más)', base({ frecuencia: 'QUINCENAL', cuotas: 4 }).map(function (p) { return [p.codigo, p.severidad]; }),
+    [['FRECUENCIA REQUIERE AUTORIZACIÓN', 'AUTORIZAR']]);
+  t.igual('QUINCENAL con categoría A: permitida sin autorización', codigos(base({ frecuencia: 'QUINCENAL', cuotas: 4, cat: cat('A'), entrega: 138000 })), []);
+  t.igual('MENSUAL siempre requiere autorización (también con A); SEMANAL nunca (aun sin categoría)',
+    [frecuenciaRequiereAutorizacion_(cat('A'), 'MENSUAL'), frecuenciaRequiereAutorizacion_(null, 'SEMANAL'), frecuenciaRequiereAutorizacion_(cat('B'), 'QUINCENAL')], [true, false, true]);
+  const conPrecio = base({ lineas: [{ nombre: 'Producto', tipo: 'PRODUCTO', precio: 93000, lista: 100000, total: 690000, tasa: 10, costoTotal: 300000 }] });
+  t.igual('Descuento 7%: DESCUENTO REQUIERE AUTORIZACIÓN (autorizable)', conPrecio.map(function (p) { return [p.codigo, p.severidad]; }), [['DESCUENTO REQUIERE AUTORIZACIÓN', 'AUTORIZAR']]);
+  const todos = base({ cuotas: 7, cat: null, entrega: 0, subtotal: 150000, atraso: 30, frecuencia: 'MENSUAL',
+    lineas: [{ nombre: 'X', tipo: 'PRODUCTO', precio: 80000, lista: 100000, total: 150000, tasa: 10, costoTotal: 140000 }] });
+  t.ok('Solo FRECUENCIA, DESCUENTO REQUIERE AUTORIZACIÓN y MARGEN BAJO MÍNIMO son autorizables; el resto se rechaza',
+    todos.length >= 6 && todos.every(function (p) { return p.autorizable === (['FRECUENCIA REQUIERE AUTORIZACIÓN', 'DESCUENTO REQUIERE AUTORIZACIÓN', 'MARGEN BAJO MÍNIMO'].indexOf(p.codigo) >= 0); }),
+    JSON.stringify(todos.map(function (p) { return [p.codigo, p.autorizable]; })));
+  const ctxAdmin = { usuario: { email: 'admin.prueba@mb.invalid', rol: ROLES.ADMIN }, email: 'admin.prueba@mb.invalid', tz: CONFIG.ZONA_HORARIA };
+  const ctxOper = { usuario: { email: 'operativa.prueba@mb.invalid', rol: ROLES.OPERATIVO }, email: 'operativa.prueba@mb.invalid', tz: CONFIG.ZONA_HORARIA };
+  const frec = base({ frecuencia: 'QUINCENAL', cuotas: 4 });
+  t.lanza('Lo no autorizable se rechaza aunque una administradora marque «autorizar»', function () {
+    resolverAutorizacion_(base({ entrega: 100000 }), ctxAdmin, { autorizar: true, motivoAutorizacion: 'Clienta de confianza' });
+  }, /ENTREGA MENOR AL MÍNIMO/);
+  t.lanza('Lo autorizable pedido por una operativa: requiere administradora', function () { resolverAutorizacion_(frec, ctxOper, { autorizar: true, motivoAutorizacion: 'Pedido de la clienta' }); }, /Requiere la autorización de una administradora/);
+  t.lanza('Administradora sin marcar «Autorizo»: se le pide confirmar con motivo', function () { resolverAutorizacion_(frec, ctxAdmin, {}); }, /Autorizo la excepción/);
+  t.lanza('Motivo de menos de 5 letras rechazado', function () { resolverAutorizacion_(frec, ctxAdmin, { autorizar: true, motivoAutorizacion: 'ok' }); }, /mínimo 5 letras/);
+  const aut = resolverAutorizacion_(frec, ctxAdmin, { autorizar: true, motivoAutorizacion: 'Cobra quincenal, 10 años de clienta' });
+  t.ok('Autorizada: queda quién, cuándo y por qué (con el código del xlsx)', aut.por.indexOf('admin.prueba@mb.invalid · ') === 0 && /FRECUENCIA REQUIERE AUTORIZACIÓN/.test(aut.motivo), JSON.stringify(aut));
+  t.igual('Sin problemas no hace falta autorizar', resolverAutorizacion_([], ctxOper, {}).por, '');
+
+  // ── Cascada de cobros = fórmula del xlsx (pagado k = MIN(monto k; MAX(0; cobrado a cuotas − (k − 1) × cuota))) ──
+  const xlsxPagos = function (plan, cobrado) {
+    const r = {};
+    const entrega = Math.min(plan.entrega, cobrado);
+    if (plan.entrega > 0) r[0] = entrega;
+    for (let k = 1; k <= plan.n; k++) r[k] = Math.min(k < plan.n ? plan.cuota : plan.ultima, Math.max(0, cobrado - entrega - (k - 1) * plan.cuota));
+    return r;
+  };
+  const cuotasDe = function (plan) { return plan.cuotas.map(function (q) { return { numero: q.n, monto: q.monto }; }); };
+  [[p1001, [0, 100000, 210000, 250000, 290000, 370000, 489999, 690000]], [pQ, [0, 210000, 331999, 332000, 500000, 700000]]].forEach(function (caso) {
+    const plan = caso[0];
+    caso[1].forEach(function (monto) {
+      const uno = aplicarCascada_(plan.total, cuotasDe(plan), monto ? [{ id: 'A', fecha: '2026-10-05', monto: monto }] : []);
+      const tercio = Math.floor(monto / 3);
+      const tres = aplicarCascada_(plan.total, cuotasDe(plan), monto ? [{ id: 'B1', fecha: '2026-10-03', monto: tercio }, { id: 'B2', fecha: '2026-10-04', monto: tercio },
+        { id: 'B3', fecha: '2026-10-05', monto: monto - 2 * tercio }] : []);
+      t.igual('Cascada = xlsx (' + plan.frecuencia.toLowerCase() + ', cobrado Gs. ' + miles_(monto) + ')', [uno.pagado, tres.pagado], [xlsxPagos(plan, monto), xlsxPagos(plan, monto)]);
+    });
+  });
+  const ap = aplicarCascada_(690000, cuotasDe(p1001), [{ id: 'CB-1', fecha: '2026-10-02', monto: 250000 }]);
+  t.igual('Aplicación de un cobro: primero la entrega, después la cuota más antigua', [ap.aplicaciones['CB-1'].texto, ap.aplicaciones['CB-1'].saldoDespues], ['Entrega 210.000; Cuota 1 40.000 (parcial)', 440000]);
+
+  // ── Vencido, días de atraso y estado a distintas fechas de corte (CREDITOS!AA:AC) ──
+  const c1001 = { total: 690000, estadoPlan: 'VIGENTE', moraPactada: 'No' };
+  const entregaPagada = [{ id: 'E', fecha: '2026-10-02', monto: 210000 }];
+  const sit = function (corte, cobros, c, Px) { const s = situacionCredito_(c || c1001, cuotasHoja(p1001), cobros, corte, Px || P); return [s.vencido, s.atraso, s.estado]; };
+  t.igual('Corte 05/10 sin entrega: vencido 210.000, 3 días, ATRASO HASTA 7', sit('2026-10-05', []), [210000, 3, 'ATRASO HASTA 7']);
+  t.igual('Corte 11/10 con la entrega pagada: cuota 1 en gracia (2 días): AL DÍA', sit('2026-10-11', entregaPagada), [0, 2, 'AL DÍA']);
+  t.igual('Corte 12/10: vencido 80.000, 3 días, ATRASO HASTA 7', sit('2026-10-12', entregaPagada), [80000, 3, 'ATRASO HASTA 7']);
+  t.igual('Corte 20/10: vencido 160.000, 11 días, ATRASO 8-15', sit('2026-10-20', entregaPagada), [160000, 11, 'ATRASO 8-15']);
+  t.igual('Corte 28/10: vencido 240.000, 19 días, ATRASO 16-30', sit('2026-10-28', entregaPagada), [240000, 19, 'ATRASO 16-30']);
+  t.igual('Corte 25/11: vencido 480.000, 47 días, ATRASO 31-60', sit('2026-11-25', entregaPagada), [480000, 47, 'ATRASO 31-60']);
+  t.igual('Corte 20/12: 72 días, ATRASO +60', sit('2026-12-20', entregaPagada), [480000, 72, 'ATRASO +60']);
+  t.igual('Todo pagado: CANCELADO', sit('2026-12-20', [{ id: 'T', fecha: '2026-10-02', monto: 690000 }]), [0, 0, 'CANCELADO']);
+  const deMas = situacionCredito_(c1001, cuotasHoja(p1001), [{ id: 'T', fecha: '2026-10-02', monto: 700000 }], '2026-10-05', P);
+  t.igual('Cobrado de más: saldo negativo marcado para revisar', [deMas.saldo, deMas.cobradoDeMas], [-10000, true]);
+  t.igual('Estado de cuota: PAGADA / VENCIDA (PARCIAL) / EN GRACIA / PENDIENTE',
+    [estadoCuota_({ monto: 80000, vencimiento: '2026-10-09' }, 80000, '2026-10-20', 2), estadoCuota_({ monto: 80000, vencimiento: '2026-10-09' }, 1000, '2026-10-20', 2),
+      estadoCuota_({ monto: 80000, vencimiento: '2026-10-09' }, 0, '2026-10-10', 2), estadoCuota_({ monto: 80000, vencimiento: '2026-10-09' }, 0, '2026-10-09', 2)],
+    ['PAGADA', 'VENCIDA (PARCIAL)', 'EN GRACIA', 'PENDIENTE']);
+
+  // ── Mora (CREDITOS!AU): solo con mora pactada en el plan Y la política firmada cargada ──
+  const casiTodo = [{ id: 'X', fecha: '2026-10-02', monto: 610000 }];
+  const firmada = Object.assign({}, P, { P_POLITICA_FIRMADA: 'Política firmada (prueba)' });
+  const conMora = Object.assign({}, c1001, { moraPactada: 'Sí' });
+  t.igual('Mora sugerida: 80.000 vencidos × 30 días = REDONDEAR(80.000 × (1,24^(30/365) − 1); −2) = 1.400',
+    situacionCredito_(conMora, cuotasHoja(p1001), casiTodo, '2026-12-13', firmada).moraSugerida, 1400);
+  t.igual('Sin política firmada no hay mora', situacionCredito_(conMora, cuotasHoja(p1001), casiTodo, '2026-12-13', P).moraSugerida, 0);
+  t.igual('Sin mora pactada en el plan no hay mora', situacionCredito_(c1001, cuotasHoja(p1001), casiTodo, '2026-12-13', firmada).moraSugerida, 0);
+  t.igual('moraCobrable_ exige plan y política', [moraCobrable_(conMora, firmada), moraCobrable_(conMora, P), moraCobrable_(c1001, firmada)], [true, false, false]);
+
+  // ── Plan A CONFIRMAR (saldos migrados y créditos ya cargados): sin cuotas, sin atraso, sin bloqueo ──
+  const hist = { total: 1662000, estadoPlan: 'A CONFIRMAR', origen: 'HISTÓRICO' };
+  const sh = situacionCredito_(hist, [], [], '2026-12-31', P);
+  t.igual('A CONFIRMAR: sin vencido, sin atraso ni mora aunque pasen los meses', [sh.estado, sh.vencido, sh.atraso, sh.moraSugerida, sh.saldo], ['A CONFIRMAR', 0, 0, 0, 1662000]);
+  const shc = situacionCredito_(hist, [], [{ id: 'C1', fecha: '2026-10-05', monto: 200000 }], '2026-10-20', P);
+  t.igual('Cobro sobre un saldo A CONFIRMAR: baja el saldo «a cuenta»', [shc.saldo, shc.aplicaciones.C1.texto], [1462000, 'A cuenta del saldo 200.000']);
+  const planH = calcularPlanCredito_({ fecha: '2026-10-20', subtotal: 1662000, entrega: 0, cuotas: 6, frecuencia: 'SEMANAL' }, P);
+  const shp = situacionCredito_(Object.assign({}, hist, { estadoPlan: 'VIGENTE' }), cuotasHoja(planH), [{ id: 'C1', fecha: '2026-10-05', monto: 200000 }], '2026-10-20', P);
+  t.igual('Al confirmar el plan, el cobro previo se re-aplica a la cuota 1 (277.000)', [planH.cuota, shp.cuotas[0].pagado, shp.cuotas[0].estado, shp.saldo, shp.estado],
+    [277000, 200000, 'PARCIAL', 1462000, 'AL DÍA']);
+  t.igual('Concepto del cobro: CANCELACIÓN / ENTREGA / CUOTA (y ENTREGA confirmada desde una nota sobre un plan A CONFIRMAR)',
+    [conceptoCobro_({ saldo: 480000, conPlan: true, cuotas: [] }, 480000), conceptoCobro_({ saldo: 690000, conPlan: true, cuotas: [{ numero: 0, falta: 210000 }] }, 100000),
+      conceptoCobro_({ saldo: 480000, conPlan: true, cuotas: [{ numero: 0, falta: 0 }, { numero: 1, falta: 80000 }] }, 80000),
+      conceptoCobro_({ saldo: 1350000, conPlan: false, cuotas: [] }, 390000, 'ENTREGA'), conceptoCobro_({ saldo: 1350000, conPlan: false, cuotas: [] }, 390000, '')],
+    ['CANCELACIÓN', 'ENTREGA', 'CUOTA', 'ENTREGA', 'CUOTA']);
+  t.igual('Plan confirmado después del corte: a esa fecha todavía era A CONFIRMAR',
+    [planExistiaEn_({ origen: 'HISTÓRICO', confirmadoEl: '2026-10-20 10:00' }, '2026-10-15'), planExistiaEn_({ origen: 'HISTÓRICO', confirmadoEl: '2026-10-20 10:00' }, '2026-10-31'),
+      planExistiaEn_({ origen: 'NUEVO' }, '2026-10-01')], [false, true, true]);
+  t.igual('Recargo de un plan confirmado: cuenta desde la confirmación (ventas nuevas: desde la venta)',
+    [fechaRecargoCredito_({ origen: 'VIGENTE PREVIO', fecha: '2026-10-06', confirmadoEl: '2026-10-20 09:00' }), fechaRecargoCredito_({ origen: 'NUEVO', fecha: '2026-10-06' })], ['2026-10-20', '2026-10-06']);
+
+  // ── Estado de la clienta (CLIENTES!Q) y sugerencia de categoría (CLIENTES!R) ──
+  t.igual('Estados de la clienta (en el orden del xlsx)', [estadoClienta_(false, cat('A'), 0, 0, P), estadoClienta_(true, cat('A'), 100, 8, P), estadoClienta_(true, null, 100, 0, P),
+    estadoClienta_(true, cat('NUEVA'), 1200000, 0, P), estadoClienta_(true, cat('B'), 0, 0, P), estadoClienta_(true, cat('B'), 500000, 3, P)],
+  ['INACTIVA', 'BLOQUEADA', 'ASIGNAR CATEGORÍA', 'EXCEDE LÍMITE', 'SIN DEUDA', 'HABILITADA']);
+  t.igual('Sugerencia de categoría', [sugerenciaCategoria_(cat('A'), 31, P), sugerenciaCategoria_(cat('C'), 45, P), sugerenciaCategoria_(cat('A'), 10, P),
+    sugerenciaCategoria_(cat('B'), 10, P), sugerenciaCategoria_(null, 90, P)], ['BAJAR A C', 'MANTENER EN C', 'BAJAR A B', 'MANTENER', '']);
+
+  // ── Plan sugerido (R0.8 b): nunca se aplica solo; sin categoría no se calcula ──
+  const ps = planSugerido_(2800000, cat('B'), P, '2026-10-11');
+  t.igual('Plan sugerido Gs. 2.800.000 con B: 6 cuotas semanales de 466.000 (última 470.000), sin recargo', [ps.plan.n, ps.plan.cuota, ps.plan.ultima, ps.plan.recargo], [6, 466000, 470000, 0]);
+  t.ok('Plan sugerido: el texto aclara que no se aplica solo', /PLAN SUGERIDO \(categoría B; no se aplica solo\)/.test(ps.texto), ps.texto);
+  t.ok('Plan sugerido sin categoría: pide asignarla', planSugerido_(1662000, null, P, '2026-10-11').plan === null && /Asigne la categoría/.test(planSugerido_(1662000, null, P, '2026-10-11').texto));
+  t.igual('Plan sugerido respeta la cuota mínima (110.000 → 2 cuotas de 55.000)', [planSugerido_(110000, cat('B'), P, '2026-10-11').plan.n, planSugerido_(110000, cat('B'), P, '2026-10-11').plan.cuota], [2, 55000]);
+
+  // ── Datos literales de la migración (SALDOS_INICIALES y CLIENTES del xlsx) ──
+  const suma = function (l, i) { return l.reduce(function (s, x) { return s + x[i]; }, 0); };
+  t.igual('Saldos según hoja (20 filas, 9001–9020) = Gs. 17.000.500', [XLSX_SALDOS_.length, XLSX_SALDOS_[0][0], XLSX_SALDOS_[19][0], suma(XLSX_SALDOS_, 4)], [20, 9001, 9020, 17000500]);
+  t.igual('Saldos DUDOSOS = Gs. 7.434.000 (6 clientas)', [XLSX_SALDOS_.filter(function (s) { return s[5] === 'DUDOSA'; }).length, suma(XLSX_SALDOS_.filter(function (s) { return s[5] === 'DUDOSA'; }), 4)], [6, 7434000]);
+  t.igual('Saldos a investigar = Gs. 1.610.000 (4 casos, no suman)', [XLSX_A_INVESTIGAR_.length, suma(XLSX_A_INVESTIGAR_, 2)], [4, 1610000]);
+  t.igual('El 17.480.500 del TABLERO = 17.000.500 + 480.000 del ejemplo 1001 (que no se migra)', suma(XLSX_SALDOS_, 4) + p1001.financiado, 17480500);
+  t.ok('41 clientas C001…C041, sin la C999 de EJEMPLO', XLSX_CLIENTAS_.length === 41 && XLSX_CLIENTAS_.every(function (c, i) { return c[0] === 'C' + ('00' + (i + 1)).slice(-3); }) &&
+    !XLSX_CLIENTAS_.some(function (c) { return c[0] === EJEMPLOS_XLSX_.CLIENTA; }));
+  t.igual('Alias leídos de OBS (las dudas «¿Es la …?» no son alias)', [aliasDeObs_(XLSX_CLIENTAS_[9][2]), aliasDeObs_(XLSX_CLIENTAS_[4][2]), aliasDeObs_(XLSX_CLIENTAS_[7][2])],
+    [['Espinoza', 'Madalena'], ['Sole Maldonado'], []]);
+  t.ok('Parecidas: alias igual → aviso de posible duplicado (no se fusiona)', clientaParecida_({ nombre: 'Sole Maldonado', contacto: '' }, 'Soledad Maldonado', ['Sole Maldonado']) &&
+    !clientaParecida_({ nombre: 'TU', contacto: 'Mirian Britez' }, 'Tu', []));
+  const nota = analizarNotaCredito_('entregó Gs. 390.000 y pagos semanales; saldo al 9/10/2026 Gs. 860.000', 1350000, 1350000, null, cats, true, P);
+  t.igual('Nota de V-00005: el pago mencionado va a «Cobros a confirmar» (no se registra)', nota.entregas, [{ monto: 390000 }]);
+  t.ok('Nota de V-00005: alerta de entrega 28,9% bajo la mínima (equipamiento, sin categoría = NUEVA 50%: Gs. 675.000)',
+    /^ENTREGA MENOR AL MÍNIMO/.test(nota.alertas[0] || '') && /28,9%/.test(nota.alertas[0]) && /675\.000/.test(nota.alertas[0]), JSON.stringify(nota.alertas));
+  t.ok('Nota de V-00005: diferencia 960.000 vs 860.000 anotado (Gs. 100.000) para REVISAR',
+    nota.alertas.some(function (a) { return /DIFERENCIA EN LA NOTA/.test(a) && /860\.000/.test(a) && /960\.000/.test(a) && /100\.000/.test(a); }), JSON.stringify(nota.alertas));
+  t.ok('Nota «Sin respaldo» (V-00003): alerta para confirmar condiciones', /^SIN RESPALDO/.test(analizarNotaCredito_('Sin respaldo', 396000, 396000, null, cats, false, P).alertas[0] || ''));
+
+  // ── Reportes (Reportes.gs) ──
+  if (typeof finDeMes_ === 'function') {
+    t.igual('Fin de mes y meses anteriores', [finDeMes_('2026-02'), finDeMes_('2028-02'), finDeMes_('2026-10'), mesDesplazado_('2026-01', -1), mesDesplazado_('2026-10', -11)],
+      ['2026-02-28', '2028-02-29', '2026-10-31', '2025-12', '2025-11']);
+    const r = resultadoMes_([{ total: 110000, neto: 100000, costo: 60000 }], P, 0.02, 15000000);
+    t.igual('TABLERO A: margen 40%, punto de equilibrio = CF ÷ (margen % − variables %) = 39.473.684', [r.margen, Math.round(r.margenPct * 1000) / 10, r.peNeto], [40000, 40, 39473684]);
+    t.igual('Controles de una línea (VENTAS!S): sin costo, sin comprobante, crédito sin plan',
+      controlesLineaVenta_({ sinCosto: true, esRecargo: false, precioLista: 100000, precio: 100000, tipo: 'MERCADERÍA', costo: 0, neto: 90909, condicion: 'Crédito' }, P, false, false),
+      ['ÍTEM SIN COSTO EN CATALOGO', 'SIN COMPROBANTE', 'CRÉDITO SIN PLAN EN CREDITOS']);
+    const ec = {
+      corte: '2026-10-11', emitido: '2026-10-11 10:00', empresa: 'Distribuidora MB', gracia: 2, moraHabilitada: false,
+      cliente: { codigo: 'C-0099', nombre: 'Prueba <b>sin</b> HTML', legado: '', ruc: '', ci: '', whatsapp: '', categoria: 'B', limite: 3000000, disponible: 2520000, estado: 'HABILITADA' },
+      resumen: { saldo: 480000, vencido: 0, atraso: 0, proximoVto: '2026-10-09', aCobrar: 80000 },
+      creditos: [{ id: 'CR-00001', venta: 'V-00001', legado: '', fecha: '2026-10-02', origen: 'NUEVO', recargo: 0, total: 690000, cobrado: 210000, saldo: 480000, estado: 'AL DÍA', atraso: 0,
+        estadoPlan: 'VIGENTE', cuotas: [{ n: 1, vto: '2026-10-09', monto: 80000, pagado: 0, falta: 80000, estado: 'PENDIENTE' }] }],
+      cobros: [], ventas: [], recargos: [], porConfirmar: [],
+    };
+    const h = htmlEstadoCuenta_(ec);
+    t.ok('Estado de cuenta: HTML escapado, con créditos y cuotas, sin costos', h.cuerpo.indexOf('<b>sin</b>') < 0 && h.cuerpo.indexOf('&lt;b&gt;sin') >= 0 &&
+      h.cuerpo.indexOf('CR-00001') >= 0 && h.cuerpo.indexOf('Cuota 1') >= 0 && !/costo|margen/i.test(h.cuerpo), h.cuerpo.slice(0, 300));
+    t.ok('Estado de cuenta A4: documento completo con @page', /@page\{size:A4/.test(documentoHtml_(h.titulo, h.css, h.cuerpo)));
+  }
+}
+
+/**
+ * Escenarios sobre la COPIA TEMPORAL del libro (Pruebas.gs → escenariosEnCopia_; correo, Drive y PDF simulados):
+ * migración con vista previa y huella, venta a crédito con entrega cobrada, rechazos aunque se manipule la pantalla,
+ * excepción autorizada, cobros (recibo, operación repetida, pago mayor al saldo), reversa por anulación, conciliación,
+ * plan de un saldo HISTÓRICO, cobro a confirmar, cierre mensual (Debe = Haber) y estado de cuenta (HTML y PDF).
+ * Las funciones internas se llaman con un contexto de prueba (más rápido); permisos y lista blanca, por la API real.
+ */
+function escenariosCartera_(t, c) {
+  const ss = c.ss;
+  const tz = c.tz;
+  reiniciarMemoriaEjecucion_();
+  const hoy = hoy_(tz);
+  const fechaA = sumarDias_(hoy, -20);
+  const sufijo = Utilities.getUuid().replace(/-/g, '').slice(0, 6).toUpperCase();
+  const admin = { email: CONFIG.CORREO_ADMIN, rol: ROLES.ADMIN, nombre: 'Administradora (prueba)', metodo: 'PRUEBA' };
+  const oper = { email: CORREO_OPERATIVA_PRUEBA, rol: ROLES.OPERATIVO, nombre: 'Operativa de prueba', metodo: 'PRUEBA' };
+  const ctx = function (u, datos) { return { ss: ss, tz: tz, usuario: u, email: u.email, datos: datos || {}, mes: hoy.slice(0, 7), unidad: '', idSolicitud: '' }; };
+  const error = function (fn) { try { fn(); return ''; } catch (e) { return String(e && e.message ? e.message : e); } };
+  const credito = function (id) { return resolverCredito_(modeloCartera_(ss, tz), id); };
+  const P = leerParametros_(ss, tz);
+  let omitido = '';
+  const paso = function (nombre, fn) {
+    if (omitido) return;
+    if (tiempoRestante_() < 45000) {
+      omitido = nombre;
+      t.ok('Cartera: escenarios omitidos por tiempo desde «' + nombre + '» (se prueban en la próxima corrida)', true);
+      return;
+    }
+    t.seccion('Escenarios · cartera · ' + nombre, fn);
+  };
+  const usuarios = leerTabla_(ss, 'usuarios', tz);
+  if (!usuarios.filas.some(function (u) { return u.correo === CORREO_OPERATIVA_PRUEBA; })) {
+    agregarFilas_(usuarios, [{ correo: CORREO_OPERATIVA_PRUEBA, activo: 'Sí', rol: ROLES.OPERATIVO, nombre: 'Operativa de prueba', notas: 'Solo en la copia de prueba' }], tz);
+    olvidarUsuariosEnCache_(ss);
+  }
+  const tokOper = sesionPrueba_(c, CORREO_OPERATIVA_PRUEBA);
+  const meses = unicos_([fechaA.slice(0, 7), hoy.slice(0, 7)]);
+  const sinPlanAntes = {};
+
+  // 1) Migración (R0.8): vista previa que no escribe, huella, controles e idempotencia.
+  paso('migración', function () {
+    const conteo = function () { return ['peluquerias', 'creditos', 'saldos', 'cobrosConfirmar', 'ventas'].map(function (k) { return leerTabla_(ss, k, tz).filas.length; }); };
+    const antes = conteo();
+    const yaEstaba = migracionAplicada_(ss, tz);
+    const vista = migrarDatosAntiguos_(ss, tz, admin.email, { simular: true });
+    t.igual('Migración: la vista previa no escribe nada', conteo(), antes);
+    t.ok('Migración: sin confirmar no se ejecuta', /confirme/.test(error(function () { ejecutarMigracion_(ctx(admin, { huella: vista.huella })); })));
+    t.ok('Migración: con otra huella (datos cambiados) pide una vista previa nueva',
+      /cambiaron desde la vista previa/.test(error(function () { ejecutarMigracion_(ctx(admin, { confirmado: true, huella: 'otra' })); })));
+    const r = ejecutarMigracion_(ctx(admin, { confirmado: true, huella: vista.huella })).informe;
+    t.ok('Migración: todos los controles de conciliación OK', r.controles.every(function (x) { return x.ok; }), JSON.stringify(r.controles.filter(function (x) { return !x.ok; })));
+    t.igual('Migración: saldos según hoja 17.000.500 · dudosas 7.434.000 · a investigar 1.610.000 (no suman)',
+      [r.totales.saldoHoja, r.totales.dudosas, r.totales.investigar], [17000500, 7434000, 1610000]);
+    t.igual('Migración: repetirla no tiene nada pendiente (no duplica)', migrarDatosAntiguos_(ss, tz, admin.email, { simular: true }).totales.pendientes, 0);
+    const m = modeloCartera_(ss, tz);
+    t.igual('Migración: ninguna venta a crédito «Pendiente» queda sin crédito', ventasCreditoSinPlan_(agruparVentas_(leerTabla_(ss, 'ventas', tz).filas), m.creditos).length, 0);
+    const aConfirmar = m.creditos.filter(function (x) { return x.estado === PLAN_.A_CONFIRMAR; });
+    t.ok('Migración: los planes A CONFIRMAR no generan cuotas, vencido, atraso ni bloqueo',
+      aConfirmar.every(function (x) { return !x.cuotas.length && x.vencido === 0 && x.atraso === 0; }) && !m.clientes.some(function (x) { return x.estado === 'BLOQUEADA' && x.aConfirmar === x.creditosAbiertos; }));
+    if (!yaEstaba) {
+      t.igual('Migración: 20 créditos HISTÓRICO A CONFIRMAR', m.creditos.filter(function (x) { return x.origen === ORIGEN_CREDITO_.HISTORICO && x.estado === PLAN_.A_CONFIRMAR; }).length, 20);
+      t.ok('Migración: lo que dicen las notas no mueve saldos (VIGENTE PREVIO sin cobros)',
+        m.creditos.filter(function (x) { return x.origen === ORIGEN_CREDITO_.PREVIO; }).every(function (x) { return x.cobrado === 0 && x.saldo === x.total; }));
+    }
+    meses.forEach(function (mes) { sinPlanAntes[mes] = cierreMensual_(ss, tz, mes, {}).conciliacion.cuadre.difVentasSinPlan; });
+  });
+
+  // 2) Datos de prueba (solo en la copia): un producto con stock y dos clientas categoría B.
+  let prod = '';
+  let cliA = '';
+  let cliB = '';
+  paso('datos de prueba', function () {
+    prod = guardarProducto_(ctx(admin, { nombre: 'PRUEBA cartera ' + sufijo, marca: 'Prueba automática', categoria: 'Capilar', costo: 150000, precio: 345000, stockInicial: 40, stockMinimo: 0 })).codigo;
+    const nueva = function (nombre) {
+      const tabla = leerTabla_(ss, 'peluquerias', tz);
+      const codigo = siguienteCodigo_(tabla.filas.map(function (p) { return p.codigo; }), 'C-', 4);
+      // Ficha COMPLETA (Fase 3, R1.3): RUC válido y único de prueba, celular, razón social, dirección y ciudad.
+      const baseRuc = String(80000000 + (parseInt(sufijo, 16) % 900000) * 10 + tabla.filas.length % 10);
+      agregarFilas_(tabla, [{ codigo: codigo, nombre: nombre, contacto: 'Prueba automática', activo: 'Sí', categoria: 'B', tipo: 'PELUQUERÍA', actualizado: new Date(),
+        usuario: admin.email, alta: hoy, observacion: 'Solo en la copia de prueba', razonSocial: nombre + ' S.A.', ruc: baseRuc + '-' + dvRuc_(baseRuc),
+        celular: '595986' + baseRuc.slice(-6), direccion: 'Calle de prueba 123', ciudad: 'Asunción', completitud: 'COMPLETA', faltantes: '' }], tz);
+      return codigo;
+    };
+    cliA = nueva('PRUEBA Peluquería A ' + sufijo);
+    cliB = nueva('PRUEBA Peluquería B ' + sufijo);
+    recalcularCartera_(ss, tz);
+    t.ok('Datos de prueba creados en la copia', !!(prod && cliA && cliB));
+  });
+
+  // 3) Venta a crédito (R0.4): vista previa del servidor, rechazos, entrega cobrada, excepción autorizada.
+  const venta = function (cliente, fecha, plan, extra) {
+    return Object.assign({ fecha: fecha, codigoCliente: cliente, condicion: 'Crédito', nota: 'Prueba automática', items: [{ codigo: prod, cantidad: 2, precio: 345000 }], plan: plan }, extra || {});
+  };
+  const reciboA = 'PR' + sufijo + '1';
+  let crA = '';
+  let ventaA = '';
+  paso('venta a crédito', function () {
+    if (!prod) return;
+    const datosA = venta(cliA, fechaA, { entrega: 210000, cuotas: 6, frecuencia: 'SEMANAL' }, { entregaCobro: { cobrar: true, medio: 'EFECTIVO', recibo: reciboA } });
+    const vp = vistaPreviaPlan_(ctx(oper, datosA));
+    t.igual('Vista previa (servidor): entrega mínima 207.000, 6 cuotas de 80.000, sin observaciones, la operativa no autoriza',
+      [vp.entregaMinima.monto, vp.plan.n, vp.plan.cuota, vp.problemas.length, vp.puedeAutorizar], [207000, 6, 80000, 0, false]);
+    const filas = function () { return [leerTabla_(ss, 'creditos', tz).filas.length, leerTabla_(ss, 'ventas', tz).filas.length, leerTabla_(ss, 'cobros', tz).filas.length]; };
+    const antes = filas();
+    t.ok('Rechazo (aunque se manipule la pantalla): entrega bajo el mínimo, ni con «autorizar»', /ENTREGA MENOR AL MÍNIMO/.test(error(function () {
+      registrarVentaCredito_(ctx(admin, venta(cliA, fechaA, { entrega: 150000, cuotas: 6 }, { autorizar: true, motivoAutorizacion: 'Prueba de manipulación' })));
+    })));
+    t.ok('Rechazo: 7 cuotas (MÁS CUOTAS QUE LA POLÍTICA)', /MÁS CUOTAS QUE LA POLÍTICA/.test(error(function () { registrarVentaCredito_(ctx(admin, venta(cliA, fechaA, { entrega: 210000, cuotas: 7 }))); })));
+    t.ok('Rechazo: entrega en efectivo sin N° de recibo (FALTA N° DE RECIBO)', /FALTA N° DE RECIBO/.test(error(function () {
+      registrarVentaCredito_(ctx(oper, venta(cliA, fechaA, { entrega: 210000, cuotas: 6 }, { entregaCobro: { cobrar: true, medio: 'EFECTIVO' } })));
+    })));
+    t.igual('Los rechazos no escribieron nada (ni venta, ni crédito, ni cobro)', filas(), antes);
+    const r = registrarVentaCredito_(ctx(oper, datosA));
+    crA = r.credito;
+    ventaA = r.id;
+    const cA = credito(crA);
+    t.igual('Crédito VIGENTE: 690.000, entrega + 6 cuotas de 80.000, origen NUEVO', [cA.estadoPlanHoja, cA.total, cA.nCuotas, cA.montoCuota, cA.cuotas.length, cA.origen],
+      [PLAN_.VIGENTE, 690000, 6, 80000, 7, ORIGEN_CREDITO_.NUEVO]);
+    t.igual('Entrega cobrada en el acto: cobro ENTREGA de 210.000 con su recibo, pendiente de conciliar',
+      modeloCartera_(ss, tz).cobros.filter(function (x) { return x.credito === crA; }).map(function (x) { return [x.concepto, x.monto, x.recibo, x.esConciliado]; }), [['ENTREGA', 210000, reciboA, false]]);
+    const v = leerTabla_(ss, 'ventas', tz).filas.filter(function (x) { return x.id === ventaA; });
+    t.ok('La venta queda «Pendiente» con su N° de crédito', v.length === 1 && v[0].estado === 'Pendiente' && v[0].nroCredito === crA, JSON.stringify(v));
+    t.igual('Venta de hace 20 días: vencido 160.000 (cuotas 1 y 2), 13 días de atraso, ATRASO 8-15', [cA.vencido, cA.atraso, cA.estado], [160000, 13, 'ATRASO 8-15']);
+    t.igual('La clienta queda BLOQUEADA (más de P_DIAS_BLOQUEO días de atraso)', modeloCartera_(ss, tz).clientesPorCodigo[cliA].estado, 'BLOQUEADA');
+    t.ok('Clienta bloqueada: otro crédito se rechaza (CLIENTA BLOQUEADA), ni con «autorizar»', /CLIENTA BLOQUEADA/.test(error(function () {
+      registrarVentaCredito_(ctx(admin, venta(cliA, hoy, { entrega: 210000, cuotas: 6 }, { autorizar: true, motivoAutorizacion: 'Prueba de manipulación' })));
+    })));
+    const datosB = venta(cliB, hoy, { entrega: 210000, cuotas: 4, frecuencia: 'QUINCENAL' });
+    t.ok('QUINCENAL con categoría B pedido por una operativa: requiere administradora',
+      /Requiere la autorización de una administradora/.test(error(function () { registrarVentaCredito_(ctx(oper, datosB)); })));
+    t.ok('Administradora sin marcar «Autorizo la excepción»: no se registra', /Autorizo la excepción/.test(error(function () { registrarVentaCredito_(ctx(admin, datosB)); })));
+    const rB = registrarVentaCredito_(ctx(admin, Object.assign({}, datosB, { autorizar: true, motivoAutorizacion: 'Cobra quincenal (prueba automática)' })));
+    const cB = credito(rB.credito);
+    t.ok('Excepción autorizada: quién, cuándo y el motivo con el código del xlsx', cB.autorizadoPor.indexOf(admin.email) === 0 && /FRECUENCIA REQUIERE AUTORIZACIÓN/.test(cB.motivoAutorizacion),
+      cB.autorizadoPor + ' | ' + cB.motivoAutorizacion);
+    t.igual('Recargo facturado en la misma venta como línea ' + P.P_COD_REC + ' (sin stock)',
+      leerTabla_(ss, 'ventas', tz).filas.filter(function (x) { return x.id === rB.id; }).map(function (x) { return [x.codigo === prod ? 'PRODUCTO' : x.codigo, x.subtotal]; }),
+      [['PRODUCTO', 690000], [P.P_COD_REC, 10000]]);
+    t.igual('Crédito QUINCENAL: total 700.000, recargo 10.000, cuotas de 122.000 (última 124.000)', [cB.total, cB.recargo, cB.montoCuota, cB.ultimaCuota], [700000, 10000, 122000, 124000]);
+    t.ok('La línea de recargo no mueve stock', !leerTabla_(ss, 'movimientos', tz).filas.some(function (x) { return x.referencia === rB.id && clave_(x.codigo) === clave_(P.P_COD_REC); }));
+  });
+
+  // 4) Cobros (R0.5): validaciones literales, operativa por la API real, cancelación, reversa y conciliación.
+  paso('cobros', function () {
+    if (!crA) return;
+    const cobro = function (u, d) { return registrarCobro_(ctx(u, Object.assign({ credito: crA, fecha: hoy }, d))); };
+    t.ok('Efectivo sin recibo: FALTA N° DE RECIBO', /FALTA N° DE RECIBO/.test(error(function () { cobro(oper, { monto: 80000, medio: 'EFECTIVO' }); })));
+    t.ok('Recibo ya usado: RECIBO REPETIDO', /RECIBO REPETIDO/.test(error(function () { cobro(oper, { monto: 80000, medio: 'EFECTIVO', recibo: reciboA }); })));
+    t.ok('Sin medio: FALTA MEDIO DE PAGO', /FALTA MEDIO DE PAGO/.test(error(function () { cobro(oper, { monto: 80000, medio: '' }); })));
+    t.ok('Sin monto: FALTA MONTO', /FALTA MONTO/.test(error(function () { cobro(oper, { monto: 0, medio: 'EFECTIVO', recibo: 'R' + sufijo }); })));
+    t.ok('Más que el saldo: PAGO MAYOR AL SALDO', /PAGO MAYOR AL SALDO/.test(error(function () { cobro(oper, { monto: 480001, medio: 'TRANSF. BANCO 1', operacion: 'OPX' + sufijo }); })));
+    const r1 = llamarPrueba_(registrarCobro, tokOper, { credito: crA, fecha: hoy, monto: 160000, medio: 'TRANSF. BANCO 1', operacion: 'OP' + sufijo + '1' });
+    t.ok('Operativa registra un cobro por la API (queda PENDIENTE DE CONCILIAR)', r1.ok && /PENDIENTE DE CONCILIAR/.test(r1.mensaje), r1.mensaje);
+    t.ok('N° de operación repetido: N° DE OPERACIÓN REPETIDO', /N° DE OPERACIÓN REPETIDO/.test(error(function () { cobro(oper, { monto: 1000, medio: 'TRANSF. BANCO 2', operacion: 'OP' + sufijo + '1' }); })));
+    let cA = credito(crA);
+    t.igual('Cobro aplicado a las cuotas vencidas: saldo 320.000, sin vencido, AL DÍA', [cA.saldo, cA.vencido, cA.estado], [320000, 0, 'AL DÍA']);
+    t.igual('La clienta vuelve a HABILITADA', modeloCartera_(ss, tz).clientesPorCodigo[cliA].estado, 'HABILITADA');
+    t.ok('«Cobrar» una venta a crédito desde Ventas se redirige a Cartera › Cobrar', /Cartera › Cobrar/.test(error(function () { cambiarEstadoVenta_(ctx(admin, { id: ventaA, accion: 'cobrar' })); })));
+    const r2 = cobro(admin, { monto: 320000, medio: 'QR / BILLETERA', operacion: 'OP' + sufijo + '2' });
+    cA = credito(crA);
+    const fv = function () { return leerTabla_(ss, 'ventas', tz).filas.filter(function (x) { return x.id === ventaA; })[0]; };
+    t.ok('Saldo cero: crédito CANCELADO y la venta pasa sola a «Cobrada» con la fecha del cobro', cA.saldo === 0 && cA.estado === 'CANCELADO' && fv().estado === 'Cobrada' && fv().fechaCobro === hoy,
+      JSON.stringify([cA.saldo, cA.estado, fv().estado, fv().fechaCobro]));
+    t.ok('Anular un cobro exige motivo', /motivo/.test(error(function () { anularCobro_(ctx(admin, { id: r2.id, motivo: '' })); })));
+    t.ok('Una operativa no puede anular cobros', /solo para administradoras/.test(error(function () { llamarPrueba_(anularCobro, tokOper, { id: r2.id, motivo: 'Prueba' }); })));
+    anularCobro_(ctx(admin, { id: r2.id, motivo: 'Reversa de prueba' }));
+    cA = credito(crA);
+    t.ok('Anulación con reversa: saldo 320.000 otra vez y la venta vuelve a «Pendiente»', cA.saldo === 320000 && fv().estado === 'Pendiente' && fv().fechaCobro === '',
+      JSON.stringify([cA.saldo, fv().estado, fv().fechaCobro]));
+    t.ok('Anular la venta con cobros vigentes: pide anular antes los cobros', /Anúlelos primero/.test(error(function () {
+      cambiarEstadoVenta_(ctx(admin, { id: ventaA, accion: 'anular', motivo: 'Prueba automática' }));
+    })));
+    const ids = modeloCartera_(ss, tz).cobros.filter(function (x) { return x.credito === crA && !x.esAnulado; }).map(function (x) { return x.id; });
+    t.ok('Conciliación de cobros', /2 cobros conciliados/.test(conciliarCobros_(ctx(admin, { ids: ids, fecha: hoy }))));
+    t.ok('Conciliados: ya no figuran «pendientes de conciliar»', modeloCartera_(ss, tz).cobros.filter(function (x) { return ids.indexOf(x.id) >= 0; }).every(function (x) { return x.esConciliado; }));
+  });
+
+  // 5) Saldo HISTÓRICO: categoría, saldo confirmado, cobro mientras está A CONFIRMAR y plan confirmado.
+  paso('plan de un saldo histórico', function () {
+    const m = modeloCartera_(ss, tz);
+    const saldos = leerTabla_(ss, 'saldos', tz);
+    const h = m.creditos.filter(function (x) {
+      if (x.origen !== ORIGEN_CREDITO_.HISTORICO || x.conPlan || x.anulado || x.saldo < 200000 || x.cobrado > 0 || !m.clientesPorCodigo[clave_(x.codigoCliente)]) return false;
+      const f = filaSaldoInicial_(saldos, x);
+      return !f || f.estado !== 'EN DISPUTA';
+    })[0];
+    if (!h) { t.ok('Plan de un saldo histórico: no quedan saldos A CONFIRMAR para probar', true); return; }
+    if (!m.clientesPorCodigo[clave_(h.codigoCliente)].cat) {
+      t.ok('Confirmar el plan sin categoría: ASIGNAR CATEGORÍA A LA CLIENTA', /ASIGNAR CATEGORÍA/.test(error(function () { confirmarPlanCredito_(ctx(admin, { credito: h.id, cuotas: 4 })); })));
+      guardarCategoriaCliente_(ctx(admin, { codigo: h.codigoCliente, categoria: 'B' }));
+    }
+    t.ok('Una operativa no puede confirmar planes', /solo para administradoras/.test(error(function () { llamarPrueba_(confirmarPlanCredito, tokOper, { credito: h.id, cuotas: 4 }); })));
+    confirmarSaldoHistorico_(ctx(admin, { credito: h.id, estado: 'CONFIRMADO', saldo: h.saldo, observacion: 'Prueba automática' }));
+    registrarCobro_(ctx(admin, { credito: h.id, fecha: hoy, monto: 50000, medio: 'TRANSF. BANCO 1', operacion: 'OP' + sufijo + 'H' }));
+    let ch = credito(h.id);
+    t.igual('Cobro sobre un saldo A CONFIRMAR: baja el saldo, sin atraso', [ch.estado, ch.saldo, ch.atraso], [PLAN_.A_CONFIRMAR, h.saldo - 50000, 0]);
+    confirmarPlanCredito_(ctx(admin, { credito: h.id, cuotas: 4, frecuencia: 'SEMANAL' }));
+    ch = credito(h.id);
+    const plan = calcularPlanCredito_({ fecha: hoy, subtotal: h.saldo, entrega: 0, cuotas: 4, frecuencia: 'SEMANAL' }, P);
+    t.igual('Plan confirmado: 4 cuotas semanales desde hoy y el cobro previo aplicado a la cuota 1',
+      [ch.conPlan, ch.cuotas.length, ch.cuotas[0].monto, ch.cuotas[0].pagado, ch.saldo, ch.estado], [true, 4, plan.cuota, 50000, h.saldo - 50000, 'AL DÍA']);
+    const fila = filaSaldoInicial_(leerTabla_(ss, 'saldos', tz), ch);
+    t.ok('«Saldos iniciales»: la fila queda CONFIRMADO', !!fila && fila.estado === 'CONFIRMADO');
+    t.ok('Un plan confirmado no se vuelve a confirmar', /ya tiene plan/.test(error(function () { confirmarPlanCredito_(ctx(admin, { credito: h.id, cuotas: 4 })); })));
+  });
+
+  // 6) Cobro a confirmar (R0.8 c): solo mueve el saldo cuando se registra con fecha, medio y comprobante.
+  paso('cobro a confirmar', function () {
+    const m = modeloCartera_(ss, tz);
+    const cc = leerTabla_(ss, 'cobrosConfirmar', tz).filas.filter(function (x) {
+      const cr = m.creditos.filter(function (y) { return y.id === x.credito; })[0];
+      return x.estado === 'PENDIENTE' && cr && !cr.anulado && cr.saldo >= x.monto && cr.fecha <= hoy;
+    })[0];
+    if (!cc) { t.ok('Cobros a confirmar: no hay pendientes para probar', true); return; }
+    t.ok('Descartar sin motivo: se pide el motivo', /mínimo 5 letras/.test(error(function () { resolverCobroAConfirmar_(ctx(admin, { id: cc.id, accion: 'descartar' })); })));
+    const antes = credito(cc.credito).saldo;
+    resolverCobroAConfirmar_(ctx(admin, { id: cc.id, accion: 'registrar', fecha: hoy, medio: 'TRANSF. BANCO 2', operacion: 'OP' + sufijo + 'C' }));
+    const fila = leerTabla_(ss, 'cobrosConfirmar', tz).filas.filter(function (x) { return x.id === cc.id; })[0];
+    t.ok('Registrado con los datos confirmados: recién ahí baja el saldo', fila.estado === 'REGISTRADO' && !!fila.cobro && credito(cc.credito).saldo === antes - cc.monto);
+    t.ok('Ya resuelto: no se registra dos veces', /ya estaba/.test(resolverCobroAConfirmar_(ctx(admin, { id: cc.id, accion: 'registrar', fecha: hoy, medio: 'EFECTIVO', recibo: 'R' + sufijo }))));
+  });
+
+  // 7) Cierre mensual (R0.7): Debe = Haber, cartera del tablero, ventas a crédito con plan y registro único por mes.
+  paso('cierre mensual', function () {
+    meses.forEach(function (mes) {
+      const cierre = cierreMensual_(ss, tz, mes, {});
+      const as = cierre.conciliacion.asiento;
+      t.ok('Cierre ' + mes + ': asiento resumen Debe = Haber', as.diferencia === 0 && as.debe > 0, 'Debe ' + as.debe + ' · Haber ' + as.haber);
+      t.igual('Cierre ' + mes + ': la cartera del TABLERO = la del modelo a la fecha de corte', cierre.B.cartera, modeloCartera_(ss, tz, cierre.corte).totales.cartera);
+      if (sinPlanAntes[mes] !== undefined) {
+        t.igual('Cierre ' + mes + ': las ventas a crédito de la prueba tienen su crédito (no suman «sin plan»)', cierre.conciliacion.cuadre.difVentasSinPlan, sinPlanAntes[mes]);
+      }
+    });
+    const mes = hoy.slice(0, 7);
+    registrarCierreMensual_(ctx(admin, { mes: mes, manual: { marangatu: '', extractos: {} }, observaciones: 'Prueba automática' }));
+    const r2 = registrarCierreMensual_(ctx(admin, { mes: mes, manual: {}, observaciones: 'Prueba automática (2)' }));
+    t.ok('Registro de cierres: una fila por mes (registrar de nuevo la actualiza)',
+      leerTabla_(ss, 'cierres', tz).filas.filter(function (x) { return String(x.mes) === mes; }).length === 1 && /actualizado/.test(r2.mensaje), r2.mensaje);
+    t.ok('Una operativa no puede abrir el cierre mensual', /solo para administradoras/.test(error(function () { llamarPrueba_(obtenerCierreMensual, tokOper, { mes: mes }); })));
+  });
+
+  // 8) Estado de cuenta (R0.6): mismo HTML en pantalla, A4 y PDF; operativa sin sugerencias ni datos sensibles.
+  paso('estado de cuenta', function () {
+    if (!crA) return;
+    const f = obtenerFichaCliente_(ctx(admin, { codigo: cliA }));
+    t.ok('Estado de cuenta: créditos, cuotas y cobros en el HTML que se imprime', f.ok && f.ficha.creditos.some(function (x) { return x.id === crA; }) && !!f.html &&
+      f.html.cuerpo.indexOf(crA) >= 0 && f.html.cuerpo.indexOf(reciboA) >= 0);
+    const antes = MODO_PRUEBA_ ? MODO_PRUEBA_.archivos.length : 0;
+    const e = exportarEstadoCuenta_(ctx(admin, { codigo: cliA }));
+    const nuevos = MODO_PRUEBA_ ? MODO_PRUEBA_.archivos.slice(antes) : [];
+    t.ok('Estado de cuenta: PDF guardado en «Exportaciones» (simulado)', nuevos.length === 1 && nuevos[0].carpeta === 'Exportaciones' && /^Estado de cuenta .+\.pdf$/.test(nuevos[0].nombre), e.mensaje);
+    const fo = llamarPrueba_(obtenerFichaCliente, tokOper, { codigo: cliA });
+    t.ok('Operativa: ve el estado de cuenta sin sugerencia de categoría ni costos', fo.ok && fo.ficha.cliente.sugerencia === '' && !/"costo|"margen/.test(JSON.stringify(fo)));
+    const d = llamarPrueba_(obtenerDatos, tokOper);
+    const cart = (d.datos && d.datos.cartera) || {};
+    t.ok('Operativa: la cartera llega sin sugerencias, sin saldos iniciales ni cobros a confirmar',
+      Array.isArray(cart.clientes) && cart.clientes.every(function (x) { return x.sugerencia === ''; }) && cart.saldosIniciales === undefined && cart.cobrosConfirmar === undefined);
+  });
+}

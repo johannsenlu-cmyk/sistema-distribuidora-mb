@@ -1,0 +1,777 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Instalación, permisos, activadores, salud y mantenimiento (v2.3)
+ * =====================================================================
+ *  instalarActualizacionMB(): UNA función deja todo listo. Es idempotente (re-ejecutable):
+ *   1. Respaldo del libro en Drive antes de tocar nada.
+ *   2. Esquema completo (hojas nuevas y columnas al final) sin alterar datos.
+ *   3. Carpeta «Distribuidora MB» con Respaldos, Proveedores, Importaciones, Comprobantes y Exportaciones.
+ *   4. Comparte con EDICIÓN el libro y la carpeta con las administradoras (sin correo de invitación) y el
+ *      calendario de la agenda con Mirian (y Raquel si la dueña lo activa); después VERIFICA releyendo los
+ *      permisos reales y anota OK / FALLO por recurso.
+ *   5. Revisa quién más tiene acceso al libro: lo informa y no lo quita sin confirmación.
+ *   6. Siembra parámetros, categorías, roles y configuración; aplica los paquetes de cada fase; instala los
+ *      activadores (America/Asuncion).
+ *   7. Corre testSistema() y deja el informe legible en «Estado de instalación».
+ *  Límite real: el proyecto es independiente (no vinculado a la hoja), por eso un menú «MB Sistema» dentro de la
+ *  hoja exige un script vinculado aparte (opcional, se entrega en la Fase 3). Las mismas acciones están en la app
+ *  (Sistema) y en el editor.
+ * =====================================================================
+ */
+
+/** Tiempo máximo de una ejecución de Apps Script: 6 minutos. Se deja margen para el informe. */
+const LIMITE_EJECUCION_MS = 330000;
+let INICIO_EJECUCION_ = Date.now();
+
+function tiempoRestante_() {
+  return LIMITE_EJECUCION_MS - (Date.now() - INICIO_EJECUCION_);
+}
+
+// ─────────────────────── Instalación (R6.1) ───────────────────────
+
+/** EDITOR (cuenta propietaria): seleccione «instalarActualizacionMB» y pulse «Ejecutar». */
+function instalarActualizacionMB() {
+  exigirEditorOTrigger_(null);
+  INICIO_EJECUCION_ = Date.now();
+  reiniciarMemoriaEjecucion_();
+  const r = conBloqueo_(function () {
+    const base = obtenerOCrearHoja_();
+    if (base.creada) prepararHojaNueva_(base.ss);
+    const ss = base.ss;
+    const tz = zonaHoraria_(ss);
+    const email = correoPropietario_() || CONFIG.CORREO_ADMIN;
+    return instalarActualizacion_(ss, tz, email, 'Editor de Apps Script');
+  });
+  console.log(r.texto + '\n' + r.pasos.map(function (p) { return '[' + p.resultado + '] ' + p.paso + (p.detalle ? ': ' + p.detalle : '') + (p.accion ? ' → ACCIÓN: ' + p.accion : ''); }).join('\n'));
+  return r;
+}
+
+/** Pasos de la instalación. Un paso crítico que falla detiene la instalación (se puede re-ejecutar sin riesgo). */
+function instalarActualizacion_(ss, tz, email, origen) {
+  reiniciarMemoriaEjecucion_();
+  const corrida = 'Instalación ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+  const pasos = [];
+  function paso(nombre, critico, accionSiFalla, fn) {
+    let res;
+    try {
+      res = fn() || {};
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e);
+      registrarPaso_(ss, tz, corrida, nombre, '', 'FALLO', msg, accionSiFalla, email);
+      pasos.push({ paso: nombre, recurso: '', resultado: 'FALLO', detalle: msg, accion: accionSiFalla });
+      if (critico) {
+        registrarPaso_(ss, tz, corrida, 'RESUMEN', '', 'FALLO', 'Instalación detenida en «' + nombre + '». Puede volver a ejecutarla: no duplica nada.', accionSiFalla, email);
+        throw new Error('Instalación detenida en «' + nombre + '»: ' + msg);
+      }
+      return null;
+    }
+    const filas = res.filas || [{ recurso: res.recurso || '', resultado: res.resultado || 'OK', detalle: res.detalle || '', accion: res.accion || '' }];
+    filas.forEach(function (f) {
+      registrarPaso_(ss, tz, corrida, nombre, f.recurso || '', f.resultado || 'OK', f.detalle || '', f.accion || '', email);
+      pasos.push({ paso: nombre, recurso: f.recurso || '', resultado: f.resultado || 'OK', detalle: f.detalle || '', accion: f.accion || '' });
+    });
+    return res;
+  }
+  registrarPaso_(ss, tz, corrida, 'Inicio', '', 'INFO', 'Versión ' + CONFIG.VERSION + ' · origen: ' + origen, '', email);
+
+  paso('1. Respaldo previo del libro', true, 'Revise el espacio de Google Drive de la cuenta propietaria y vuelva a ejecutar «instalarActualizacionMB».', function () {
+    const b = respaldoUnaVez_(ss, tz, 'instalar v' + CONFIG.VERSION);
+    return { recurso: 'Libro', detalle: '«' + b.nombre + '» en «' + CONFIG.CARPETA_SISTEMA + '/Respaldos».' };
+  });
+  paso('2. Esquema completo (hojas y columnas)', true, 'Ejecute «autorizar» en el editor y vuelva a ejecutar «instalarActualizacionMB».', function () {
+    const creadas = asegurarEstructura_(ss);
+    return { recurso: 'Libro', detalle: creadas.length ? creadas.length + ' hojas nuevas: ' + creadas.join(', ') + '. Columnas nuevas agregadas al final de las hojas existentes.' : 'Sin cambios: la estructura ya estaba completa.' };
+  });
+  paso('3. Carpeta «' + CONFIG.CARPETA_SISTEMA + '»', false, 'Verifique que la cuenta propietaria tenga espacio en Drive.', function () {
+    const c = carpetaSistema_(true);
+    const subs = CONFIG.SUBCARPETAS.map(function (n) { subcarpeta_(n, true); return n; });
+    escribirConfig_(ss, CFG.CARPETA, c.getUrl());
+    let dentro = false;
+    try {
+      const it = DriveApp.getFileById(ss.getId()).getParents();
+      while (it.hasNext()) if (it.next().getId() === c.getId()) dentro = true;
+    } catch (e) { dentro = false; }
+    return {
+      recurso: 'Carpeta', detalle: c.getUrl() + ' · subcarpetas: ' + subs.join(', ') + '.',
+      resultado: dentro ? 'OK' : 'AVISO',
+      accion: dentro ? '' : 'El libro sigue en su carpeta actual (no se movió). Si lo desea: app › Sistema › «Mover el libro a la carpeta» (conserva el ID y el enlace).',
+    };
+  });
+  paso('4. Compartir con las administradoras y verificar', false, 'Ver la acción de cada recurso con FALLO.', function () {
+    return { filas: compartirYVerificar_(ss, tz) };
+  });
+  paso('5. Acceso de otras personas al libro', false, 'Quite el acceso en Sistema › Usuarias («Quitar acceso a la hoja»).', function () {
+    const h = revisarAccesoLibro_(ss, tz, null);
+    const quitar = h.filter(function (x) { return x.estado !== 'OK'; });
+    return {
+      recurso: 'Libro', resultado: quitar.length ? 'AVISO' : 'OK',
+      detalle: h.length ? h.map(function (x) { return x.correo + ': ' + x.acceso + ' → ' + x.estado; }).join(' · ') : 'Solo la propietaria tiene acceso.',
+      accion: quitar.length ? 'No se quitó nada sin confirmación. Revise: ' + quitar.map(function (x) { return x.correo + ' (' + x.detalle + ')'; }).join('; ') : '',
+    };
+  });
+  paso('6a. Parámetros, categorías, roles y configuración', true, 'Revise «Parámetros de crédito», «Categorías de crédito» y «Usuarios».', function () {
+    asegurarFilasConfiguracion_(ss);
+    const s = sembrarParametros_(ss, tz, email);
+    const u = sembrarUsuarios_(ss, tz);
+    const e = sembrarEntidades_(ss, tz, email);
+    const P = leerParametros_(ss, tz);
+    const pendientes = ['P_META_ASISTENTE', 'P_REPOSICION', 'P_POLITICA_FIRMADA', 'P_IVA_RECARGO'].filter(function (k) { return P[k] === null; });
+    const abierto = registroAbierto_(ss);
+    return {
+      recurso: 'Libro', resultado: P._faltan.length || abierto ? 'AVISO' : 'OK',
+      detalle: s.parametros + ' parámetros y ' + s.categorias + ' categorías agregados (los existentes no se tocan) · roles: ' + u + ' · entidades fiscales: ' + e +
+        ' · registro de nuevos correos: ' + (abierto ? 'ABIERTO' : 'cerrado') + '.',
+      accion: (P._faltan.length ? 'Completar parámetros: ' + P._faltan.join(', ') + '. ' : '') +
+        (pendientes.length ? 'Confirmar con Mirian / contador: ' + pendientes.map(function (k) { return P._nombres[k]; }).join(', ') + '. ' : '') +
+        (abierto ? 'Con el registro abierto, cualquier persona con cuenta de Google y el enlace puede crearse un usuario OPERATIVO: ciérrelo en Sistema › Usuarias.' : ''),
+    };
+  });
+  paso('6b. Paquetes de actualización (uno por fase)', true, 'Revise el detalle y vuelva a ejecutar «instalarActualizacionMB».', function () {
+    aplicarPaquetes_(ss, email, tz, ROLES.ADMIN);
+    const det = aplicarPaquetes_.ultimo || [];
+    const error = det.filter(function (d) { return d.estado === 'ERROR'; });
+    if (error.length) throw new Error(error.map(function (d) { return d.id + ': ' + d.resumen; }).join(' | '));
+    return { filas: det.map(function (d) {
+      return { recurso: d.id, resultado: d.estado === 'NO INSTALADO' ? 'INFO' : 'OK', detalle: d.estado + (d.resumen ? ': ' + String(d.resumen).slice(0, 600) : ''),
+        accion: d.estado === 'NO INSTALADO' ? 'El módulo de esa fase todavía no está en el proyecto (se aplicará al instalarlo).' : '' };
+    }) };
+  });
+  paso('6c. Activadores automáticos (America/Asuncion)', false, 'Ejecute «autorizar» y vuelva a ejecutar «instalarActualizacionMB» con la cuenta propietaria.', function () {
+    const t = instalarTriggers_();
+    return { recurso: 'Activadores', detalle: t.join(' · ') };
+  });
+  paso('7. Pruebas del sistema (testSistema)', false, 'Ver las filas «Prueba ·» con FALLO en esta misma hoja.', function () {
+    if (tiempoRestante_() < 150000) {
+      return { recurso: 'Pruebas', resultado: 'AVISO', detalle: 'Quedaba poco tiempo de ejecución (límite de 6 minutos de Google).', accion: 'Ejecute «testSistema» por separado en el editor.' };
+    }
+    const t = testSistema_(ss, tz, { corrida: corrida, email: email });
+    return { recurso: 'Pruebas', resultado: t.fallos ? 'FALLO' : 'OK', detalle: t.ok + ' de ' + t.total + ' pruebas OK' + (t.omitidas ? ' (' + t.omitidas + ' omitidas por tiempo)' : '') + '.',
+      accion: t.fallos ? 'Revisar las pruebas con FALLO (filas «Prueba ·»).' : '' };
+  });
+  paso('8. Versión y Léame', false, 'Sin impacto en los datos.', function () {
+    escribirConfig_(ss, CFG.VERSION, CONFIG.VERSION);
+    escribirLeame_(ss.getSheetByName(HOJA_LEAME) || ss.insertSheet(HOJA_LEAME, 0), ss);
+    olvidarConfiguracionIngreso_();
+    const cfg = configuracionIngreso_();
+    return {
+      recurso: 'MB Acceso', resultado: cfg.clientId && cfg.enlaceAcceso ? 'OK' : 'AVISO',
+      detalle: 'Versión del sistema = ' + CONFIG.VERSION + '. Ingreso con Google: ' + (cfg.clientId ? 'Client ID registrado' : 'Client ID pendiente') + ', ' + (cfg.enlaceAcceso ? 'enlace registrado' : 'enlace pendiente') + '.',
+      accion: cfg.clientId && cfg.enlaceAcceso ? '' : 'Publique «MB Acceso» y abra su enlace con la cuenta propietaria: el primer ingreso registra solo el Client ID y el enlace (guía, paso 5).',
+    };
+  });
+
+  const fallos = pasos.filter(function (p) { return p.resultado === 'FALLO'; });
+  const avisos = pasos.filter(function (p) { return p.resultado === 'AVISO'; });
+  const texto = (fallos.length ? 'Instalación con ' + fallos.length + ' falla(s)' : 'Instalación completa') + (avisos.length ? ' y ' + avisos.length + ' aviso(s)' : '') +
+    ' (v' + CONFIG.VERSION + '). Detalle en «Estado de instalación».';
+  registrarPaso_(ss, tz, corrida, 'RESUMEN', '', fallos.length ? 'FALLO' : (avisos.length ? 'AVISO' : 'OK'), texto,
+    fallos.concat(avisos).map(function (p) { return p.paso + (p.recurso ? ' (' + p.recurso + ')' : '') + ': ' + p.accion; }).filter(String).join(' | '), email);
+  enviarInformeInstalacion_(corrida, pasos, texto);
+  return { texto: texto, pasos: pasos, fallos: fallos.length, avisos: avisos.length, corrida: corrida };
+}
+
+/** Paquete «v23-f1-nucleo»: esquema, configuración, parámetros, roles, entidades fiscales y unidad de negocio de lo existente. */
+function aplicarPaqueteNucleo_(ss, email, tz) {
+  respaldoUnaVez_(ss, tz, 'paquete v23-f1-nucleo');
+  asegurarEstructura_(ss);
+  asegurarFilasConfiguracion_(ss);
+  const s = sembrarParametros_(ss, tz, email);
+  const u = sembrarUsuarios_(ss, tz);
+  const e = sembrarEntidades_(ss, tz, email);
+  const unidades = completarUnidadesExistentes_(ss, tz, email);
+  escribirConfig_(ss, CFG.VERSION, CONFIG.VERSION);
+  return 'Núcleo v' + CONFIG.VERSION + ': ' + s.parametros + ' parámetros, ' + s.categorias + ' categorías, roles (' + u + '), entidades fiscales (' + e + '), ' +
+    'unidad de negocio completada en ' + unidades + ' filas existentes.';
+}
+
+function registrarPaso_(ss, tz, corrida, paso, recurso, resultado, detalle, accion, email) {
+  try {
+    anexarFilas_(ss, 'instalacion', [{
+      fecha: new Date(), corrida: corrida, paso: paso, recurso: recurso || '', resultado: resultado, detalle: String(detalle || '').slice(0, 1500),
+      accion: String(accion || '').slice(0, 800), version: CONFIG.VERSION, usuario: email || '',
+    }], tz);
+  } catch (e) {
+    console.error('No se pudo registrar el paso «' + paso + '»: ' + e);
+  }
+}
+
+function enviarInformeInstalacion_(corrida, pasos, texto) {
+  try {
+    const cuerpo = texto + '\n\n' + pasos.map(function (p) {
+      return '[' + p.resultado + '] ' + p.paso + (p.recurso ? ' · ' + p.recurso : '') + (p.detalle ? ': ' + p.detalle : '') + (p.accion ? '\n      Acción: ' + p.accion : '');
+    }).join('\n') + '\n\nAplicación: ' + CONFIG.URL_APP;
+    enviarCorreo_({ to: CONFIG.CORREO_ADMIN, subject: 'Distribuidora MB · ' + corrida + ': ' + (/falla/.test(texto) ? 'revisar' : 'OK'), body: cuerpo });
+  } catch (e) {
+    console.warn('Informe de instalación no enviado por correo: ' + e);
+  }
+}
+
+/** Rol de las cuentas actuales: las administradoras fijas = ADMINISTRADOR; el resto conserva el suyo (vacío → OPERATIVO). */
+function sembrarUsuarios_(ss, tz) {
+  const tabla = leerTabla_(ss, 'usuarios', tz);
+  const nombres = { 'mirian.tallerdebelleza@gmail.com': 'Mirian Britez', 'markieren.rc@gmail.com': 'Raquel (consultora)' };
+  const ya = {};
+  const cambios = [];
+  const lote = [];
+  tabla.filas.forEach(function (u) {
+    const c = u.correo.toLowerCase();
+    ya[c] = true;
+    const rol = esAdminFijo_(c) ? ROLES.ADMIN : normalizarRol_(u.rol || ROLES.OPERATIVO);
+    const datos = {};
+    if (u.rol !== rol) datos.rol = rol;
+    if (!u.nombre && nombres[c]) datos.nombre = nombres[c];
+    if (esAdminFijo_(c) && !esActivo_(u.activo)) datos.activo = 'Sí';
+    if (Object.keys(datos).length) { lote.push({ fila: u._fila, valores: datos }); cambios.push(c + ' → ' + rol); }
+  });
+  actualizarFilas_(tabla, lote, tz);
+  const nuevas = CONFIG.ADMINS_FIJOS.filter(function (c) { return !ya[c]; }).map(function (c) {
+    cambios.push(c + ' (nueva) → ' + ROLES.ADMIN);
+    return { correo: c, activo: 'Sí', acceso: '', ingresos: 0, rol: ROLES.ADMIN, nombre: nombres[c] || '', notas: 'Administradora fija (definida en el código).' };
+  });
+  agregarFilas_(tabla, nuevas, tz);
+  olvidarUsuariosEnCache_(ss);
+  return cambios.length ? cambios.join(' · ') : 'sin cambios';
+}
+
+/** «Entidades fiscales»: una fila por unidad, PENDIENTE (los datos los completa Mirian con su contador). */
+function sembrarEntidades_(ss, tz, email) {
+  const tabla = leerTabla_(ss, 'entidades', tz);
+  const ya = tabla.filas.map(function (f) { return unidadValida_(f.unidad, ''); });
+  const nuevas = LISTAS.UNIDADES.filter(function (u) { return ya.indexOf(u) < 0; }).map(function (u) {
+    return { unidad: u, estado: 'PENDIENTE', observacion: 'PENDIENTE: razón social, RUC, timbrado, establecimiento, punto de expedición y régimen (Mirian y su contador).',
+      actualizado: new Date(), usuario: email || USUARIO_ACTUALIZACION };
+  });
+  agregarFilas_(tabla, nuevas, tz);
+  return nuevas.length ? nuevas.length + ' filas PENDIENTES' : 'sin cambios';
+}
+
+/**
+ * R4.1: completa SOLO la columna nueva «Unidad de negocio» de las filas existentes (Ventas → DISTRIBUIDORA,
+ * Servicios realizados → SALÓN, Movimientos de stock → SALÓN si es «Uso en salón», si no DISTRIBUIDORA). Cada cambio
+ * queda en «Auditoría». Idempotente: lo que ya tiene unidad no se toca.
+ */
+function completarUnidadesExistentes_(ss, tz, email) {
+  const propia = !AUDITORIA_;
+  if (propia) iniciarAuditoria_({ email: email || CONFIG.CORREO_ADMIN, rol: ROLES.ADMIN, metodo: 'INSTALACIÓN' }, 'Instalación v' + CONFIG.VERSION + ': unidad de negocio', '', '');
+  let n = 0;
+  [['ventas', function () { return 'DISTRIBUIDORA'; }],
+    ['realizados', function () { return 'SALÓN'; }],
+    ['movimientos', function (f) { return /uso en sal/i.test(f.tipo) ? 'SALÓN' : 'DISTRIBUIDORA'; }]].forEach(function (par) {
+    const tabla = leerTabla_(ss, par[0], tz);
+    const lote = tabla.filas.filter(function (f) { return !f.unidad; }).map(function (f) { return { fila: f._fila, valores: { unidad: par[1](f) } }; });
+    n += actualizarFilas_(tabla, lote, tz);
+  });
+  if (n) anotarAuditoria_('', '', 'Unidad de negocio completada en ' + n + ' filas existentes (Ventas → DISTRIBUIDORA, Servicios realizados → SALÓN).', '');
+  if (propia) volcarAuditoria_(ss, tz, '');
+  return n;
+}
+
+// ─────────────────────── Compartir y verificar (R6.1 paso 4) ───────────────────────
+
+/**
+ * Comparte libro y carpeta con Mirian y Raquel (edición, sin invitación por correo) y el calendario de la agenda
+ * con Mirian (y Raquel si «Agenda: compartir el calendario con Raquel» = Sí). Luego relee los permisos reales.
+ * Devuelve filas { recurso, resultado, detalle, accion } para el informe.
+ */
+function compartirYVerificar_(ss, tz) {
+  const filas = [];
+  const admins = CONFIG.ADMINS_FIJOS.filter(function (c) { return c !== CONFIG.CORREO_ADMIN; });
+  const carpeta = carpetaSistema_(true);
+  const recursos = [{ nombre: 'Libro «' + ss.getName() + '»', id: ss.getId() }, { nombre: 'Carpeta «' + CONFIG.CARPETA_SISTEMA + '»', id: carpeta.getId() }];
+  recursos.forEach(function (rec) {
+    admins.forEach(function (correo) {
+      const r = compartirSinAviso_(rec.id, correo, 'writer');
+      const verificacion = permisosDe_(rec.id);
+      const tiene = verificacion.lista.some(function (p) { return p.correo === correo && (p.rol === 'writer' || p.rol === 'owner'); });
+      filas.push({
+        recurso: rec.nombre + ' · ' + correo,
+        resultado: tiene ? 'OK' : 'FALLO',
+        detalle: (r === 'YA TENÍA' ? 'Ya tenía edición' : (r === 'OK' ? 'Compartido con edición, sin invitación por correo' : r)) + (tiene ? ' · verificado en los permisos reales.' : ' · NO figura en los permisos reales' + (verificacion.error ? ' (' + verificacion.error + ')' : '') + '.'),
+        accion: tiene ? '' : (/no está activado/.test(r) ? 'En el editor: Servicios (+) › Drive API › Agregar (versión v3), y vuelva a ejecutar la instalación.'
+          : 'Comparta a mano: abra el recurso › Compartir › agregue ' + correo + ' como Editor y desmarque «Notificar».'),
+      });
+    });
+  });
+  if (typeof compartirCalendarioAgenda_ === 'function') {
+    compartirCalendarioAgenda_(ss, tz).forEach(function (f) { filas.push(f); });
+  } else {
+    filas.push({ recurso: 'Calendario «Agenda Salón MB»', resultado: 'INFO', detalle: 'El módulo de agenda (Fase 5) todavía no está instalado.', accion: '' });
+  }
+  return filas;
+}
+
+/** App › Sistema: mueve el libro a la carpeta «Distribuidora MB» (conserva su ID y su enlace). Requiere confirmación. */
+function moverLibroACarpeta(req) {
+  return ejecutar_('moverLibroACarpeta', req, 'escritura', function (ctx) {
+    if (ctx.datos.confirmado !== true) throw errorUsuario_('Confirme que desea mover el libro a la carpeta «' + CONFIG.CARPETA_SISTEMA + '».');
+    const carpeta = carpetaSistema_(true);
+    const archivo = DriveApp.getFileById(ctx.ss.getId());
+    archivo.moveTo(carpeta);
+    auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Mover el libro a la carpeta', 'El libro se movió a «' + CONFIG.CARPETA_SISTEMA + '» (mismo ID y enlace).', '', '', '', ctx.usuario.metodo);
+    return 'Listo: el libro está ahora en la carpeta «' + CONFIG.CARPETA_SISTEMA + '». Su ID y su enlace no cambiaron.';
+  });
+}
+
+// ─────────────────────── Activadores (R6.1 paso 6) ───────────────────────
+
+/** Tareas programadas. Cada una se instala SOLO si su función existe (módulo instalado). Zona: America/Asuncion. */
+function tareasProgramadas_() {
+  const z = CONFIG.ZONA_HORARIA;
+  return [
+    { funcion: 'tareaDiariaMB', existe: typeof tareaDiariaMB === 'function', descripcion: 'diaria 02:15 (respaldo con retención de 14 días, sesiones, cartera, aviso del límite BCP)',
+      crear: function (b) { return b.timeBased().everyDays(1).atHour(2).nearMinute(15).inTimezone(z); } },
+    { funcion: 'dispararAlertasCobranzaMora', existe: typeof dispararAlertasCobranzaMora === 'function', descripcion: 'diaria 09:05 (alertas de mora por WhatsApp)',
+      crear: function (b) { return b.timeBased().everyDays(1).atHour(9).nearMinute(5).inTimezone(z); } },
+    { funcion: 'revisarAcuerdosProveedores', existe: typeof revisarAcuerdosProveedores === 'function', descripcion: 'diaria 08:05 (vencimiento de acuerdos de proveedores)',
+      crear: function (b) { return b.timeBased().everyDays(1).atHour(8).nearMinute(5).inTimezone(z); } },
+    { funcion: 'tareaAgendaHoraria', existe: typeof tareaAgendaHoraria === 'function', descripcion: 'cada hora (recordatorios de turnos y reintentos con Google Calendar)',
+      crear: function (b) { return b.timeBased().everyHours(1).inTimezone(z); } },
+    { funcion: 'procesarColaSifen', existe: typeof procesarColaSifen === 'function', descripcion: 'cada 30 minutos (reintentos de SIFEN y envío del KuDE)',
+      crear: function (b) { return b.timeBased().everyMinutes(30); } },
+  ];
+}
+
+/** Recrea los activadores (borra los anteriores con el mismo nombre: nunca quedan duplicados). */
+function instalarTriggers_() {
+  const tareas = tareasProgramadas_();
+  const nombres = tareas.map(function (t) { return t.funcion; }).concat(['tareaDiaria']); // 'tareaDiaria' = nombre de la v2.2
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (nombres.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
+  });
+  return tareas.map(function (t) {
+    if (!t.existe) return t.funcion + ': módulo no instalado (sin activador)';
+    t.crear(ScriptApp.newTrigger(t.funcion)).create();
+    return t.funcion + ': ' + t.descripcion;
+  });
+}
+
+/**
+ * Ejecuta una tarea automática. Si falla, avisa por correo a las administradoras (máximo un aviso por tarea y por día,
+ * registrado en «Alertas enviadas») y anota la falla en «Estado de instalación».
+ */
+function ejecutarTarea_(nombre, fn) {
+  INICIO_EJECUCION_ = Date.now();
+  try {
+    return fn();
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    console.error('[' + nombre + '] ' + (e && e.stack ? e.stack : e));
+    try {
+      const ss = abrirHoja_();
+      const tz = zonaHoraria_(ss);
+      registrarPaso_(ss, tz, 'Tarea automática', nombre, 'Activador', 'FALLO', msg, 'Ver Sistema › Salud.', 'Activador');
+      avisarUnaVez_(ss, tz, 'FALLA DE TAREA', nombre, hoy_(tz), correosAdministradoras_(),
+        'Distribuidora MB · Falló una tarea automática: ' + nombre,
+        'La tarea «' + nombre + '» falló el ' + Utilities.formatDate(new Date(), tz, 'dd/MM/yyyy HH:mm') + '.\n\nError: ' + msg +
+        '\n\nQué hacer: abra la app › Sistema › Salud. Si el error menciona permisos, la cuenta propietaria debe ejecutar «autorizar» en el editor de Apps Script.\n\n' + CONFIG.URL_APP);
+    } catch (e2) { console.error('No se pudo avisar la falla: ' + e2); }
+    throw e;
+  }
+}
+
+/**
+ * Aviso por correo con registro anti-duplicado en «Alertas enviadas» (clave = tipo|referencia|hito).
+ * Respeta la cuota de MailApp. Devuelve 'ENVIADO' | 'YA ENVIADO' | 'SIN CUOTA' | 'ERROR'.
+ */
+function avisarUnaVez_(ss, tz, tipo, referencia, hito, destinatarios, asunto, cuerpo) {
+  const clave = [tipo, referencia, hito].join('|');
+  const tabla = leerTabla_(ss, 'alertas', tz);
+  if (tabla.filas.some(function (f) { return f.clave === clave && (f.estado === 'ENVIADO' || f.estado === 'SIMULADO'); })) return 'YA ENVIADO';
+  const r = enviarCorreo_({ to: destinatarios.join(','), subject: asunto, body: cuerpo });
+  const estado = r.ok ? (r.simulado ? 'SIMULADO' : 'ENVIADO') : (/cuota/.test(r.motivo || '') ? 'SIN CUOTA' : 'ERROR');
+  anexarFilas_(ss, 'alertas', [{ fecha: new Date(), tipo: tipo, referencia: referencia, hito: String(hito), destinatarios: destinatarios.join(', '),
+    canal: 'CORREO', estado: estado, detalle: r.motivo || asunto, clave: clave }], tz);
+  return estado;
+}
+
+/** Activador diario (02:15, Asunción): respaldo con retención de 14 días, sesiones vencidas, cartera y aviso del límite BCP. */
+function tareaDiariaMB(e) {
+  exigirEditorOTrigger_(e);
+  return ejecutarTarea_('Tarea diaria', function () {
+    reiniciarMemoriaEjecucion_();
+    const ss = abrirHoja_();
+    const tz = zonaHoraria_(ss);
+    const r = {};
+    conBloqueo_(function () {
+      r.sesionesBorradas = limpiarSesionesVencidas_();
+      if (typeof recalcularCartera_ === 'function') {
+        const m = recalcularCartera_(ss, tz);
+        r.cartera = m.totales.cartera;
+        r.vencido = m.totales.vencido;
+      }
+    });
+    const b = respaldoAhora_(ss, tz, '');
+    r.respaldo = b.nombre;
+    r.respaldosBorrados = b.borrados;
+    const P = leerParametros_(ss, tz);
+    const mes = hoy_(tz).slice(0, 7);
+    if (String(P.P_LIMITE_BCP_MES || '') < mes) {
+      conBloqueo_(function () {
+        avisarUnaVez_(ss, tz, 'LÍMITE BCP', 'P_LIMITE_BCP', mes, correosAdministradoras_(), 'Distribuidora MB · Actualizar el límite de tasa usuraria del BCP (' + mes + ')',
+          'El límite cargado es ' + (P.P_LIMITE_BCP !== null ? porcentajeTexto_(P.P_LIMITE_BCP) : '(vacío)') + ' (verificado: ' + (P.P_LIMITE_BCP_MES || 'nunca') + '). ' +
+          'Verifique la publicación mensual del BCP y actualice «Parámetros de crédito» (límite y mes verificado).');
+      });
+    }
+    return r;
+  });
+}
+
+// ─────────────────────── Diagnóstico (R6.3) y salud (?page=health) ───────────────────────
+
+/** EDITOR: diagnóstico de SOLO LECTURA (permisos, activadores, parámetros, pendientes, versión). No escribe nada. */
+function diagnosticoCompleto() {
+  exigirEditorOTrigger_(null);
+  reiniciarMemoriaEjecucion_();
+  const ss = abrirHoja_();
+  const tz = zonaHoraria_(ss);
+  const d = diagnostico_(ss, tz);
+  console.log(textoDiagnostico_(d));
+  return d;
+}
+
+/** Diagnóstico completo, sin escrituras. */
+function diagnostico_(ss, tz) {
+  const props = PropertiesService.getScriptProperties();
+  const paquetes = leerJsonPropiedad_(props, CLAVE_PAQUETES);
+  const instalados = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
+  const P = leerParametros_(ss, tz);
+  const cfg = configuracionIngreso_();
+  const carpeta = carpetaSistema_(false);
+  const permisos = [];
+  [{ nombre: 'Libro', id: ss.getId() }].concat(carpeta ? [{ nombre: 'Carpeta', id: carpeta.getId() }] : []).forEach(function (rec) {
+    const p = permisosDe_(rec.id);
+    CONFIG.ADMINS_FIJOS.forEach(function (c) {
+      const tiene = p.lista.some(function (x) { return x.correo === c && (x.rol === 'writer' || x.rol === 'owner'); });
+      permisos.push({ recurso: rec.nombre, correo: c, ok: tiene || c === correoPropietario_(), detalle: p.error || '' });
+    });
+  });
+  if (typeof estadoCalendarioAgenda_ === 'function') estadoCalendarioAgenda_(ss, tz).forEach(function (x) { permisos.push(x); });
+  let pendientes = [];
+  try {
+    const c = { P: P, productos: leerTabla_(ss, 'productos', tz).filas, servicios: leerTabla_(ss, 'servicios', tz).filas };
+    pendientes = pendientesSistema_(ss, tz, Object.assign(c, { ventas: [], grupos: [], peluquerias: [], realizados: [], personal: [], mes: hoy_(tz).slice(0, 7) }));
+  } catch (e) { pendientes = [{ titulo: 'No se pudieron calcular los pendientes: ' + e, cantidad: 1 }]; }
+  let cuota = null;
+  try { cuota = MailApp.getRemainingDailyQuota(); } catch (e) { cuota = null; }
+  return {
+    version: CONFIG.VERSION,
+    versionHoja: String(leerConfig_(ss, CFG.VERSION) || ''),
+    zonaScript: Session.getScriptTimeZone(),
+    zonaHoja: tz,
+    paquetes: PAQUETES.map(function (q) {
+      const a = paquetes[q.id + '|' + ss.getId()];
+      return { id: q.id, aplicado: !!a, fecha: a ? a.fecha : '', disponible: !q.disponible || q.disponible() };
+    }),
+    modulos: modulosInstalados_(),
+    triggers: tareasProgramadas_().map(function (t) { return { funcion: t.funcion, descripcion: t.descripcion, modulo: t.existe, instalado: instalados.filter(function (x) { return x === t.funcion; }).length }; }),
+    permisos: permisos,
+    acceso: accesosLibroLectura_(ss),
+    ingreso: { clientId: !!cfg.clientId, enlaceAcceso: cfg.enlaceAcceso, codigoPorCorreo: cfg.codigoPorCorreo, registroAbierto: registroAbierto_(ss) },
+    parametrosFaltantes: P._faltan.map(function (k) { return P._nombres[k] || k; }),
+    avisosParametros: P._avisos,
+    pendientes: pendientes.map(function (p) { return { titulo: p.titulo, cantidad: p.cantidad }; }),
+    integraciones: { sifen: modoIntegracion_(ss, 'sifen'), whatsapp: modoIntegracion_(ss, 'whatsapp'), facturacion: modoFacturacion_(ss) },
+    ultimoRespaldo: leerJsonPropiedad_(props, 'MB_ULTIMO_RESPALDO'),
+    ultimasPruebas: leerJsonPropiedad_(props, 'MB_ULTIMAS_PRUEBAS'),
+    correoRestanteHoy: cuota,
+    sesionesActivas: sesionesGuardadas_().filter(function (s) { return Number(s.x) > Date.now(); }).length,
+    carpeta: carpeta ? carpeta.getUrl() : '',
+  };
+}
+
+/** Lectura de accesos sin tocar la columna «Acceso a la hoja» (el diagnóstico no escribe). */
+function accesosLibroLectura_(ss) {
+  const salida = [];
+  try {
+    const archivo = DriveApp.getFileById(ss.getId());
+    const usuarios = mapaUsuarios_(ss);
+    archivo.getEditors().concat(archivo.getViewers()).forEach(function (u) {
+      const c = String(u.getEmail()).toLowerCase();
+      if (c === correoPropietario_()) return;
+      const x = usuarios[c];
+      const admin = esAdminFijo_(c) || (x && normalizarRol_(x.rol) === ROLES.ADMIN && x.activo);
+      salida.push({ correo: c, estado: admin ? 'OK' : 'QUITAR', detalle: admin ? 'Administradora' : 'No es administradora: ve costos.' });
+    });
+  } catch (e) {
+    salida.push({ correo: '', estado: 'ERROR', detalle: String(e) });
+  }
+  return salida;
+}
+
+function textoDiagnostico_(d) {
+  const l = [];
+  l.push('DIAGNÓSTICO · Distribuidora MB v' + d.version + ' (hoja: ' + d.versionHoja + ') · zona ' + d.zonaScript + ' / ' + d.zonaHoja);
+  l.push('Paquetes: ' + d.paquetes.map(function (p) { return p.id + (p.aplicado ? ' ✔ ' + p.fecha : (p.disponible ? ' PENDIENTE' : ' (módulo no instalado)')); }).join(' · '));
+  l.push('Activadores: ' + d.triggers.map(function (t) { return t.funcion + (t.instalado ? ' ✔' : (t.modulo ? ' FALTA' : ' (sin módulo)')); }).join(' · '));
+  l.push('Permisos: ' + d.permisos.map(function (p) { return p.recurso + ' · ' + p.correo + (p.ok ? ' OK' : ' FALLO'); }).join(' · '));
+  l.push('Otros accesos al libro: ' + (d.acceso.length ? d.acceso.map(function (a) { return a.correo + ' ' + a.estado; }).join(' · ') : 'ninguno'));
+  l.push('Ingreso con Google: Client ID ' + (d.ingreso.clientId ? 'OK' : 'PENDIENTE') + ' · enlace ' + (d.ingreso.enlaceAcceso || 'PENDIENTE') + ' · código por correo ' + (d.ingreso.codigoPorCorreo ? 'Sí' : 'No') + ' · registro ' + (d.ingreso.registroAbierto ? 'ABIERTO' : 'cerrado'));
+  l.push('Parámetros faltantes: ' + (d.parametrosFaltantes.join(', ') || 'ninguno') + (d.avisosParametros.length ? ' · avisos: ' + d.avisosParametros.join(' ') : ''));
+  l.push('Pendientes: ' + (d.pendientes.map(function (p) { return p.titulo + ' (' + p.cantidad + ')'; }).join(' · ') || 'ninguno'));
+  l.push('SIFEN: ' + d.integraciones.sifen + ' · WhatsApp: ' + d.integraciones.whatsapp + ' · facturación: ' + d.integraciones.facturacion);
+  l.push('Último respaldo: ' + (d.ultimoRespaldo.nombre || 'ninguno') + ' · últimas pruebas: ' + (d.ultimasPruebas.resumen || 'sin datos') + ' · correos restantes hoy: ' + d.correoRestanteHoy);
+  return l.join('\n');
+}
+
+function obtenerSalud(req) {
+  return ejecutar_('obtenerSalud', req, 'lectura', function (ctx) {
+    const d = diagnostico_(ctx.ss, ctx.tz);
+    let instalacion = [];
+    try {
+      const h = ctx.ss.getSheetByName(ESQUEMA.instalacion.hoja);
+      const n = h ? h.getLastRow() : 0;
+      if (n >= 2) {
+        const enc = h.getRange(1, 1, 1, h.getLastColumn()).getValues()[0].map(function (v) { return String(v).trim(); });
+        const idx = {};
+        ESQUEMA.instalacion.columnas.forEach(function (c) { idx[c[0]] = enc.indexOf(c[1]); });
+        const desde = Math.max(2, n - 59);
+        instalacion = h.getRange(desde, 1, n - desde + 1, h.getLastColumn()).getValues().reverse().map(function (f) {
+          const o = {};
+          Object.keys(idx).forEach(function (k) { const v = idx[k] >= 0 ? f[idx[k]] : ''; o[k] = v instanceof Date ? Utilities.formatDate(v, ctx.tz, 'yyyy-MM-dd HH:mm') : String(v); });
+          return o;
+        });
+      }
+    } catch (e) { instalacion = []; }
+    d.instalacion = instalacion;
+    d.texto = textoDiagnostico_(d);
+    return { ok: true, salud: d };
+  });
+}
+
+/** App › Sistema: acciones de mantenimiento (solo administradoras). Lo masivo pide vista previa en su propia pantalla. */
+function ejecutarMantenimiento(req) {
+  return ejecutar_('ejecutarMantenimiento', req, 'lectura', function (ctx) {
+    const accion = String(ctx.datos.accion || '');
+    const ss = ctx.ss;
+    const tz = ctx.tz;
+    INICIO_EJECUCION_ = Date.now();
+    let mensaje = '';
+    let detalle = null;
+    if (accion === 'instalar') {
+      const r = conBloqueo_(function () { return instalarActualizacion_(ss, tz, ctx.email, 'App › Sistema (' + ctx.email + ')'); });
+      mensaje = r.texto;
+      detalle = r.pasos;
+    } else if (accion === 'pruebas') {
+      const r = conBloqueo_(function () { return testSistema_(ss, tz, { corrida: 'Pruebas ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'), email: ctx.email }); });
+      mensaje = r.ok + ' de ' + r.total + ' pruebas OK.';
+      detalle = r.detalle;
+    } else if (accion === 'actualizaciones') {
+      const avisos = conBloqueo_(function () { asegurarEstructura_(ss); return aplicarPaquetes_(ss, ctx.email, tz, ctx.usuario.rol); });
+      mensaje = avisos.length ? avisos.join(' ') : 'No hay actualizaciones pendientes.';
+      detalle = aplicarPaquetes_.ultimo;
+    } else if (accion === 'respaldo') {
+      const b = respaldoAhora_(ss, tz, 'manual');
+      mensaje = 'Respaldo creado: «' + b.nombre + '» en «' + CONFIG.CARPETA_SISTEMA + '/Respaldos».';
+    } else if (accion === 'compartir') {
+      const filas = conBloqueo_(function () { return compartirYVerificar_(ss, tz); });
+      const mal = filas.filter(function (f) { return f.resultado === 'FALLO'; });
+      mensaje = mal.length ? mal.length + ' recurso(s) sin verificar: ' + mal.map(function (f) { return f.recurso + ' → ' + f.accion; }).join(' · ') : 'Libro y carpeta compartidos con las administradoras y verificados.';
+      detalle = filas;
+    } else if (accion === 'acceso') {
+      const h = conBloqueo_(function () { return revisarAccesoLibro_(ss, tz, null); });
+      mensaje = h.length ? h.map(function (x) { return x.correo + ': ' + x.estado; }).join(' · ') : 'Solo la propietaria tiene acceso.';
+      detalle = h;
+    } else if (accion === 'activadores') {
+      mensaje = 'Activadores: ' + instalarTriggers_().join(' · ');
+    } else if (accion === 'recalcular' && typeof recalcularCartera_ === 'function') {
+      const m = conBloqueo_(function () { return recalcularCartera_(ss, tz); });
+      mensaje = 'Cartera recalculada: Gs. ' + miles_(m.totales.cartera) + ' (vencido Gs. ' + miles_(m.totales.vencido) + ').';
+    } else if (accion === 'alertas' && typeof dispararAlertasCobranzaMora_ === 'function') {
+      const r = dispararAlertasCobranzaMora_({ disparadoPor: ctx.email });
+      mensaje = 'WhatsApp (' + r.modo + '): ' + r.enviados + ' enviados, ' + r.simulados + ' simulados, ' + r.omitidos + ' omitidos, ' + r.errores + ' con error.';
+      detalle = r;
+    } else if (accion === 'colaSifen' && typeof procesarColaSifen_ === 'function') {
+      const r = procesarColaSifen_({ reintentar: true });
+      mensaje = 'Facturación: ' + r.procesados + ' procesados (' + r.aprobados + ' aprobados, ' + r.simulados + ' simulados, ' + r.pendientes + ' pendientes, ' + r.errores + ' con error).';
+    } else if (accion === 'sincronizarAgenda' && typeof sincronizarAgenda_ === 'function') {
+      const r = sincronizarAgenda_(ss, tz, { forzar: true });
+      mensaje = 'Agenda: ' + r.sincronizados + ' turnos sincronizados con Google Calendar, ' + r.errores + ' con error.';
+    } else {
+      throw errorUsuario_('Acción de mantenimiento no disponible: ' + accion + '.');
+    }
+    conBloqueo_(function () { auditarEvento_(ss, ctx.email, ctx.usuario.rol, 'Mantenimiento: ' + accion, String(mensaje).slice(0, 300), '', '', '', ctx.usuario.metodo); });
+    return { ok: true, mensaje: mensaje, detalle: detalle, datos: construirDatos_(ss, ctx.mes, tz, ctx.usuario) };
+  });
+}
+
+function obtenerAuditoria(req) {
+  return ejecutar_('obtenerAuditoria', req, 'lectura', function (ctx) {
+    const h = ctx.ss.getSheetByName(ESQUEMA.auditoria.hoja);
+    const filas = [];
+    const filtro = normalizar_(ctx.datos.buscar || '');
+    if (h && h.getLastRow() >= 2) {
+      const n = h.getLastRow();
+      const desde = Math.max(2, n - 499);
+      const enc = h.getRange(1, 1, 1, h.getLastColumn()).getValues()[0].map(function (v) { return String(v).trim(); });
+      const idx = {};
+      ESQUEMA.auditoria.columnas.forEach(function (c) { idx[c[0]] = enc.indexOf(c[1]); });
+      h.getRange(desde, 1, n - desde + 1, h.getLastColumn()).getValues().reverse().forEach(function (f) {
+        const o = {};
+        Object.keys(idx).forEach(function (k) {
+          const v = idx[k] >= 0 ? f[idx[k]] : '';
+          o[k] = v instanceof Date ? Utilities.formatDate(v, ctx.tz, 'yyyy-MM-dd HH:mm') : String(v);
+        });
+        if (!filtro || normalizar_(JSON.stringify(o)).indexOf(filtro) >= 0) filas.push(o);
+      });
+    }
+    return { ok: true, auditoria: filas.slice(0, 300) };
+  });
+}
+
+// ─────────────────────── Configuración desde la app (solo administradoras) ───────────────────────
+
+/** Filas de «Configuración» editables desde Sistema › Configuración (el resto, solo en la hoja). */
+function configuracionEditable_() {
+  return [CFG_CODIGO_CORREO, CFG.RUC_DV, CFG.FACTURACION, CFG.TRANSFERENCIA, CFG.COMISION_PRODUCTOS, CFG.CONSUMIDOR_FINAL,
+    CFG.AG_DIAS, CFG.AG_APERTURA, CFG.AG_CIERRE, CFG.AG_PAUSA, CFG.AG_PUESTOS, CFG.AG_SENA_ACTIVA, CFG.AG_SENA_PCT, CFG.AG_CANCEL_ACTIVA,
+    CFG.AG_CANCEL_HORAS, CFG.AG_COMPARTIR_RAQUEL, CFG.AG_RECORDATORIOS, CFG.WA_DIAS_ENTRE, CFG.WA_MAX_DIA, CFG.KUDE_AUTOMATICO, CFG.AVISOS_ACUERDOS];
+}
+
+function guardarConfiguracion(req) {
+  return ejecutar_('guardarConfiguracion', req, 'escritura', function (ctx) {
+    const etiqueta = String(ctx.datos.etiqueta || '');
+    if (configuracionEditable_().indexOf(etiqueta) < 0) throw errorUsuario_('Esa fila de «Configuración» no se edita desde la app.');
+    const fila = filasConfiguracion_().filter(function (f) { return f[0] === etiqueta; })[0];
+    let valor = texto_(ctx.datos.valor, 200);
+    if (fila && fila[2]) {
+      const v = fila[2].filter(function (x) { return normalizar_(x) === normalizar_(valor); })[0];
+      if (!v) throw errorUsuario_('Valor no válido para «' + etiqueta + '». Opciones: ' + fila[2].join(', ') + '.');
+      valor = v;
+    }
+    if ((etiqueta === CFG.AG_APERTURA || etiqueta === CFG.AG_CIERRE) && valor && !/^([01]\d|2[0-3]):[0-5]\d$/.test(valor)) throw errorUsuario_('Use el formato HH:MM (ej.: 09:00).');
+    if (etiqueta === CFG.AG_PAUSA && valor && !/^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/.test(valor)) throw errorUsuario_('Use el formato HH:MM-HH:MM (ej.: 12:00-13:00).');
+    const anterior = leerConfig_(ctx.ss, etiqueta);
+    escribirConfig_(ctx.ss, etiqueta, valor);
+    if (etiqueta === CFG_CODIGO_CORREO) olvidarConfiguracionIngreso_();
+    auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Configuración', '', etiqueta, String(anterior), valor, ctx.usuario.metodo);
+    return '«' + etiqueta + '» = ' + (valor || '(vacío)') + '.';
+  });
+}
+
+/** Sistema › Parámetros: edita un valor de «Parámetros de crédito» (con control del límite BCP). */
+function guardarParametro(req) {
+  return ejecutar_('guardarParametro', req, 'escritura', function (ctx) {
+    const clave = clave_(ctx.datos.clave);
+    const tabla = leerTabla_(ctx.ss, 'parametros', ctx.tz);
+    const fila = tabla.filas.find(function (f) { return clave_(f.clave) === clave; });
+    if (!fila) throw errorUsuario_('No existe el parámetro ' + clave + ' en «Parámetros de crédito».');
+    const crudo = ctx.datos.valor === null || ctx.datos.valor === undefined ? '' : ctx.datos.valor;
+    const unidad = String(fila.unidad || 'texto');
+    let valor = '';
+    if (String(crudo).trim() !== '') {
+      const r = interpretarParametro_(crudo, unidad);
+      if (!r.ok) throw errorUsuario_('Valor no válido para «' + fila.nombre + '» (' + unidad + ').');
+      valor = /^s[ií]\/no$/i.test(unidad) ? (r.valor ? 'SÍ' : 'NO') : r.valor;
+    } else if (PARAMETROS_OPCIONALES_.indexOf(clave) < 0) {
+      throw errorUsuario_('«' + fila.nombre + '» no puede quedar vacío: la política lo necesita.');
+    }
+    if (['P_TEA_FIN', 'P_TEA_MORA', 'P_LIMITE_BCP'].indexOf(clave) >= 0 && valor !== '') {
+      const P = leerParametros_(ctx.ss, ctx.tz);
+      const tea = Math.max(clave === 'P_TEA_FIN' ? valor : (P.P_TEA_FIN || 0), clave === 'P_TEA_MORA' ? valor : (P.P_TEA_MORA || 0));
+      const limite = clave === 'P_LIMITE_BCP' ? valor : P.P_LIMITE_BCP;
+      if (limite !== null && tea > limite + 1e-12) throw errorUsuario_('REVISAR: una tasa supera el límite BCP (' + porcentajeTexto_(tea) + ' > ' + porcentajeTexto_(limite) + ').');
+    }
+    actualizarCeldas_(tabla, fila._fila, { valor: valor, actualizado: new Date(), usuario: ctx.email }, ctx.tz);
+    if (unidad === '%' && valor !== '') tabla.hoja.getRange(fila._fila, tabla.idx.valor + 1).setNumberFormat('0.00%');
+    memoria_.parametros = null;
+    return '«' + fila.nombre + '» = ' + (valor === '' ? '(vacío)' : (unidad === '%' ? porcentajeTexto_(valor) : String(valor))) + '.';
+  });
+}
+
+// ─────────────────────── Integraciones (credenciales enmascaradas en PropertiesService) ───────────────────────
+
+/** Campos de credenciales por integración: [propiedad, etiqueta, secreta]. Nunca se guardan en la hoja ni en el código. */
+function camposIntegracion_() {
+  return {
+    sifen: [['SIFEN_URL', 'URL del middleware SIFEN (https://…)', false], ['SIFEN_TOKEN', 'Token del middleware', true]],
+    whatsapp: [['WA_TOKEN', 'Token de acceso (Meta)', true], ['WA_PHONE_ID', 'Phone number ID', false], ['WA_VERSION', 'Versión de la API Graph (ej.: v25.0)', false],
+      ['WA_PLANTILLA_COBRANZA', 'Plantilla aprobada: recordatorio de saldo', false], ['WA_PLANTILLA_TURNO', 'Plantilla aprobada: recordatorio de turno', false],
+      ['WA_PLANTILLA_KUDE', 'Plantilla aprobada: envío del KuDE', false], ['WA_IDIOMA', 'Idioma de las plantillas (ej.: es)', false]],
+  };
+}
+
+function datosIntegraciones_(ss) {
+  const props = PropertiesService.getScriptProperties();
+  const campos = camposIntegracion_();
+  const salida = {};
+  Object.keys(campos).forEach(function (cual) {
+    const lista = campos[cual].map(function (c) {
+      const v = props.getProperty(c[0]) || '';
+      return { clave: c[0], etiqueta: c[1], valor: enmascarar_(v, c[2]), secreto: c[2], configurado: !!v };
+    });
+    salida[cual] = { modo: modoIntegracion_(ss, cual), campos: lista, faltantes: lista.filter(function (c) { return !c.configurado; }).map(function (c) { return c.etiqueta; }) };
+  });
+  return salida;
+}
+
+function guardarIntegracion(req) { return ejecutar_('guardarIntegracion', req, 'escritura', guardarIntegracion_); }
+
+/** Cambia el modo (SIMULACIÓN / PRODUCCIÓN / APAGADO) y guarda credenciales en PropertiesService (nunca en la hoja). */
+function guardarIntegracion_(ctx) {
+  const d = ctx.datos;
+  const cual = d.cual === 'whatsapp' ? 'whatsapp' : (d.cual === 'sifen' ? 'sifen' : '');
+  if (!cual) throw errorUsuario_('Integración no reconocida.');
+  const props = PropertiesService.getScriptProperties();
+  const cambios = [];
+  camposIntegracion_()[cual].forEach(function (c) {
+    if (!d.credenciales || !Object.prototype.hasOwnProperty.call(d.credenciales, c[0])) return;
+    const v = String(d.credenciales[c[0]] === null || d.credenciales[c[0]] === undefined ? '' : d.credenciales[c[0]]).trim();
+    if (/^•/.test(v)) return; // valor enmascarado sin cambios
+    if (c[0] === 'SIFEN_URL' && v && !/^https:\/\/[^\s]+$/i.test(v)) throw errorUsuario_('La URL del middleware debe empezar con https://');
+    if (c[0] === 'WA_VERSION' && v && !/^v\d+\.\d+$/.test(v)) throw errorUsuario_('Versión de la API: formato v25.0');
+    if (v) props.setProperty(c[0], v); else props.deleteProperty(c[0]);
+    cambios.push(c[1] + (v ? ' = ' + enmascarar_(v, c[2]) : ' (borrado)'));
+  });
+  let textoModo = '';
+  if (d.modo) {
+    const modo = /^prod/i.test(d.modo) ? 'PRODUCCIÓN' : (/^apag/i.test(d.modo) ? 'APAGADO' : 'SIMULACIÓN');
+    if (modo === 'PRODUCCIÓN') {
+      const faltan = datosIntegraciones_(ctx.ss)[cual].campos.filter(function (c) {
+        return !c.configurado && (cual === 'sifen' || c.clave === 'WA_TOKEN' || c.clave === 'WA_PHONE_ID' || c.clave === 'WA_VERSION');
+      });
+      if (faltan.length) throw errorUsuario_('Para pasar a PRODUCCIÓN complete: ' + faltan.map(function (c) { return c.etiqueta; }).join(', ') + '.');
+      if (cual === 'sifen') {
+        const ent = entidadFiscalDe_(ctx.ss, ctx.tz, 'DISTRIBUIDORA');
+        if (!ent.completa) throw errorUsuario_('Para pasar a PRODUCCIÓN complete «Entidades fiscales» (' + ent.unidad + '): ' + ent.faltan.join(', ') + '.');
+      }
+    }
+    const etiqueta = cual === 'sifen' ? CFG.MODO_SIFEN : CFG.MODO_WA;
+    const anterior = leerConfig_(ctx.ss, etiqueta);
+    if (anterior !== modo) {
+      escribirConfig_(ctx.ss, etiqueta, modo);
+      cambios.push('Modo: ' + (anterior || '—') + ' → ' + modo);
+      textoModo = ' Modo: ' + modo + '.';
+    }
+  }
+  auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Integración ' + cual.toUpperCase(), cambios.join(' · ') || 'Sin cambios', '', '', '', ctx.usuario.metodo);
+  return (cual === 'sifen' ? 'Facturación electrónica' : 'WhatsApp') + ': ' + (cambios.length ? cambios.length + ' cambio(s) guardado(s).' : 'sin cambios.') + textoModo;
+}
+
+// ─────────────────────── Datos del panel «Sistema» (solo administradoras) ───────────────────────
+
+function datosAdmin_(ss, tz, usuario, contexto) {
+  const P = contexto && contexto.P ? contexto.P : leerParametros_(ss, tz);
+  const cfg = configuracionIngreso_();
+  let parametros = [];
+  try {
+    parametros = leerTabla_(ss, 'parametros', tz).filas.map(function (f) {
+      return { clave: f.clave, nombre: f.nombre, valor: f.valor, unidad: f.unidad, fuente: f.fuente, falta: P._faltan.indexOf(clave_(f.clave)) >= 0 };
+    });
+  } catch (e) { parametros = []; }
+  const props = PropertiesService.getScriptProperties();
+  return {
+    usuarios: datosUsuarios_(ss, tz),
+    parametros: parametros,
+    categorias: leerCategorias_(ss, tz),
+    configuracion: configuracionEditable_().map(function (k) {
+      const f = filasConfiguracion_().filter(function (x) { return x[0] === k; })[0] || [k, '', null, ''];
+      return { etiqueta: k, valor: String(leerConfig_(ss, k)), opciones: f[2], descripcion: f[3] };
+    }),
+    integraciones: datosIntegraciones_(ss),
+    ingreso: { clientId: !!cfg.clientId, enlaceAcceso: cfg.enlaceAcceso, codigoPorCorreo: cfg.codigoPorCorreo },
+    ultimoRespaldo: leerJsonPropiedad_(props, 'MB_ULTIMO_RESPALDO'),
+    ultimasPruebas: leerJsonPropiedad_(props, 'MB_ULTIMAS_PRUEBAS'),
+    carpeta: String(leerConfig_(ss, CFG.CARPETA) || ''),
+    avisosParametros: P._avisos,
+  };
+}

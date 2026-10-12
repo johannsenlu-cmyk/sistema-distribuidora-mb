@@ -1,0 +1,3300 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Sistema de Inventario y Gestión
+ *  Archivo: Código.gs — núcleo del servidor (Google Apps Script, V8)
+ * =====================================================================
+ *
+ *  Versión 2.3 (11/10/2026): cartera de crédito y cobranzas, base de clientes,
+ *  proveedores, recálculo de comisiones, venta en un solo ticket, agenda del
+ *  salón, identidad verificada por Google («MB Acceso»), roles, auditoría,
+ *  SIFEN, WhatsApp y reportes. Extiende la v2.1 (nada se renombra ni se borra).
+ *
+ *  Archivos del proyecto (comparten el ámbito global; cada uno es un módulo):
+ *   Código.gs (este) · DatosSalon.gs (datos del salón, v2.1, sin cambios) ·
+ *   Nucleo.gs · Seguridad.gs · Cartera.gs · Migracion.gs · Reportes.gs ·
+ *   Clientes.gs · Proveedores.gs · Comisiones.gs · Tickets.gs · Agenda.gs ·
+ *   Fiscal.gs · Whatsapp.gs · Instalacion.gs · Pruebas.gs ·
+ *   Index.html y los parciales UI_*.html.
+ *  Regla de carga: ningún archivo usa al cargarse algo definido en otro
+ *  archivo (el orden de los archivos en el editor no importa). Las llamadas
+ *  a módulos de fases posteriores van protegidas con «typeof … === 'function'».
+ *
+ *  Criterios "a prueba de errores" (vigentes desde la v2.1):
+ *   - Una única hoja de cálculo, abierta por su ID guardado.
+ *   - Toda escritura usa un bloqueo (LockService) e idempotencia por
+ *     idSolicitud: un doble clic o un reenvío no duplica nada.
+ *   - El stock se calcula siempre desde "Movimientos de stock".
+ *   - Nada se borra: ventas, servicios, cobros y tickets se ANULAN con motivo.
+ *   - Las columnas se ubican por su título; lo nuevo va siempre al final.
+ *   - Toda escritura queda en «Auditoría» con el correo verificado.
+ *
+ *  Historial: v2.1 (05/10/2026) datos del salón · v2.2 (06/10/2026) enlaces
+ *  personales, retirada · v2.3 (este archivo).
+ *
+ *  Las funciones cuyo nombre termina en "_" son privadas: Google no permite
+ *  llamarlas desde el navegador.
+ * =====================================================================
+ */
+
+/**
+ * PASO PREVIO (una sola vez, la cuenta propietaria): seleccione «autorizar» en la barra superior del
+ * editor, pulse «Ejecutar» y acepte TODOS los permisos («Seleccionar todo»). Después ejecute
+ * «instalarActualizacionMB» (Instalacion.gs).
+ */
+function autorizar() {
+  exigirEditorOTrigger_(null);
+  ScriptApp.requireAllScopes(ScriptApp.AuthMode.FULL);
+  const cuenta = Session.getEffectiveUser().getEmail();
+  console.log('✔ Permisos listos para ' + cuenta + '. Siguiente paso: ejecutar «instalarActualizacionMB».');
+  return 'Permisos listos';
+}
+
+// ─────────────────────────── 1. Configuración ───────────────────────────
+
+const CONFIG = Object.freeze({
+  NOMBRE_HOJA: 'Inventario - Distribuidora MB',
+  CORREO_ADMIN: 'johannsenlu@gmail.com',
+  ZONA_HORARIA: 'America/Asuncion',
+  CLAVE_ID_HOJA: 'MB_ID_HOJA_INVENTARIO',
+  VERSION: '2.3',
+  MARCAS_BASE: ['Sacha Dionne', 'Framesi', 'W Profesional'],
+  // Administradoras fijas (decisión D4): no se pueden desactivar ni bajar de rol desde la hoja.
+  ADMINS_FIJOS: Object.freeze(['mirian.tallerdebelleza@gmail.com', 'markieren.rc@gmail.com', 'johannsenlu@gmail.com']),
+  // Enlace oficial de la aplicación (implementación principal; NO cambia al publicar versiones nuevas).
+  URL_APP: 'https://script.google.com/macros/s/AKfycbw1WS0g31ZIS4H6Dke1rn0rMLDA9PFQP971es0m6lVqM8VjoI36qrordGJ7cXpBsVXD/exec',
+  // Carpeta del sistema en el Drive de la cuenta propietaria (R6.1 paso 3).
+  CARPETA_SISTEMA: 'Distribuidora MB',
+  SUBCARPETAS: Object.freeze(['Respaldos', 'Proveedores', 'Importaciones', 'Comprobantes', 'Exportaciones']),
+  RETENCION_RESPALDOS_DIAS: 14,
+});
+
+const LIMITES = Object.freeze({
+  PRECIO_UNITARIO: 100000000, // Gs. por unidad de producto
+  PRECIO_SERVICIO: 50000000, // Gs. por servicio
+  CANTIDAD: 100000, // unidades por línea / movimiento
+  ITEMS_POR_VENTA: 60,
+});
+
+const PREFIJO_SESION = '[SESION] ';
+const HOJA_LEAME = 'Léame';
+const HOJA_CONFIG = 'Configuración';
+const PARAM_REGISTRO = 'Registro de nuevos correos';
+const DESCRIPCION_REGISTRO = 'Abierto: una persona nueva que ingresa con Google queda registrada como OPERATIVO (sin acceso a la hoja ni a costos). ' +
+  'Cerrado: solo ingresan los correos activos de «Usuarios». Si falta esta fila, se considera Cerrado.';
+
+const MESES_ = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio',
+  'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+
+const FORMATOS = Object.freeze({
+  fecha: 'dd/mm/yyyy',
+  fechahora: 'dd/mm/yyyy hh:mm',
+  gs: '#,##0',
+  entero: '#,##0',
+  gsopc: '#,##0', // guaraníes opcionales (vacío ≠ 0)
+});
+
+const COLORES = Object.freeze({
+  encabezado: '#2B2A27',
+  textoEncabezado: '#FFFFFF',
+  catalogo: '#8C6D46',
+  registro: '#2B2A27',
+  sistema: '#B9B4AA',
+});
+
+const TIPOS_MOVIMIENTO = Object.freeze({
+  ingreso: { etiqueta: 'Ingreso (compra)', signo: 1, notaObligatoria: false },
+  uso: { etiqueta: 'Uso en salón', signo: -1, notaObligatoria: false },
+  ajuste_mas: { etiqueta: 'Ajuste (+)', signo: 1, notaObligatoria: true },
+  ajuste_menos: { etiqueta: 'Ajuste (-)', signo: -1, notaObligatoria: true },
+});
+
+/**
+ * v2.3: listas cerradas (textos literales de la hoja LISTAS del xlsx y del megaprompt). Se definen AQUÍ,
+ * antes del ESQUEMA, porque Apps Script evalúa cada archivo en orden y el ESQUEMA las usa al cargarse.
+ */
+const LISTAS = Object.freeze({
+  SI_NO: ['Sí', 'No'],
+  ROLES: ['ADMINISTRADOR', 'OPERATIVO'],
+  UNIDADES: ['DISTRIBUIDORA', 'SALÓN'],
+  TIPOS_CLIENTE: ['PELUQUERÍA', 'CLIENTA DEL SALÓN', 'OTRO'],
+  COMPLETITUD: ['COMPLETA', 'INCOMPLETA'],
+  ZONAS: ['ASUNCIÓN', 'GRAN ASUNCIÓN', 'INTERIOR'],
+  TASAS_IVA: ['10', '5', '0'],
+  LINEAS: ['CAPILAR', 'FACIAL Y ROSTRO', 'HERRAMIENTAS Y ACCESORIOS', 'EQUIPAMIENTO Y MOBILIARIO',
+    'SERVICIOS Y CAPACITACIÓN', 'INGRESOS FINANCIEROS', 'REVISAR'],
+  MEDIOS_PAGO: ['EFECTIVO', 'TRANSF. BANCO 1', 'TRANSF. BANCO 2', 'QR / BILLETERA', 'TARJETA (POS)', 'CHEQUE'],
+  CONCEPTOS_COBRO: ['ENTREGA', 'CUOTA', 'CANCELACIÓN', 'RECARGO POR MORA'],
+  COMPROBANTES: ['FACTURA', 'FACTURA ELECTRÓNICA', 'NOTA DE CRÉDITO', 'ANULADO', 'SIN COMPROBANTE'],
+  FRECUENCIAS: ['SEMANAL', 'QUINCENAL', 'MENSUAL'],
+  ESTADOS_PLAN: ['A CONFIRMAR', 'VIGENTE', 'CANCELADO', 'ANULADO'],
+  ESTADOS_CREDITO: ['CANCELADO', 'AL DÍA', 'ATRASO HASTA 7', 'ATRASO 8-15', 'ATRASO 16-30', 'ATRASO 31-60', 'ATRASO +60'],
+  ORIGENES_CREDITO: ['NUEVO', 'VIGENTE PREVIO', 'HISTÓRICO'],
+  ESTADOS_SALDO: ['A CONFIRMAR', 'CONFIRMADO', 'EN DISPUTA'],
+  LECTURAS: ['LEGIBLE', 'DUDOSA', 'A INVESTIGAR'],
+  CONDICIONES: ['CONTADO', 'CRÉDITO'],
+  ESTADOS_TICKET: ['COBRADO', 'A CRÉDITO', 'ANULADO'],
+  ORIGENES: ['NUEVO', 'MIGRADO', 'HISTÓRICO'],
+  ESTADOS_AGENDA: ['AGENDADO', 'CONFIRMADO', 'EN CURSO', 'REALIZADO', 'CANCELADO', 'NO SE PRESENTÓ'],
+  MOTIVOS_BLOQUEO: ['FERIADO', 'VACACIONES', 'AUSENCIA', 'OTRO'],
+  ESTADOS_PROVEEDOR: ['VIGENTE', 'POR VENCER', 'VENCIDO', 'SIN ACUERDO'],
+  ESTADOS_IMPORTACION: ['LISTO', 'REVISAR', 'DUPLICADO', 'APROBADO', 'RECHAZADO'],
+  ESTADOS_COBRO_CONFIRMAR: ['PENDIENTE', 'REGISTRADO', 'DESCARTADO'],
+  APLICACION_PCT: ['SOLO HACIA ADELANTE', 'RETROACTIVO DESDE'],
+});
+
+/**
+ * Estructura de datos. Cada columna: [clave interna, título en la hoja, tipo, ancho, opciones].
+ * Tipos: texto | fecha | fechahora | gs (guaraníes) | entero | decimal
+ *        gsopc (guaraníes opcional: vacío ≠ 0) | libre (número o texto tal cual)
+ * opciones (v2.3, opcional): { lista: [...] } → validación con aviso (no rechaza lo ya cargado).
+ * Hoja: { hoja, grupo, despuesDe, bloque, descripcion }.
+ * Reglas: en hojas existentes las columnas nuevas van SOLO al final; ningún título existente cambia;
+ * ninguna hoja se renombra ni se borra. Los títulos de esta tabla quedan FIJOS desde la Fase 1 de la v2.3.
+ */
+const COLUMNAS_CLIENTE_ = [
+  ['codigo', 'Código', 'texto', 90],
+  ['nombre', 'Peluquería', 'texto', 220],
+  ['contacto', 'Contacto', 'texto', 170],
+  ['telefono', 'Teléfono', 'texto', 130],
+  ['ciudad', 'Ciudad', 'texto', 130],
+  ['direccion', 'Dirección', 'texto', 230],
+  ['ruc', 'RUC', 'texto', 110],
+  ['activo', 'Activo', 'texto', 70],
+  ['actualizado', 'Última actualización', 'fechahora', 150],
+  ['usuario', 'Actualizado por', 'texto', 210],
+  // v2.3 (R1.2, al final)
+  ['razonSocial', 'Razón social', 'texto', 220],
+  ['celular', 'Celular (595XXXXXXXXX)', 'texto', 160],
+  ['correo', 'Correo', 'texto', 210],
+  ['tipo', 'Tipo de cliente', 'texto', 150, { lista: LISTAS.TIPOS_CLIENTE }],
+  ['categoria', 'Categoría de crédito', 'texto', 150],
+  ['ci', 'CI', 'texto', 110],
+  ['zona', 'Zona', 'texto', 130, { lista: LISTAS.ZONAS }],
+  ['legado', 'Código legado', 'texto', 110],
+  ['alias', 'Alias', 'texto', 220],
+  ['completitud', 'Completitud', 'texto', 120],
+  ['faltantes', 'Campos faltantes', 'texto', 300],
+  ['alta', 'Fecha de alta', 'fecha', 110],
+  ['observacion', 'Observación', 'texto', 320],
+  // v2.3 (R0.6: estado de crédito, lo calcula el sistema)
+  ['limite', 'Límite de crédito (automático)', 'gs', 170],
+  ['saldo', 'Saldo (automático)', 'gs', 140],
+  ['vencido', 'Vencido (automático)', 'gs', 140],
+  ['atraso', 'Máx. atraso en días (automático)', 'entero', 190],
+  ['estadoCredito', 'Estado de crédito (automático)', 'texto', 200],
+  ['disponible', 'Disponible (automático)', 'gs', 160],
+  ['sugerencia', 'Sugerencia de categoría (automático)', 'texto', 220],
+];
+
+const ESQUEMA = {
+  // ───────────── Hojas vigentes (v2.1): títulos intactos; lo nuevo va al final ─────────────
+  productos: {
+    hoja: 'Productos', grupo: 'catalogo', bloque: 'v2.1 + R2.4 + R4.4',
+    descripcion: 'Catálogo de productos. El stock se calcula desde «Movimientos de stock».',
+    columnas: [
+      ['codigo', 'Código', 'texto', 90],
+      ['nombre', 'Producto', 'texto', 260],
+      ['marca', 'Marca / Línea', 'texto', 150],
+      ['categoria', 'Categoría', 'texto', 140],
+      ['presentacion', 'Presentación', 'texto', 120],
+      ['costo', 'Costo unitario (Gs.)', 'gs', 140],
+      ['precio', 'Precio a peluquerías (Gs.)', 'gs', 170],
+      ['stockMinimo', 'Stock mínimo', 'entero', 110],
+      ['stock', 'Stock actual (automático)', 'entero', 170],
+      ['activo', 'Activo', 'texto', 70],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+      // v2.3 (al final)
+      ['iva', 'Tasa IVA', 'texto', 90, { lista: LISTAS.TASAS_IVA }],
+      ['linea', 'Línea / centro de costo', 'texto', 220, { lista: LISTAS.LINEAS }],
+      ['proveedor', 'Código proveedor', 'texto', 130],
+    ],
+  },
+  movimientos: {
+    hoja: 'Movimientos de stock', grupo: 'registro', bloque: 'v2.1 + R4.3',
+    descripcion: 'Fuente única del stock: cada entrada y salida, con quién y cuándo.',
+    columnas: [
+      ['id', 'N° movimiento', 'texto', 110],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['tipo', 'Tipo', 'texto', 150],
+      ['codigo', 'Código producto', 'texto', 120],
+      ['producto', 'Producto', 'texto', 240],
+      ['cantidad', 'Cantidad (+/-)', 'entero', 110],
+      ['costoUnitario', 'Costo unitario (Gs.)', 'gs', 140],
+      ['referencia', 'Referencia', 'texto', 110],
+      ['nota', 'Nota', 'texto', 260],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // v2.3 (al final)
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['precioTransferencia', 'Precio de transferencia (Gs.)', 'gsopc', 190],
+    ],
+  },
+  peluquerias: {
+    hoja: 'Peluquerías', grupo: 'catalogo', bloque: 'v2.1 + R1.2 + R0.6',
+    descripcion: 'Clientes de la distribuidora (C-xxxx): peluquerías y clientas con crédito.',
+    columnas: COLUMNAS_CLIENTE_,
+  },
+  ventas: {
+    hoja: 'Ventas', grupo: 'registro', bloque: 'v2.1 + R4.1 + R4.4 + R0',
+    descripcion: 'Detalle de productos vendidos (una fila por línea). La cabecera es «Tickets».',
+    columnas: [
+      ['id', 'N° venta', 'texto', 100],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['codigoCliente', 'Código peluquería', 'texto', 130],
+      ['cliente', 'Peluquería', 'texto', 200],
+      ['codigo', 'Código producto', 'texto', 120],
+      ['producto', 'Producto', 'texto', 240],
+      ['cantidad', 'Cantidad', 'entero', 90],
+      ['precio', 'Precio unitario (Gs.)', 'gs', 140],
+      ['subtotal', 'Subtotal (Gs.)', 'gs', 130],
+      ['costoUnitario', 'Costo unitario (Gs.)', 'gs', 140],
+      ['condicion', 'Condición', 'texto', 100],
+      ['estado', 'Estado', 'texto', 100],
+      ['fechaCobro', 'Fecha de cobro', 'fecha', 120],
+      ['nota', 'Nota', 'texto', 240],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // v2.3 (al final)
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['origen', 'Origen', 'texto', 100, { lista: LISTAS.ORIGENES }],
+      ['precioLista', 'Precio de lista (Gs.)', 'gsopc', 140],
+      ['descuento', 'Descuento %', 'decimal', 100],
+      ['iva', 'Tasa IVA', 'texto', 90, { lista: LISTAS.TASAS_IVA }],
+      ['ivaMonto', 'IVA incluido (Gs.)', 'gs', 130],
+      ['linea', 'Línea / centro de costo', 'texto', 200],
+      ['nroCredito', 'N° crédito', 'texto', 110],
+      ['codigoProfesional', 'Código profesional (comisión)', 'texto', 190],
+      ['profesional', 'Profesional (comisión)', 'texto', 170],
+      ['porcentaje', '% Comisión de venta', 'decimal', 140],
+      ['comision', 'Comisión de venta (Gs.)', 'gs', 160],
+      ['liquidado', 'Comisión liquidada el', 'fecha', 150],
+      ['autorizadoPor', 'Autorizado por', 'texto', 210],
+      ['motivoAutorizacion', 'Motivo de autorización', 'texto', 260],
+    ],
+  },
+  personal: {
+    hoja: 'Personal', grupo: 'catalogo', bloque: 'v2.1',
+    descripcion: 'Profesionales del salón y su % de comisión vigente (el historial está en «Historial de porcentajes»).',
+    columnas: [
+      ['codigo', 'Código', 'texto', 80],
+      ['nombre', 'Nombre', 'texto', 200],
+      ['rol', 'Rol', 'texto', 150],
+      ['comision', '% Comisión', 'decimal', 100],
+      ['telefono', 'Teléfono', 'texto', 130],
+      ['activo', 'Activo', 'texto', 70],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+    ],
+  },
+  servicios: {
+    hoja: 'Servicios', grupo: 'catalogo', bloque: 'v2.1 + R4.4 + R5.2',
+    descripcion: 'Catálogo de servicios del salón (Mirian los edita; el sistema nunca pisa sus cambios).',
+    columnas: [
+      ['codigo', 'Código', 'texto', 80],
+      ['nombre', 'Servicio', 'texto', 220],
+      ['precio', 'Precio base (Gs.)', 'gs', 130],
+      ['comision', '% Comisión del servicio', 'decimal', 170],
+      ['activo', 'Activo', 'texto', 70],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+      // v2.3 (al final)
+      ['iva', 'Tasa IVA', 'texto', 90, { lista: LISTAS.TASAS_IVA }],
+      ['linea', 'Línea / centro de costo', 'texto', 220, { lista: LISTAS.LINEAS }],
+      ['duracion', 'Duración (min)', 'entero', 120],
+    ],
+  },
+  realizados: {
+    hoja: 'Servicios realizados', grupo: 'registro', bloque: 'v2.1 + R1.5 + R4.1 + R4.4 + R3',
+    descripcion: 'Detalle de servicios (una fila por servicio, con su profesional y su comisión). La cabecera es «Tickets».',
+    columnas: [
+      ['id', 'N° servicio', 'texto', 100],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['codigoProfesional', 'Código profesional', 'texto', 130],
+      ['profesional', 'Profesional', 'texto', 180],
+      ['codigoServicio', 'Código servicio', 'texto', 120],
+      ['servicio', 'Servicio', 'texto', 200],
+      ['cliente', 'Cliente', 'texto', 170],
+      ['precio', 'Precio cobrado (Gs.)', 'gs', 140],
+      ['porcentaje', '% Comisión', 'decimal', 100],
+      ['comision', 'Comisión (Gs.)', 'gs', 120],
+      ['estado', 'Estado', 'texto', 100],
+      ['liquidado', 'Comisión liquidada el', 'fecha', 150],
+      ['nota', 'Nota', 'texto', 240],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // v2.3 (al final)
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['origen', 'Origen', 'texto', 100, { lista: LISTAS.ORIGENES }],
+      ['precioLista', 'Precio de lista (Gs.)', 'gsopc', 140],
+      ['descuento', 'Descuento %', 'decimal', 100],
+      ['iva', 'Tasa IVA', 'texto', 90, { lista: LISTAS.TASAS_IVA }],
+      ['ivaMonto', 'IVA incluido (Gs.)', 'gs', 130],
+      ['lote', 'Último lote de recálculo', 'texto', 170],
+    ],
+  },
+  usuarios: {
+    // v2.3: se conserva el nombre «Usuarios» (decisión D4: el rol va en una columna nueva al final).
+    hoja: 'Usuarios', grupo: 'sistema', bloque: 'v2.1 + RT.2',
+    descripcion: 'Correos que pueden ingresar y su rol (ADMINISTRADOR / OPERATIVO).',
+    columnas: [
+      ['correo', 'Correo', 'texto', 250],
+      ['activo', 'Activo', 'texto', 70],
+      ['acceso', 'Acceso a la hoja', 'texto', 230],
+      ['alta', 'Primer ingreso', 'fechahora', 150],
+      ['ultimo', 'Último ingreso', 'fechahora', 150],
+      ['ingresos', 'Ingresos', 'entero', 90],
+      // v2.3 (al final)
+      ['rol', 'Rol', 'texto', 140, { lista: LISTAS.ROLES }],
+      ['nombre', 'Nombre', 'texto', 180],
+      ['verificado', 'Último ingreso verificado', 'fechahora', 180],
+      ['metodo', 'Método de ingreso', 'texto', 160],
+      ['notas', 'Notas', 'texto', 280],
+    ],
+  },
+
+  // ───────────── R1 · Clientes (hoja nueva para clientas del salón) ─────────────
+  clientasSalon: {
+    hoja: 'Clientas salón', grupo: 'catalogo', despuesDe: 'peluquerias', bloque: 'R1.2 · R1.5',
+    descripcion: 'Clientas del salón (CS-0001…): mismo contrato de columnas que «Peluquerías»; nadie se duplica entre hojas.',
+    columnas: COLUMNAS_CLIENTE_.map(function (c) { return c[0] === 'nombre' ? ['nombre', 'Nombre', 'texto', 220] : c; }),
+  },
+
+  // ───────────── R2 · Proveedores ─────────────
+  proveedores: {
+    hoja: 'Proveedores', grupo: 'catalogo', despuesDe: 'clientasSalon', bloque: 'R2.1',
+    descripcion: 'Proveedores y su acuerdo vigente. Confidencial: solo administradoras.',
+    columnas: [
+      ['codigo', 'Código', 'texto', 90],
+      ['razonSocial', 'Razón social', 'texto', 220],
+      ['nombre', 'Nombre comercial', 'texto', 200],
+      ['ruc', 'RUC', 'texto', 110],
+      ['contacto', 'Contacto principal', 'texto', 180],
+      ['telefono', 'Teléfono / WhatsApp', 'texto', 150],
+      ['correo', 'Correo', 'texto', 210],
+      ['direccion', 'Dirección', 'texto', 230],
+      ['marcas', 'Marcas o líneas', 'texto', 220],
+      ['descuento', 'Descuento %', 'decimal', 110],
+      ['plazo', 'Plazo de pago (días)', 'entero', 140],
+      ['compraMinima', 'Compra mínima (Gs.)', 'gsopc', 150],
+      ['inicio', 'Fecha de inicio del acuerdo', 'fecha', 170],
+      ['vencimiento', 'Fecha de vencimiento del acuerdo', 'fecha', 200],
+      ['renovacion', 'Renovación automática', 'texto', 160, { lista: LISTAS.SI_NO }],
+      ['diasAviso', 'Días de aviso', 'entero', 110],
+      ['documento', 'Documento del acuerdo', 'texto', 260],
+      ['estado', 'Estado', 'texto', 130, { lista: LISTAS.ESTADOS_PROVEEDOR }],
+      ['activo', 'Activo', 'texto', 70],
+      ['notas', 'Notas', 'texto', 260],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+    ],
+  },
+  acuerdos: {
+    hoja: 'Acuerdos de proveedores', grupo: 'registro', despuesDe: 'proveedores', bloque: 'R2.2',
+    descripcion: 'Historial de vigencias: renovar archiva el acuerdo anterior (nunca se pisa).',
+    columnas: [
+      ['id', 'N° acuerdo', 'texto', 100],
+      ['codigoProveedor', 'Código proveedor', 'texto', 130],
+      ['proveedor', 'Proveedor', 'texto', 200],
+      ['descuento', 'Descuento %', 'decimal', 110],
+      ['plazo', 'Plazo de pago (días)', 'entero', 140],
+      ['compraMinima', 'Compra mínima (Gs.)', 'gsopc', 150],
+      ['inicio', 'Fecha de inicio', 'fecha', 120],
+      ['vencimiento', 'Fecha de vencimiento', 'fecha', 140],
+      ['renovacion', 'Renovación automática', 'texto', 160],
+      ['documento', 'Documento del acuerdo', 'texto', 260],
+      ['estado', 'Estado', 'texto', 120, { lista: ['VIGENTE', 'ARCHIVADO'] }],
+      ['archivado', 'Archivado el', 'fechahora', 150],
+      ['motivo', 'Motivo', 'texto', 260],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+    ],
+  },
+
+  // ───────────── R4 · Ticket (cabecera) y pagos ─────────────
+  tickets: {
+    hoja: 'Tickets', grupo: 'registro', despuesDe: 'ventas', bloque: 'R4.4',
+    descripcion: 'Cabecera de toda venta (productos y servicios). El detalle está en «Ventas» y «Servicios realizados», unido por «N° ticket».',
+    columnas: [
+      ['id', 'N° ticket', 'texto', 100],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 200],
+      ['subtotal', 'Subtotal (Gs.)', 'gs', 130],
+      ['descuento', 'Descuento (Gs.)', 'gs', 130],
+      ['total', 'Total (Gs.)', 'gs', 130],
+      ['gravada10', 'Gravada 10% (Gs.)', 'gs', 140],
+      ['iva10', 'IVA 10% (Gs.)', 'gs', 120],
+      ['gravada5', 'Gravada 5% (Gs.)', 'gs', 140],
+      ['iva5', 'IVA 5% (Gs.)', 'gs', 120],
+      ['exenta', 'Exenta (Gs.)', 'gs', 120],
+      ['condicion', 'Condición', 'texto', 110, { lista: LISTAS.CONDICIONES }],
+      ['estado', 'Estado', 'texto', 110, { lista: LISTAS.ESTADOS_TICKET }],
+      ['tipoComprobante', 'Tipo de comprobante', 'texto', 170, { lista: LISTAS.COMPROBANTES }],
+      ['nroComprobante', 'N° comprobante', 'texto', 150],
+      ['origen', 'Origen', 'texto', 100, { lista: LISTAS.ORIGENES }],
+      ['observacion', 'Observación', 'texto', 300],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // extras v2.3 (al final)
+      ['nroCredito', 'N° crédito', 'texto', 110],
+      ['autorizadoPor', 'Autorizado por', 'texto', 210],
+      ['motivoAutorizacion', 'Motivo de autorización', 'texto', 260],
+      ['motivoAnulacion', 'Motivo de anulación', 'texto', 260],
+      ['entidad', 'Entidad fiscal', 'texto', 160],
+      ['cdc', 'CDC', 'texto', 360],
+      ['kude', 'URL del KuDE', 'texto', 260],
+      ['solicitud', 'Id de solicitud', 'texto', 150],
+    ],
+  },
+  pagosTicket: {
+    hoja: 'Pagos de ticket', grupo: 'registro', despuesDe: 'tickets', bloque: 'R4.4',
+    descripcion: 'Pagos de contado de cada ticket, divididos en varios medios si hace falta.',
+    columnas: [
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['medio', 'Medio de pago', 'texto', 150, { lista: LISTAS.MEDIOS_PAGO }],
+      ['monto', 'Monto (Gs.)', 'gs', 130],
+      ['operacion', 'N° operación', 'texto', 150],
+      ['recibo', 'N° recibo', 'texto', 110],
+      ['anulado', 'Anulado', 'texto', 90, { lista: LISTAS.SI_NO }],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // extras v2.3 (al final)
+      ['unidad', 'Unidad de negocio', 'texto', 150],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 200],
+      ['conciliado', 'Conciliado', 'texto', 100, { lista: LISTAS.SI_NO }],
+      ['fechaConciliacion', 'Fecha conciliación', 'fecha', 140],
+      ['conciliadoPor', 'Conciliado por', 'texto', 210],
+      ['motivoAnulacion', 'Motivo de anulación', 'texto', 260],
+    ],
+  },
+
+  // ───────────── R0 · Cartera de crédito y cobranzas ─────────────
+  creditos: {
+    hoja: 'Créditos', grupo: 'registro', despuesDe: 'pagosTicket', bloque: 'R0',
+    descripcion: 'Un crédito por venta a crédito o saldo migrado. Plan A CONFIRMAR = sin cuotas, sin atraso ni alertas.',
+    columnas: [
+      ['id', 'N° crédito', 'texto', 110],
+      ['venta', 'N° venta', 'texto', 100],
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 200],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['subtotal', 'Subtotal (Gs.)', 'gs', 130],
+      ['recargo', 'Recargo financiero (Gs.)', 'gs', 170],
+      ['total', 'Total (Gs.)', 'gs', 130],
+      ['entrega', 'Entrega pactada (Gs.)', 'gs', 160],
+      ['cuotas', 'N° cuotas', 'entero', 90],
+      ['frecuencia', 'Frecuencia', 'texto', 110, { lista: LISTAS.FRECUENCIAS }],
+      ['primerVto', '1er vencimiento', 'fecha', 120],
+      ['montoCuota', 'Monto cuota (Gs.)', 'gs', 140],
+      ['ultimaCuota', 'Última cuota (Gs.)', 'gs', 140],
+      ['saldo', 'Saldo (automático)', 'gs', 140],
+      ['estadoPlan', 'Estado del plan', 'texto', 130, { lista: LISTAS.ESTADOS_PLAN }],
+      ['estadoCredito', 'Estado del crédito (automático)', 'texto', 210],
+      ['categoria', 'Categoría aplicada', 'texto', 140],
+      ['origen', 'Origen', 'texto', 130, { lista: LISTAS.ORIGENES_CREDITO }],
+      ['legado', 'Código legado', 'texto', 110],
+      ['autorizadoPor', 'Autorizado por', 'texto', 210],
+      ['motivoAutorizacion', 'Motivo de autorización', 'texto', 260],
+      ['observacion', 'Observación', 'texto', 340],
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // extras v2.3 (al final)
+      ['cobrado', 'Cobrado (automático)', 'gs', 150],
+      ['vencido', 'Vencido (automático)', 'gs', 150],
+      ['atraso', 'Días de atraso (automático)', 'entero', 170],
+      ['proximoVto', 'Próximo vencimiento (automático)', 'fecha', 200],
+      ['moraPactada', 'Mora pactada en el plan', 'texto', 170, { lista: LISTAS.SI_NO }],
+      ['planSugerido', 'Plan sugerido', 'texto', 360],
+      ['lectura', 'Lectura (saldo migrado)', 'texto', 160],
+      ['alertas', 'Alertas', 'texto', 360],
+      ['confirmadoPor', 'Plan confirmado por', 'texto', 210],
+      ['confirmadoEl', 'Plan confirmado el', 'fechahora', 160],
+      ['motivoAnulacion', 'Motivo de anulación', 'texto', 260],
+    ],
+  },
+  cuotas: {
+    hoja: 'Cuotas', grupo: 'registro', despuesDe: 'creditos', bloque: 'R0',
+    descripcion: 'Plan de pagos de cada crédito (N° cuota 0 = entrega). Lo pagado sale de «Cobros» en cascada.',
+    columnas: [
+      ['credito', 'N° crédito', 'texto', 110],
+      ['numero', 'N° cuota', 'entero', 80],
+      ['vencimiento', 'Vencimiento', 'fecha', 110],
+      ['monto', 'Monto (Gs.)', 'gs', 130],
+      ['pagado', 'Pagado (Gs.)', 'gs', 130],
+      ['estado', 'Estado', 'texto', 150],
+      // extras v2.3 (al final)
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 200],
+    ],
+  },
+  cobros: {
+    hoja: 'Cobros', grupo: 'registro', despuesDe: 'cuotas', bloque: 'R0',
+    descripcion: 'Cada pago de un crédito (entrega, cuota, cancelación o mora), con recibo u operación y conciliación.',
+    columnas: [
+      ['id', 'N° cobro', 'texto', 110],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['recibo', 'N° recibo', 'texto', 110],
+      ['credito', 'N° crédito', 'texto', 110],
+      ['venta', 'N° venta', 'texto', 100],
+      ['cliente', 'Cliente', 'texto', 200],
+      ['monto', 'Monto (Gs.)', 'gs', 130],
+      ['medio', 'Medio de pago', 'texto', 150, { lista: LISTAS.MEDIOS_PAGO }],
+      ['operacion', 'N° operación', 'texto', 150],
+      ['concepto', 'Concepto', 'texto', 170, { lista: LISTAS.CONCEPTOS_COBRO }],
+      ['conciliado', 'Conciliado', 'texto', 100, { lista: LISTAS.SI_NO }],
+      ['fechaConciliacion', 'Fecha conciliación', 'fecha', 140],
+      ['anulado', 'Anulado', 'texto', 90, { lista: LISTAS.SI_NO }],
+      ['motivoAnulacion', 'Motivo de anulación', 'texto', 260],
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // extras v2.3 (al final)
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['aplicacion', 'Aplicación (automático)', 'texto', 320],
+      ['saldoDespues', 'Saldo después (automático)', 'gs', 180],
+      ['conciliadoPor', 'Conciliado por', 'texto', 210],
+      ['nota', 'Nota', 'texto', 240],
+    ],
+  },
+  cobrosConfirmar: {
+    hoja: 'Cobros a confirmar', grupo: 'registro', despuesDe: 'cobros', bloque: 'R0.8 c',
+    descripcion: 'Pagos mencionados en notas o planillas que todavía no tienen fecha, medio y recibo confirmados. No mueven saldos.',
+    columnas: [
+      ['id', 'N°', 'texto', 90],
+      ['detectado', 'Fecha detectada', 'fechahora', 150],
+      ['credito', 'N° crédito', 'texto', 110],
+      ['venta', 'N° venta', 'texto', 100],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 200],
+      ['monto', 'Monto informado (Gs.)', 'gs', 160],
+      ['fuente', 'Fuente', 'texto', 360],
+      ['estado', 'Estado', 'texto', 120, { lista: LISTAS.ESTADOS_COBRO_CONFIRMAR }],
+      ['cobro', 'N° cobro', 'texto', 110],
+      ['resueltoPor', 'Resuelto por', 'texto', 210],
+      ['resuelto', 'Fecha de resolución', 'fechahora', 160],
+      ['observacion', 'Observación', 'texto', 300],
+    ],
+  },
+  saldos: {
+    hoja: 'Saldos iniciales', grupo: 'registro', despuesDe: 'cobrosConfirmar', bloque: 'R0.8 a',
+    descripcion: 'Copia fiel de SALDOS_INICIALES (corte 25/09/2026) y del cuadro «Saldos a investigar» del xlsx.',
+    columnas: [
+      ['numero', 'N° venta (migración)', 'texto', 150],
+      ['legado', 'Cod clienta', 'texto', 100],
+      ['clienta', 'Clienta', 'texto', 190],
+      ['fechaCorte', 'Fecha de corte', 'fecha', 110],
+      ['saldoHoja', 'Saldo según hoja (Gs.)', 'gsopc', 160],
+      ['saldoConfirmado', 'Saldo confirmado con la clienta (Gs.)', 'gsopc', 230],
+      ['saldoMigrar', 'Saldo a migrar (Gs.)', 'gsopc', 150],
+      ['lectura', 'Lectura', 'texto', 120, { lista: LISTAS.LECTURAS }],
+      ['detalle', 'Detalle en las hojas (lectura a verificar)', 'texto', 440],
+      ['estado', 'Estado', 'texto', 130, { lista: LISTAS.ESTADOS_SALDO }],
+      ['observacion', 'Obs.', 'texto', 320],
+      // extras v2.3 (al final): cuadro «Saldos a investigar» y enlace con el sistema
+      ['tipo', 'Tipo', 'texto', 130, { lista: ['SALDO INICIAL', 'A INVESTIGAR'] }],
+      ['ultimoVisto', 'Último saldo visto (Gs.)', 'gsopc', 170],
+      ['hojaFecha', 'Hoja', 'texto', 110],
+      ['codigoCliente', 'Código cliente (sistema)', 'texto', 170],
+      ['credito', 'N° crédito', 'texto', 110],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+    ],
+  },
+  cierres: {
+    hoja: 'Cierres mensuales', grupo: 'registro', despuesDe: 'saldos', bloque: 'R0.7',
+    descripcion: 'Registro de cada cierre mensual (solo administradoras) con sus cifras al momento del cierre.',
+    columnas: [
+      ['mes', 'Mes', 'texto', 90],
+      ['fecha', 'Fecha de cierre', 'fechahora', 150],
+      ['usuario', 'Responsable', 'texto', 210],
+      ['diferencias', 'Diferencias encontradas', 'texto', 360],
+      ['observaciones', 'Observaciones', 'texto', 320],
+      // extras v2.3 (al final)
+      ['ventasIva', 'Ventas con IVA (Gs.)', 'gs', 160],
+      ['ventaNeta', 'Venta neta sin IVA (Gs.)', 'gs', 170],
+      ['costo', 'Costo de lo vendido (Gs.)', 'gs', 170],
+      ['margen', 'Margen bruto (Gs.)', 'gs', 150],
+      ['margenPct', 'Margen bruto %', 'decimal', 120],
+      ['resultado', 'Resultado (Gs.)', 'gs', 150],
+      ['cartera', 'Cartera total (Gs.)', 'gs', 150],
+      ['vencido', 'Cartera vencida (Gs.)', 'gs', 160],
+      ['cobrado', 'Cobrado en el mes (Gs.)', 'gs', 170],
+      ['efectividad', 'Efectividad de cobranza %', 'decimal', 170],
+      ['servicios', 'Servicios del salón (Gs.)', 'gs', 170],
+      ['asiento', 'Asiento resumen (Debe = Haber)', 'texto', 300],
+    ],
+  },
+
+  // ───────────── R3 · Comisiones ─────────────
+  historialPct: {
+    hoja: 'Historial de porcentajes', grupo: 'catalogo', despuesDe: 'personal', bloque: 'R3.6',
+    descripcion: 'Cada % de comisión con su fecha de vigencia: un cambio se aplica hacia adelante o retroactivo desde una fecha.',
+    columnas: [
+      ['codigoProfesional', 'Código profesional', 'texto', 130],
+      ['profesional', 'Profesional', 'texto', 180],
+      ['codigoServicio', 'Código servicio', 'texto', 130],
+      ['servicio', 'Servicio', 'texto', 200],
+      ['porcentaje', '%', 'decimal', 80],
+      ['desde', 'Vigente desde', 'fechahora', 160],
+      ['aplicacion', 'Aplicación', 'texto', 190, { lista: LISTAS.APLICACION_PCT }],
+      ['fuente', 'Fuente / motivo', 'texto', 320],
+      ['lote', 'N° lote', 'texto', 110],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+    ],
+  },
+  recalculos: {
+    hoja: 'Recálculos de comisiones', grupo: 'registro', despuesDe: 'realizados', bloque: 'R3.5',
+    descripcion: 'Cada recálculo masivo (lote) con sus filtros y totales; un lote se puede revertir.',
+    columnas: [
+      ['id', 'N° lote', 'texto', 100],
+      ['fecha', 'Fecha y hora', 'fechahora', 150],
+      ['usuario', 'Responsable', 'texto', 210],
+      ['filtros', 'Filtros', 'texto', 360],
+      ['base', 'Base del cálculo', 'texto', 200],
+      ['pctAnterior', '% anterior', 'texto', 160],
+      ['pctNuevo', '% nuevo', 'texto', 160],
+      ['registros', 'Registros', 'entero', 90],
+      ['totalAntes', 'Total antes (Gs.)', 'gs', 140],
+      ['totalDespues', 'Total después (Gs.)', 'gs', 150],
+      ['diferencia', 'Diferencia (Gs.)', 'gs', 140],
+      ['estado', 'Estado', 'texto', 120, { lista: ['EN CURSO', 'APLICADO', 'REVERTIDO'] }],
+      ['motivo', 'Motivo', 'texto', 260],
+      ['revertidoPor', 'Revertido por', 'texto', 210],
+      ['revertido', 'Revertido el', 'fechahora', 150],
+      ['solicitud', 'Id de solicitud', 'texto', 150],
+    ],
+  },
+  recalculosDetalle: {
+    hoja: 'Recálculos · detalle', grupo: 'registro', despuesDe: 'recalculos', bloque: 'R3.5',
+    descripcion: 'Valor anterior y nuevo de cada registro tocado por un lote (permite revertir exactamente).',
+    columnas: [
+      ['lote', 'N° lote', 'texto', 100],
+      ['servicio', 'N° servicio', 'texto', 110],
+      ['fechaServicio', 'Fecha del servicio', 'fecha', 130],
+      ['profesional', 'Profesional', 'texto', 170],
+      ['nombreServicio', 'Servicio', 'texto', 200],
+      ['precio', 'Precio (Gs.)', 'gs', 120],
+      ['pctAnterior', '% anterior', 'decimal', 100],
+      ['comisionAnterior', 'Comisión anterior (Gs.)', 'gs', 160],
+      ['pctNuevo', '% nuevo', 'decimal', 90],
+      ['comisionNueva', 'Comisión nueva (Gs.)', 'gs', 150],
+      ['diferencia', 'Diferencia (Gs.)', 'gs', 130],
+      ['tipo', 'Tipo', 'texto', 100, { lista: ['CAMBIO', 'AJUSTE'] }],
+      ['estado', 'Estado', 'texto', 110, { lista: ['APLICADO', 'REVERTIDO'] }],
+    ],
+  },
+  ajustes: {
+    hoja: 'Ajustes de comisiones', grupo: 'registro', despuesDe: 'recalculosDetalle', bloque: 'R3.4',
+    descripcion: 'Diferencias sobre comisiones ya liquidadas: no se modifican, se ajustan en la próxima liquidación.',
+    columnas: [
+      ['id', 'N° ajuste', 'texto', 100],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['lote', 'N° lote', 'texto', 100],
+      ['servicio', 'N° servicio', 'texto', 110],
+      ['codigoProfesional', 'Código profesional', 'texto', 130],
+      ['profesional', 'Profesional', 'texto', 170],
+      ['liquidadoAntes', 'Comisión liquidada (Gs.)', 'gs', 170],
+      ['recalculada', 'Comisión recalculada (Gs.)', 'gs', 180],
+      ['monto', 'Ajuste (Gs.)', 'gs', 120],
+      ['motivo', 'Motivo', 'texto', 260],
+      ['liquidado', 'Liquidado el', 'fecha', 120],
+      ['anulado', 'Anulado', 'texto', 90, { lista: LISTAS.SI_NO }],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+    ],
+  },
+
+  // ───────────── R5 · Agenda ─────────────
+  agenda: {
+    hoja: 'Agenda', grupo: 'registro', despuesDe: 'ajustes', bloque: 'R5.1',
+    descripcion: 'Turnos del salón (uno por fila), sincronizados con el calendario «Agenda Salón MB».',
+    columnas: [
+      ['id', 'N° turno', 'texto', 100],
+      ['fecha', 'Fecha', 'fecha', 100],
+      ['inicio', 'Hora inicio', 'texto', 90],
+      ['duracion', 'Duración (min)', 'entero', 110],
+      ['fin', 'Hora fin (automática)', 'texto', 140],
+      ['profesional', 'Profesional', 'texto', 170],
+      ['puesto', 'Puesto', 'texto', 100],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 190],
+      ['celular', 'Celular', 'texto', 140],
+      ['estado', 'Estado', 'texto', 130, { lista: LISTAS.ESTADOS_AGENDA }],
+      ['sena', 'Seña (Gs.)', 'gsopc', 110],
+      ['medioSena', 'Medio de la seña', 'texto', 150, { lista: LISTAS.MEDIOS_PAGO }],
+      ['refSena', 'Referencia de la seña', 'texto', 160],
+      ['motivo', 'Motivo', 'texto', 220],
+      ['notas', 'Notas', 'texto', 260],
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['eventoId', 'ID del evento de Google Calendar', 'texto', 260],
+      ['sync', 'Estado de sincronización', 'texto', 170],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+      // extras v2.3 (al final)
+      ['codigoProfesional', 'Código profesional', 'texto', 130],
+      ['servicios', 'Servicios (resumen)', 'texto', 260],
+      ['recordatorio', 'Recordatorio enviado el', 'fechahora', 170],
+      ['modificado', 'Última modificación', 'fechahora', 150],
+      ['modificadoPor', 'Modificado por', 'texto', 210],
+    ],
+  },
+  agendaServicios: {
+    hoja: 'Agenda · servicios', grupo: 'registro', despuesDe: 'agenda', bloque: 'R5.1',
+    descripcion: 'Servicios de cada turno (un turno puede tener varios).',
+    columnas: [
+      ['turno', 'N° turno', 'texto', 100],
+      ['codigoServicio', 'Código servicio', 'texto', 120],
+      ['servicio', 'Servicio', 'texto', 220],
+      ['duracion', 'Duración (min)', 'entero', 110],
+      ['precio', 'Precio (Gs.)', 'gs', 120],
+      ['codigoProfesional', 'Código profesional', 'texto', 130],
+      ['profesional', 'Profesional', 'texto', 170],
+    ],
+  },
+  bloqueos: {
+    hoja: 'Bloqueos de agenda', grupo: 'catalogo', despuesDe: 'agendaServicios', bloque: 'R5.1',
+    descripcion: 'Feriados, vacaciones y ausencias: la agenda no acepta turnos en esos horarios.',
+    columnas: [
+      ['id', 'N° bloqueo', 'texto', 100],
+      ['desde', 'Desde', 'fecha', 100],
+      ['hasta', 'Hasta', 'fecha', 100],
+      ['inicio', 'Hora inicio', 'texto', 90],
+      ['fin', 'Hora fin', 'texto', 90],
+      ['profesional', 'Profesional (vacío = todo el salón)', 'texto', 230],
+      ['puesto', 'Puesto', 'texto', 100],
+      ['motivo', 'Motivo', 'texto', 130, { lista: LISTAS.MOTIVOS_BLOQUEO }],
+      ['detalle', 'Detalle', 'texto', 260],
+      ['activo', 'Activo', 'texto', 70],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+    ],
+  },
+
+  // ───────────── Política, fiscal, importación e integraciones ─────────────
+  parametros: {
+    hoja: 'Parámetros de crédito', grupo: 'catalogo', despuesDe: 'usuarios', bloque: 'R0.1',
+    descripcion: 'Política de crédito y precios (rangos P_* del xlsx). Solo administradoras. Nunca hay cifras de política en el código.',
+    columnas: [
+      ['nombre', 'Parámetro', 'texto', 360],
+      ['valor', 'Valor', 'libre', 150],
+      ['unidad', 'Unidad', 'texto', 120],
+      ['fuente', 'Fuente / nota', 'texto', 480],
+      // extras v2.3 (al final)
+      ['clave', 'Clave del sistema', 'texto', 190],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+    ],
+  },
+  categorias: {
+    hoja: 'Categorías de crédito', grupo: 'catalogo', despuesDe: 'parametros', bloque: 'R0.1',
+    descripcion: 'Categorías NUEVA, C, B y A (xlsx PARAMETROS B51:G54).',
+    columnas: [
+      ['nombre', 'Categoría', 'texto', 120],
+      ['limite', 'Límite de saldo (Gs.)', 'gs', 160],
+      ['entrega', 'Entrega mínima (%)', 'decimal', 140],
+      ['cuotas', 'Cuotas máximas', 'entero', 120],
+      ['frecuencia', 'Frecuencia', 'texto', 200],
+      ['criterio', 'Quién entra', 'texto', 420],
+      ['activo', 'Activo', 'texto', 70],
+    ],
+  },
+  entidades: {
+    hoja: 'Entidades fiscales', grupo: 'catalogo', despuesDe: 'categorias', bloque: 'R4.2',
+    descripcion: 'Datos fiscales por unidad de negocio (hoy PENDIENTES: los completa Mirian con su contador).',
+    columnas: [
+      ['unidad', 'Unidad de negocio', 'texto', 150, { lista: LISTAS.UNIDADES }],
+      ['razonSocial', 'Razón social', 'texto', 220],
+      ['ruc', 'RUC', 'texto', 110],
+      ['timbrado', 'Timbrado', 'texto', 120],
+      ['establecimiento', 'Establecimiento', 'texto', 120],
+      ['punto', 'Punto de expedición', 'texto', 140],
+      ['regimen', 'Régimen tributario', 'texto', 200],
+      ['estado', 'Estado', 'texto', 120, { lista: ['PENDIENTE', 'COMPLETO'] }],
+      ['observacion', 'Observación', 'texto', 320],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+      ['usuario', 'Actualizado por', 'texto', 210],
+    ],
+  },
+  importacion: {
+    hoja: 'Importación · Historial', grupo: 'registro', despuesDe: 'entidades', bloque: 'R1.6',
+    descripcion: 'Bandeja de entrada del historial (planilla de la asistente, imágenes): nada pasa a Ventas sin aprobación.',
+    columnas: [
+      ['id', 'N° fila', 'texto', 110],
+      ['lote', 'Lote de importación', 'texto', 150],
+      ['fuente', 'Fuente', 'texto', 200],
+      ['referencia', 'Referencia (archivo o imagen)', 'texto', 260],
+      ['ubicacion', 'Ubicación en la fuente', 'texto', 150],
+      ['original', 'Dato original', 'texto', 360],
+      ['fecha', 'Fecha (normalizada)', 'fecha', 130],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente (normalizado)', 'texto', 200],
+      ['tipoItem', 'Tipo de ítem', 'texto', 110, { lista: ['PRODUCTO', 'SERVICIO'] }],
+      ['codigoItem', 'Código ítem', 'texto', 110],
+      ['item', 'Ítem (normalizado)', 'texto', 220],
+      ['cantidad', 'Cantidad', 'entero', 90],
+      ['monto', 'Monto (Gs.)', 'gsopc', 130],
+      ['condicion', 'Condición', 'texto', 110, { lista: LISTAS.CONDICIONES }],
+      ['confianza', 'Confianza', 'texto', 100, { lista: ['ALTA', 'MEDIA', 'BAJA'] }],
+      ['huella', 'Huella', 'texto', 150],
+      ['estado', 'Estado', 'texto', 120, { lista: LISTAS.ESTADOS_IMPORTACION }],
+      ['motivo', 'Motivo', 'texto', 300],
+      ['ventaHistorica', 'N° venta histórica', 'texto', 150],
+      ['aprobadoPor', 'Aprobado por', 'texto', 210],
+      ['aprobado', 'Fecha de aprobación', 'fechahora', 160],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['registrado', 'Fecha de registro', 'fechahora', 150],
+    ],
+  },
+  sifen: {
+    hoja: 'SIFEN registro', grupo: 'registro', despuesDe: 'importacion', bloque: 'RT.5 · RT.6',
+    descripcion: 'Cada envío a SIFEN (e-Kuatia) por middleware: estado, CDC, N° y KuDE. En SIMULACIÓN no hay N° real.',
+    columnas: [
+      ['id', 'N° registro', 'texto', 110],
+      ['fecha', 'Fecha', 'fechahora', 150],
+      ['ticket', 'N° ticket', 'texto', 100],
+      ['venta', 'N° venta', 'texto', 100],
+      ['unidad', 'Unidad de negocio', 'texto', 150],
+      ['tipo', 'Tipo de documento', 'texto', 160],
+      ['estado', 'Estado', 'texto', 130, { lista: ['PENDIENTE', 'APROBADO', 'ERROR', 'SIMULADO'] }],
+      ['modo', 'Modo', 'texto', 120],
+      ['cdc', 'CDC', 'texto', 390],
+      ['numero', 'N° comprobante', 'texto', 150],
+      ['kude', 'URL del KuDE', 'texto', 300],
+      ['intentos', 'Intentos', 'entero', 80],
+      ['proximo', 'Próximo intento', 'fechahora', 150],
+      ['error', 'Último error', 'texto', 340],
+      ['total', 'Total (Gs.)', 'gs', 130],
+      ['gravada10', 'Gravada 10% (Gs.)', 'gs', 140],
+      ['iva10', 'IVA 10% (Gs.)', 'gs', 120],
+      ['gravada5', 'Gravada 5% (Gs.)', 'gs', 140],
+      ['iva5', 'IVA 5% (Gs.)', 'gs', 120],
+      ['exenta', 'Exenta (Gs.)', 'gs', 120],
+      ['idExterno', 'Id externo', 'texto', 150],
+      ['entidad', 'Entidad fiscal', 'texto', 160],
+      ['envioKude', 'Envío del KuDE', 'texto', 160],
+      ['kudeEnviado', 'KuDE enviado el', 'fechahora', 150],
+      ['canalKude', 'Canal del envío', 'texto', 130],
+      ['usuario', 'Registrado por', 'texto', 210],
+      ['actualizado', 'Última actualización', 'fechahora', 150],
+    ],
+  },
+  whatsapp: {
+    hoja: 'WhatsApp log', grupo: 'registro', despuesDe: 'sifen', bloque: 'RT.7 · R5.6 · RT.6',
+    descripcion: 'Cada mensaje de WhatsApp (cobranza, recordatorio de turno, KuDE): enviado, simulado u omitido.',
+    columnas: [
+      ['fecha', 'Fecha y hora', 'fechahora', 150],
+      ['dia', 'Día', 'fecha', 100],
+      ['tipo', 'Tipo de mensaje', 'texto', 170],
+      ['codigoCliente', 'Código cliente', 'texto', 120],
+      ['cliente', 'Cliente', 'texto', 200],
+      ['whatsapp', 'WhatsApp', 'texto', 140],
+      ['plantilla', 'Plantilla', 'texto', 220],
+      ['variables', 'Variables', 'texto', 300],
+      ['estado', 'Estado', 'texto', 110],
+      ['idMensaje', 'Id del mensaje', 'texto', 260],
+      ['detalle', 'Detalle', 'texto', 340],
+      ['referencia', 'Referencia', 'texto', 170],
+      ['vencido', 'Monto vencido (Gs.)', 'gsopc', 150],
+      ['atraso', 'Días de atraso', 'entero', 110],
+      ['disparadoPor', 'Disparado por', 'texto', 210],
+    ],
+  },
+  alertas: {
+    hoja: 'Alertas enviadas', grupo: 'sistema', despuesDe: 'whatsapp', bloque: 'R2.3 · R6.1',
+    descripcion: 'Registro anti-duplicado de avisos por correo (acuerdos por vencer, fallas de tareas automáticas).',
+    columnas: [
+      ['fecha', 'Fecha y hora', 'fechahora', 150],
+      ['tipo', 'Tipo', 'texto', 190],
+      ['referencia', 'Referencia', 'texto', 150],
+      ['hito', 'Hito', 'texto', 120],
+      ['destinatarios', 'Destinatarios', 'texto', 300],
+      ['canal', 'Canal', 'texto', 110],
+      ['estado', 'Estado', 'texto', 110],
+      ['detalle', 'Detalle', 'texto', 360],
+      ['clave', 'Clave', 'texto', 260],
+    ],
+  },
+  auditoria: {
+    hoja: 'Auditoría', grupo: 'sistema', despuesDe: 'alertas', bloque: 'RT.3',
+    descripcion: 'Toda escritura: quién (correo verificado), cuándo, función, hoja, registro, campo, antes y después.',
+    columnas: [
+      ['fecha', 'Fecha y hora', 'fechahora', 150],
+      ['usuario', 'Correo verificado', 'texto', 230],
+      ['rol', 'Rol', 'texto', 120],
+      ['operacion', 'Función', 'texto', 180],
+      ['hoja', 'Hoja', 'texto', 160],
+      ['referencia', 'Registro', 'texto', 150],
+      ['campo', 'Campo', 'texto', 200],
+      ['anterior', 'Valor anterior', 'texto', 220],
+      ['nuevo', 'Valor nuevo', 'texto', 220],
+      ['solicitud', 'Id de solicitud', 'texto', 150],
+      ['unidad', 'Unidad de negocio', 'texto', 150],
+      // extras v2.3 (al final)
+      ['accion', 'Acción', 'texto', 110],
+      ['detalle', 'Detalle', 'texto', 340],
+      ['metodo', 'Método de ingreso', 'texto', 140],
+    ],
+  },
+  instalacion: {
+    hoja: 'Estado de instalación', grupo: 'sistema', despuesDe: 'auditoria', bloque: 'R6.1',
+    descripcion: 'Informe legible OK / FALLO / AVISO de cada instalación, diagnóstico y prueba.',
+    columnas: [
+      ['fecha', 'Fecha y hora', 'fechahora', 150],
+      ['corrida', 'Corrida', 'texto', 160],
+      ['paso', 'Paso', 'texto', 260],
+      ['recurso', 'Recurso', 'texto', 220],
+      ['resultado', 'Resultado', 'texto', 100],
+      ['detalle', 'Detalle', 'texto', 480],
+      ['accion', 'Acción requerida', 'texto', 380],
+      ['version', 'Versión', 'texto', 80],
+      ['usuario', 'Ejecutado por', 'texto', 210],
+    ],
+  },
+};
+
+/** Hojas que no se auditan fila por fila (son registros técnicos o el propio rastro). */
+const HOJAS_SIN_AUDITORIA = ['Auditoría', 'Estado de instalación', 'WhatsApp log', 'Alertas enviadas', 'Recálculos · detalle'];
+
+// ─────────────────────────── 2. Aplicación web ───────────────────────────
+
+/**
+ * v2.3: la página se arma como plantilla (createTemplateFromFile) para incluir los parciales UI_* e inyectar
+ * el «arranque» del ingreso: enlace de MB Acceso, sesión recién verificada por Google (?acceso=…) o el error.
+ * ?page=health abre el panel «Sistema › Salud» (solo administradoras, tras ingresar).
+ */
+function doGet(e) {
+  const p = e && e.parameter ? e.parameter : {};
+  const t = HtmlService.createTemplateFromFile('Index');
+  const pagina = String(p.page || '');
+  t.pagina = /^[a-z]{1,20}$/.test(pagina) ? pagina : '';
+  t.version = CONFIG.VERSION;
+  t.arranque = jsonParaHtml_(arranqueIngreso_(p));
+  return t.evaluate()
+    .setTitle('Distribuidora MB · Gestión')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/**
+ * Datos de arranque de la página (nunca lanza). Con ?acceso=<token de MB Acceso> canjea el token por una sesión.
+ * Devuelve { enlaceAcceso, codigoPorCorreo, sesion: { token, email, recordado } | null, error }.
+ */
+function arranqueIngreso_(p) {
+  const r = { enlaceAcceso: '', codigoPorCorreo: false, sesion: null, error: '', url: CONFIG.URL_APP };
+  try {
+    const cfg = configuracionIngreso_();
+    r.enlaceAcceso = cfg.enlaceAcceso;
+    r.codigoPorCorreo = cfg.codigoPorCorreo;
+    if (p && p.acceso) {
+      const s = canjearTokenGoogle_(String(p.acceso), String(p.r || '') === '1', String(p.desde || ''));
+      r.sesion = { token: s.token, email: s.email, recordado: s.recordado };
+      r.enlaceAcceso = configuracionIngreso_().enlaceAcceso;
+    }
+  } catch (err) {
+    r.error = err && err.esUsuario ? err.message : 'No se pudo verificar el ingreso con Google. Intente nuevamente.';
+    if (!(err && err.esUsuario)) console.error('arranqueIngreso_: ' + (err && err.stack ? err.stack : err));
+  }
+  return r;
+}
+
+/** JSON seguro para incrustar dentro de <script> (sin «</script>» ni comentarios HTML). */
+function jsonParaHtml_(obj) {
+  return JSON.stringify(obj).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
+/**
+ * Inserta el contenido de otro archivo HTML del proyecto (Index.html: <?!= incluir_('UI_Cartera') ?>).
+ * Si el parcial todavía no existe (fase no instalada), devuelve '' y la app sigue funcionando.
+ */
+function incluir_(nombre) {
+  try {
+    return HtmlService.createHtmlOutputFromFile(nombre).getContent();
+  } catch (e) {
+    return '<!-- ' + String(nombre).replace(/[^A-Za-z0-9_]/g, '') + ': todavía no instalado -->';
+  }
+}
+
+// ─────────────────────── 3. API (llamada desde Index.html) ───────────────────────
+// Todas reciben un único objeto: { token, mes: 'AAAA-MM', idSolicitud, datos, cliente: '2.3' }.
+// v2.3: la identidad sale SIEMPRE del token de sesión emitido por el servidor tras verificar a la persona con
+// Google («MB Acceso») o, si está habilitado, con un código por correo. Ningún correo escrito autoriza nada.
+
+/**
+ * Entrada a la app con una sesión ya emitida (token). Sin token válido responde [SESION] y la página muestra
+ * «Ingresar con Google». Con «Ingreso con código por correo» = Sí también acepta { email } y envía el código.
+ * Una página vieja (v2.1, sin «cliente») recibe [SESION] y se le pide recargar.
+ */
+function iniciarSesion(req) {
+  return ejecutar_('iniciarSesion', req, 'publico', function (ctx, solicitud) {
+    if (!solicitud || solicitud.cliente !== CONFIG.VERSION) {
+      throw errorUsuario_(PREFIJO_SESION + 'La aplicación se actualizó a la versión ' + CONFIG.VERSION + '. Recargue la página (tecla F5 o deslizar hacia abajo) e ingrese con Google.');
+    }
+    const r = conBloqueo_(function () {
+      const base = obtenerOCrearHoja_();
+      if (base.creada) prepararHojaNueva_(base.ss);
+      return base;
+    });
+    const ss = r.ss;
+    const tz = zonaHoraria_(ss);
+    const sesion = ctx.token ? leerSesion_(ctx.token) : null;
+    if (sesion) {
+      const acceso = evaluarAccesoCorreo_(ss, sesion.e, tz);
+      return completarIngreso_(ss, tz, sesion.e, ctx.token, sesion, ctx.mes, r, acceso);
+    }
+    if (solicitud.email && codigoPorCorreoHabilitado_()) {
+      const email = normalizarCorreo_(solicitud.email, false);
+      const acceso = evaluarAccesoCorreo_(ss, email, tz);
+      return solicitarCodigoAcceso_(ss, tz, email, acceso);
+    }
+    throw errorUsuario_(PREFIJO_SESION + 'Ingrese con el botón «Ingresar con Google».');
+  });
+}
+
+/** Respaldo (solo si «Ingreso con código por correo» = Sí): valida el código recibido por correo y abre la sesión. */
+function verificarCodigo(req) {
+  return ejecutar_('verificarCodigo', req, 'publico', function (ctx, solicitud) {
+    if (!codigoPorCorreoHabilitado_()) throw errorUsuario_(PREFIJO_SESION + 'El ingreso con código está desactivado. Ingrese con Google.');
+    const email = normalizarCorreo_(solicitud.email, false);
+    const ss = abrirHoja_();
+    const tz = zonaHoraria_(ss);
+    const acceso = evaluarAccesoCorreo_(ss, email, tz);
+    comprobarCodigoAcceso_(ss, tz, email, solicitud.codigo);
+    const nueva = crearSesion_(email, solicitud.recordar === true || solicitud.recordar === 'true', 'CÓDIGO');
+    return completarIngreso_(ss, tz, email, nueva.token, nueva.sesion, ctx.mes, { creada: false, avisos: [] }, acceso);
+  });
+}
+
+/** Cierra la sesión de este dispositivo (revoca su token en el servidor). */
+function cerrarSesion(req) {
+  return ejecutar_('cerrarSesion', req, 'publico', function (ctx) {
+    const s = ctx.token ? leerSesion_(ctx.token) : null;
+    if (s) {
+      revocarSesion_(ctx.token);
+      try {
+        const ss = abrirHoja_();
+        conBloqueo_(function () { auditarEvento_(ss, s.e, '', 'Salida', 'Sesión cerrada por la usuaria en este dispositivo.', '', '', '', s.m || ''); });
+      } catch (e) { console.warn('Auditoría de salida no registrada: ' + e); }
+    }
+    return { ok: true };
+  });
+}
+
+/** Recarga todos los datos para el mes indicado (filtrados según el rol). */
+function obtenerDatos(req) {
+  return ejecutar_('obtenerDatos', req, 'lectura', function (ctx) {
+    return { ok: true, datos: construirDatos_(ctx.ss, ctx.mes, ctx.tz, ctx.usuario) };
+  });
+}
+
+function guardarProducto(req) { return ejecutar_('guardarProducto', req, 'escritura', guardarProducto_); }
+function registrarMovimiento(req) { return ejecutar_('registrarMovimiento', req, 'escritura', registrarMovimiento_); }
+function guardarPeluqueria(req) { return ejecutar_('guardarPeluqueria', req, 'escritura', guardarPeluqueria_); }
+function registrarVenta(req) { return ejecutar_('registrarVenta', req, 'escritura', registrarVenta_); }
+function cambiarEstadoVenta(req) { return ejecutar_('cambiarEstadoVenta', req, 'escritura', cambiarEstadoVenta_); }
+function guardarProfesional(req) { return ejecutar_('guardarProfesional', req, 'escritura', guardarProfesional_); }
+function guardarServicio(req) { return ejecutar_('guardarServicio', req, 'escritura', guardarServicio_); }
+function registrarServicio(req) { return ejecutar_('registrarServicio', req, 'escritura', registrarServicio_); }
+function anularServicio(req) { return ejecutar_('anularServicio', req, 'escritura', anularServicio_); }
+function liquidarComisiones(req) { return ejecutar_('liquidarComisiones', req, 'escritura', liquidarComisiones_); }
+
+// ─────────────────────── 4. Ejecución segura (bloqueo, sesión, rol, idempotencia, auditoría) ───────────────────────
+
+/**
+ * Envoltorio de TODA llamada desde el navegador.
+ *  - 'publico': solo el ingreso (iniciarSesion, verificarCodigo, cerrarSesion).
+ *  - 'lectura' / 'escritura': exige sesión válida (token), resuelve el rol y verifica PERMISOS[nombre]
+ *    en el servidor. Las escrituras van con bloqueo (30 s), idempotencia por idSolicitud, guardado inmediato
+ *    (flush) y auditoría con correo verificado, rol, función, idSolicitud y unidad de negocio.
+ *  - v2.3: a una OPERATIVA nunca le llega un campo sensible (costos, márgenes, condiciones de proveedores…):
+ *    además de la lista blanca de cada respuesta, se filtra todo el resultado (segunda barrera).
+ */
+function ejecutar_(nombre, req, modo, fn) {
+  try {
+    req = (req && typeof req === 'object') ? req : {};
+    reiniciarMemoriaEjecucion_();
+    const ctx = {
+      mes: normalizarMes_(req.mes),
+      datos: (req.datos && typeof req.datos === 'object') ? req.datos : {},
+      token: String(req.token || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 200),
+      idSolicitud: String(req.idSolicitud || ''),
+    };
+    if (modo === 'publico') return fn(ctx, req);
+
+    ctx.ss = abrirHoja_();
+    ctx.tz = zonaHoraria_(ctx.ss);
+    ctx.usuario = usuarioDeSesion_(ctx.ss, ctx.token, ctx.tz); // lanza [SESION] si no hay sesión válida
+    ctx.email = ctx.usuario.email;
+    ctx.unidad = unidadSolicitud_(ctx.datos);
+    verificarPermiso_(nombre, ctx.usuario);
+    const operativa = !esAdministradora_(ctx.usuario);
+    if (modo === 'lectura') {
+      const r = fn(ctx);
+      return operativa ? filtrarSensibles_(r, 0) : r;
+    }
+
+    const resultado = conBloqueo_(function () {
+      return conIdempotencia_(nombre, ctx, function () {
+        iniciarAuditoria_(ctx.usuario, nombre, ctx.idSolicitud, ctx.unidad);
+        let r;
+        try {
+          r = fn(ctx);
+        } catch (e) {
+          volcarAuditoria_(ctx.ss, ctx.tz, e && e.esUsuario ? '' : ('Operación incompleta: ' + (e && e.message ? e.message : e)));
+          throw e;
+        }
+        volcarAuditoria_(ctx.ss, ctx.tz, '');
+        return r;
+      });
+    });
+    return operativa ? filtrarSensibles_(resultado, 0) : resultado;
+  } catch (e) {
+    throw aErrorCliente_(e, nombre);
+  }
+}
+
+/** Unidad de negocio declarada en la solicitud (DISTRIBUIDORA / SALÓN); vacía si no corresponde. */
+function unidadSolicitud_(datos) {
+  try { return unidadValida_(datos && datos.unidad, ''); } catch (e) { return ''; }
+}
+
+/**
+ * Idempotencia: si la misma solicitud (idSolicitud + operación + datos + usuario) ya se procesó en las
+ * últimas 6 horas, devuelve el resultado guardado marcado como «repetida» y no vuelve a escribir.
+ */
+function conIdempotencia_(nombre, ctx, fn) {
+  const cache = CacheService.getScriptCache();
+  const clave = claveIdempotencia_(ctx.idSolicitud, nombre + '|' + (ctx.email || ''), ctx.datos);
+  if (clave) {
+    const previo = cache.get(clave);
+    if (previo) {
+      const repetido = JSON.parse(previo);
+      repetido.repetida = true;
+      repetido.datos = ctx.ss ? construirDatos_(ctx.ss, ctx.mes, ctx.tz, ctx.usuario) : null;
+      return repetido;
+    }
+  }
+  let resultado = fn();
+  if (typeof resultado === 'string') resultado = { mensaje: resultado };
+  resultado.ok = true;
+  SpreadsheetApp.flush();
+  if (clave) {
+    try { cache.put(clave, JSON.stringify(resultado), 21600); } catch (e) { console.warn('Idempotencia sin caché: ' + e); }
+  }
+  if (ctx.ss) resultado.datos = construirDatos_(ctx.ss, ctx.mes, ctx.tz, ctx.usuario);
+  return resultado;
+}
+
+let bloqueoTomado_ = false;
+function conBloqueo_(fn) {
+  if (bloqueoTomado_) return fn(); // v2.2: reentrante dentro de la misma ejecución (evita bloqueos anidados)
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    throw errorUsuario_('El sistema está guardando otra operación. Espere unos segundos e intente nuevamente.');
+  }
+  bloqueoTomado_ = true;
+  try {
+    return fn();
+  } finally {
+    bloqueoTomado_ = false;
+    lock.releaseLock();
+  }
+}
+
+function claveIdempotencia_(id, nombre, datos) {
+  const limpio = String(id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60);
+  if (!limpio) return '';
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, nombre + '|' + JSON.stringify(datos));
+  let huella = '';
+  for (let i = 0; i < bytes.length; i++) huella += ('0' + (bytes[i] & 0xff).toString(16)).slice(-2);
+  return 'mb_' + limpio + '_' + huella;
+}
+
+function errorUsuario_(mensaje) {
+  const e = new Error(mensaje);
+  e.esUsuario = true;
+  return e;
+}
+
+function aErrorCliente_(e, nombre) {
+  if (e && e.esUsuario) return new Error(e.message);
+  console.error('[' + nombre + '] ' + (e && e.stack ? e.stack : e));
+  const detalle = e && e.message ? e.message : String(e);
+  if (/permission|permiso|authoriz|autoriz/i.test(detalle)) {
+    return new Error('Faltan permisos de Google. Quien instaló el sistema debe abrir el proyecto en script.google.com, ' +
+      'elegir la función «autorizar», pulsar «Ejecutar» y aceptar todos los permisos («Seleccionar todo»).');
+  }
+  return new Error('No se pudo completar la operación. Intente nuevamente en unos segundos. Detalle técnico: ' + detalle);
+}
+
+// v2.3: la identidad sale de usuarioDeSesion_ (Seguridad.gs); «verificarUsuario_» (confiaba en el correo escrito) ya no existe.
+
+let propietarioCache_ = null;
+function correoPropietario_() {
+  if (propietarioCache_ === null) {
+    try {
+      propietarioCache_ = String(Session.getEffectiveUser().getEmail() || '').toLowerCase();
+    } catch (e) {
+      propietarioCache_ = '';
+    }
+  }
+  return propietarioCache_;
+}
+
+/** v2.2: administradora fija (lista en CONFIG.ADMINS_FIJOS) o cuenta propietaria del proyecto. */
+function esPrivilegiado_(email) {
+  return esAdminFijo_(email);
+}
+
+// ─────────────────────── 5. Hoja de cálculo: creación, recuperación y permisos ───────────────────────
+
+function obtenerOCrearHoja_() {
+  if (MODO_PRUEBA_ && MODO_PRUEBA_.libro) return { ss: MODO_PRUEBA_.libro, creada: false, avisos: [] };
+  const props = PropertiesService.getScriptProperties();
+  const avisos = [];
+  const idGuardado = props.getProperty(CONFIG.CLAVE_ID_HOJA);
+  let archivo = null;
+
+  if (idGuardado) {
+    try {
+      archivo = DriveApp.getFileById(idGuardado);
+      if (archivo.isTrashed()) {
+        archivo.setTrashed(false);
+        avisos.push('La hoja de cálculo estaba en la papelera de Google Drive y se restauró automáticamente.');
+      }
+    } catch (e) {
+      archivo = null; // Eliminada definitivamente o sin acceso.
+    }
+  }
+  if (!archivo) archivo = buscarHojaPorNombre_();
+
+  let ss;
+  let creada = false;
+  if (archivo) {
+    ss = SpreadsheetApp.openById(archivo.getId());
+  } else {
+    ss = SpreadsheetApp.create(CONFIG.NOMBRE_HOJA);
+    creada = true;
+    if (idGuardado) avisos.push('No se encontró la hoja anterior (fue eliminada definitivamente). Se creó una hoja nueva.');
+  }
+  props.setProperty(CONFIG.CLAVE_ID_HOJA, ss.getId());
+  return { ss: ss, creada: creada, avisos: avisos };
+}
+
+/** Si el ID se perdió (por ejemplo, al copiar el proyecto), reutiliza la hoja existente del propietario. */
+function buscarHojaPorNombre_() {
+  const yo = correoPropietario_();
+  let elegido = null;
+  try {
+    const it = DriveApp.getFilesByName(CONFIG.NOMBRE_HOJA);
+    while (it.hasNext()) {
+      const f = it.next();
+      try {
+        if (f.isTrashed() || f.getMimeType() !== MimeType.GOOGLE_SHEETS) continue;
+        const dueno = f.getOwner();
+        if (yo && dueno && String(dueno.getEmail()).toLowerCase() !== yo) continue;
+        if (!elegido || f.getLastUpdated() > elegido.getLastUpdated()) elegido = f;
+      } catch (e) { /* se ignora ese archivo */ }
+    }
+  } catch (e) { /* sin resultados */ }
+  return elegido;
+}
+
+function abrirHoja_() {
+  if (MODO_PRUEBA_ && MODO_PRUEBA_.libro) return MODO_PRUEBA_.libro; // testSistema(): copia temporal, nunca el libro vivo
+  const id = PropertiesService.getScriptProperties().getProperty(CONFIG.CLAVE_ID_HOJA);
+  if (!id) throw errorUsuario_(PREFIJO_SESION + 'El sistema necesita prepararse. La cuenta propietaria debe ejecutar «instalarActualizacionMB».');
+  try {
+    return SpreadsheetApp.openById(id);
+  } catch (e) {
+    throw errorUsuario_(PREFIJO_SESION + 'No se pudo abrir la hoja de cálculo. Avise a la administración (puede estar en la papelera de Drive).');
+  }
+}
+
+function zonaHoraria_(ss) {
+  try {
+    return ss.getSpreadsheetTimeZone() || CONFIG.ZONA_HORARIA;
+  } catch (e) {
+    return CONFIG.ZONA_HORARIA;
+  }
+}
+
+/**
+ * Comparte la hoja con EDICIÓN SOLO a administradoras, sin correo de invitación (servicio avanzado de Drive).
+ * v2.3: ya NO se llama al ingresar (antes compartía el libro con cada correo que entraba). Devuelve
+ * { correo: 'Propietario' | 'Editor' | 'Error: …' }.
+ */
+function asegurarAcceso_(ss, correos) {
+  const resultado = {};
+  const archivo = DriveApp.getFileById(ss.getId());
+  let dueno = '';
+  try {
+    const d = archivo.getOwner();
+    dueno = d ? String(d.getEmail()).toLowerCase() : '';
+  } catch (e) { /* sin dato */ }
+  correos.forEach(function (correo) {
+    correo = String(correo || '').toLowerCase().trim();
+    if (!correo) return;
+    if (correo === dueno || correo === correoPropietario_()) { resultado[correo] = 'Propietario'; return; }
+    const u = usuarioPorCorreo_(ss, correo);
+    if (u.rol !== ROLES.ADMIN || !u.activo) { resultado[correo] = 'Error: solo se comparte con administradoras activas.'; return; }
+    const r = compartirSinAviso_(ss.getId(), correo, 'writer');
+    resultado[correo] = r === 'OK' || r === 'YA TENÍA' ? 'Editor' : 'Error: ' + r.replace(/^ERROR: /, '');
+  });
+  return resultado;
+}
+
+function registrarIngreso_(tabla, existente, email, acceso, tz, extra) {
+  const ahora = new Date();
+  extra = extra || {};
+  if (existente) {
+    const cambios = {
+      ultimo: ahora,
+      ingresos: (existente.ingresos || 0) + 1,
+      acceso: acceso || existente.acceso,
+    };
+    if (extra.verificado) cambios.verificado = ahora;
+    if (extra.metodo) cambios.metodo = extra.metodo;
+    if (extra.rol && !existente.rol) cambios.rol = extra.rol;
+    actualizarCeldas_(tabla, existente._fila, cambios, tz);
+  } else {
+    agregarFilas_(tabla, [{
+      correo: email, activo: 'Sí', acceso: acceso || '', alta: ahora, ultimo: ahora, ingresos: 1,
+      rol: extra.rol || ROLES.OPERATIVO, verificado: extra.verificado ? ahora : '', metodo: extra.metodo || '', notas: extra.notas || '',
+    }], tz);
+  }
+}
+
+/** v2.3 (R6.3): si falta la pestaña, la fila o el valor, el registro queda CERRADO (la v2.1 lo dejaba abierto). */
+function registroAbierto_(ss) {
+  const hoja = ss.getSheetByName(HOJA_CONFIG);
+  if (!hoja || hoja.getLastRow() < 2) return false;
+  const valores = hoja.getRange(1, 1, hoja.getLastRow(), 2).getValues();
+  for (let i = 0; i < valores.length; i++) {
+    if (String(valores[i][0]).trim() === PARAM_REGISTRO) {
+      return /^abierto\b/i.test(String(valores[i][1]).trim());
+    }
+  }
+  return false;
+}
+
+// ─────────────────────── 6. Estructura y formato de la hoja ───────────────────────
+
+function prepararHojaNueva_(ss) {
+  try { ss.setSpreadsheetTimeZone(CONFIG.ZONA_HORARIA); } catch (e) { console.warn('Zona horaria no aplicada: ' + e); }
+  try { ss.setSpreadsheetLocale('es'); } catch (e) { console.warn('Configuración regional no aplicada: ' + e); }
+  const primera = ss.getSheets()[0];
+  primera.setName(HOJA_LEAME);
+  escribirLeame_(primera, ss);
+}
+
+/**
+ * Crea las hojas que falten y repara títulos ausentes (columnas nuevas SOLO al final). Es seguro ejecutarla
+ * siempre: no renombra ni borra hojas, títulos ni datos. Ubica cada hoja nueva junto a su referencia
+ * («despuesDe») y agrega las filas nuevas de «Configuración». Devuelve los nombres de las hojas creadas.
+ */
+function asegurarEstructura_(ss) {
+  const existentes = {};
+  ss.getSheets().forEach(function (h) { existentes[h.getName()] = h; });
+  if (!existentes[HOJA_LEAME]) escribirLeame_(ss.insertSheet(HOJA_LEAME, 0), ss);
+  const creadas = [];
+  Object.keys(ESQUEMA).forEach(function (clave) {
+    const def = ESQUEMA[clave];
+    let hoja = existentes[def.hoja];
+    if (!hoja) {
+      hoja = ss.insertSheet(def.hoja, posicionNuevaHoja_(ss, def));
+      formatearHoja_(hoja, def);
+      existentes[def.hoja] = hoja;
+      creadas.push(def.hoja);
+    } else {
+      repararEncabezados_(hoja, def);
+    }
+  });
+  if (!existentes[HOJA_CONFIG]) crearConfiguracion_(ss.insertSheet(HOJA_CONFIG, ss.getSheets().length));
+  asegurarFilasConfiguracion_(ss);
+  return creadas;
+}
+
+/**
+ * Índice (base 0) para insertar una hoja nueva justo después de su hoja de referencia (def.despuesDe).
+ * Si la referencia aún no existe, sigue la cadena de referencias hasta encontrar una.
+ */
+function posicionNuevaHoja_(ss, def) {
+  let actual = def;
+  for (let i = 0; i < 30 && actual && actual.despuesDe && ESQUEMA[actual.despuesDe]; i++) {
+    const ref = ss.getSheetByName(ESQUEMA[actual.despuesDe].hoja);
+    if (ref) return ref.getIndex();
+    actual = ESQUEMA[actual.despuesDe];
+  }
+  return ss.getSheets().length;
+}
+
+function formatearHoja_(hoja, def) {
+  if (hoja.getMaxRows() > 300 && hoja.getLastRow() <= 1) hoja.deleteRows(301, hoja.getMaxRows() - 300); // hojas nuevas livianas
+  escribirEncabezados_(hoja, def.columnas, 1);
+  hoja.setFrozenRows(1);
+  hoja.setRowHeight(1, 34);
+  hoja.setTabColor(COLORES[def.grupo] || COLORES.sistema);
+  const n = def.columnas.length;
+  const proteccion = def.grupo === 'catalogo' ? hoja.getRange(1, 1, 1, n).protect() : hoja.protect();
+  proteccion.setDescription(def.grupo === 'catalogo'
+    ? 'Títulos del sistema: no los modifique.'
+    : 'Registro gestionado por la aplicación. Para corregir, use «Anular» en la aplicación.');
+  proteccion.setWarningOnly(true);
+}
+
+/**
+ * Escribe títulos, anchos, formatos y (v2.3) validaciones de lista con AVISO: lo ya cargado que no esté en la
+ * lista queda marcado, pero no se rechaza ni se pierde.
+ */
+function escribirEncabezados_(hoja, columnas, desde) {
+  const hasta = desde + columnas.length - 1;
+  if (hoja.getMaxColumns() < hasta) hoja.insertColumnsAfter(hoja.getMaxColumns(), hasta - hoja.getMaxColumns());
+  if (hoja.getMaxRows() < 2) hoja.insertRowsAfter(hoja.getMaxRows(), 200);
+  hoja.getRange(1, desde, 1, columnas.length).setValues([columnas.map(function (c) { return c[1]; })]);
+  estiloEncabezado_(hoja.getRange(1, desde, 1, columnas.length));
+  const filas = hoja.getMaxRows() - 1;
+  columnas.forEach(function (c, i) {
+    hoja.setColumnWidth(desde + i, c[3] || 120);
+    const rango = hoja.getRange(2, desde + i, filas, 1);
+    if (FORMATOS[c[2]]) rango.setNumberFormat(FORMATOS[c[2]]);
+    if (c[2] === 'texto' && /hora/i.test(c[1]) && !/fecha/i.test(c[1])) rango.setNumberFormat('@');
+    const lista = c[0] === 'activo' ? LISTAS.SI_NO : (c[4] && c[4].lista ? c[4].lista : null);
+    if (lista) rango.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(lista, true).setAllowInvalid(true).build());
+  });
+}
+
+function repararEncabezados_(hoja, def) {
+  const ultima = hoja.getLastColumn();
+  const actuales = ultima > 0
+    ? hoja.getRange(1, 1, 1, ultima).getValues()[0].map(function (v) { return String(v).trim(); })
+    : [];
+  const vacia = actuales.every(function (v) { return v === ''; }) && hoja.getLastRow() <= 1;
+  if (vacia) {
+    formatearHoja_(hoja, def);
+    return;
+  }
+  const alFinal = [];
+  def.columnas.forEach(function (c, i) {
+    if (actuales.indexOf(c[1]) >= 0) return;
+    if (i < actuales.length && actuales[i] === '' && i < ultima) {
+      // El título se borró pero la columna sigue en su lugar original: se restaura ahí y los datos se conservan.
+      hoja.getRange(1, i + 1).setValue(c[1]);
+      estiloEncabezado_(hoja.getRange(1, i + 1));
+      actuales[i] = c[1];
+    } else {
+      alFinal.push(c);
+    }
+  });
+  if (alFinal.length) escribirEncabezados_(hoja, alFinal, ultima + 1);
+}
+
+function estiloEncabezado_(rango) {
+  rango.setFontWeight('bold')
+    .setFontColor(COLORES.textoEncabezado)
+    .setBackground(COLORES.encabezado)
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+}
+
+function reglaLista_(valores) {
+  return SpreadsheetApp.newDataValidation().requireValueInList(valores, true).setAllowInvalid(false).build();
+}
+
+/** Léame: instrucciones y el índice de hojas (lo reescribe la instalación; no tiene datos de negocio). */
+function escribirLeame_(hoja, ss) {
+  const tz = zonaHoraria_(ss);
+  const lineas = [
+    ['DISTRIBUIDORA MB · Sistema de Inventario y Gestión · versión ' + CONFIG.VERSION],
+    [''],
+    ['Esta hoja de cálculo es la base de datos del sistema (actualizada el ' + Utilities.formatDate(new Date(), tz, 'dd/MM/yyyy') + ').'],
+    ['• Registre ventas (tickets), créditos, cobros, servicios, turnos, clientes y proveedores desde la aplicación web (el enlace que le compartieron).'],
+    ['• El stock sale de «Movimientos de stock»; lo pagado de cada cuota, de «Cobros»; las comisiones, de «Servicios realizados» y sus ajustes.'],
+    ['• No modifique a mano las hojas de registro ni los títulos de la fila 1. Para corregir, use «Anular» en la aplicación: stock y saldos se recalculan solos.'],
+    ['• Puede agregar columnas propias al final de cualquier hoja: el sistema las respeta.'],
+    ['• Seguridad: se ingresa con «Ingresar con Google» (identidad verificada). Esta hoja contiene costos: solo la ven las administradoras. Roles en «Usuarios».'],
+    ['• Administradoras fijas: ' + CONFIG.ADMINS_FIJOS.join(', ') + '. La política de crédito se edita en «Parámetros de crédito».'],
+    [''],
+    ['HOJAS DEL SISTEMA'],
+  ];
+  Object.keys(ESQUEMA).forEach(function (k) {
+    const d = ESQUEMA[k];
+    lineas.push(['• ' + d.hoja + (d.descripcion ? ': ' + d.descripcion : '')]);
+  });
+  hoja.clearContents();
+  hoja.getRange(1, 1, lineas.length, 1).setValues(lineas);
+  hoja.getRange(1, 1, lineas.length, 1).setWrap(true).setVerticalAlignment('middle');
+  hoja.getRange(1, 1).setFontSize(15).setFontWeight('bold');
+  hoja.getRange(11, 1).setFontWeight('bold');
+  hoja.setColumnWidth(1, 900);
+  hoja.setTabColor(COLORES.sistema);
+  if (!hoja.getProtections(SpreadsheetApp.ProtectionType.SHEET).length) {
+    hoja.protect().setDescription('Instrucciones del sistema').setWarningOnly(true);
+  }
+}
+
+function crearConfiguracion_(hoja) {
+  const filas = [
+    ['Parámetro', 'Valor', 'Descripción'],
+    [PARAM_REGISTRO, 'Cerrado', DESCRIPCION_REGISTRO],
+    ['Correo administrador', CONFIG.CORREO_ADMIN, 'Cuenta propietaria del sistema (definida en el código).'],
+    ['Versión del sistema', celdaTexto_(CONFIG.VERSION), 'Versión instalada.'],
+  ];
+  hoja.getRange(1, 1, filas.length, 3).setValues(filas);
+  estiloEncabezado_(hoja.getRange(1, 1, 1, 3));
+  hoja.setFrozenRows(1);
+  hoja.setRowHeight(1, 34);
+  hoja.setColumnWidth(1, 300);
+  hoja.setColumnWidth(2, 240);
+  hoja.setColumnWidth(3, 620);
+  hoja.getRange(2, 3, filas.length - 1, 1).setWrap(true);
+  hoja.getRange(2, 2).setDataValidation(reglaLista_(['Abierto', 'Cerrado'])).setFontWeight('bold');
+  hoja.setTabColor(COLORES.sistema);
+  hoja.getRange(1, 1, 1, 3).protect().setDescription('Títulos del sistema').setWarningOnly(true);
+}
+
+// ─────────────────────── 7. Lectura y escritura de tablas ───────────────────────
+
+/** Lee una hoja del esquema y devuelve sus filas como objetos (fechas como texto 'AAAA-MM-DD'). */
+function leerTabla_(ss, clave, tz) {
+  const def = ESQUEMA[clave];
+  const hoja = ss.getSheetByName(def.hoja);
+  if (!hoja) {
+    throw errorUsuario_(PREFIJO_SESION + 'Falta la hoja «' + def.hoja + '». Avise a la administración: al ingresar una administradora el sistema la repara.');
+  }
+  const valores = hoja.getDataRange().getValues();
+  const encabezados = (valores[0] || []).map(function (v) { return String(v).trim(); });
+  const idx = {};
+  const tipos = {};
+  def.columnas.forEach(function (c) {
+    const i = encabezados.indexOf(c[1]);
+    if (i < 0) {
+      throw errorUsuario_(PREFIJO_SESION + 'Falta la columna «' + c[1] + '» en la hoja «' + def.hoja + '». Avise a la administración: al ingresar una administradora el sistema la repara.');
+    }
+    idx[c[0]] = i;
+    tipos[c[0]] = c[2];
+  });
+  const filas = [];
+  for (let r = 1; r < valores.length; r++) {
+    const fila = valores[r];
+    if (fila.every(function (v) { return v === '' || v === null; })) continue;
+    const obj = { _fila: r + 1 };
+    def.columnas.forEach(function (c) { obj[c[0]] = deCelda_(fila[idx[c[0]]], c[2], tz); });
+    filas.push(obj);
+  }
+  return { hoja: hoja, def: def, idx: idx, tipos: tipos, ancho: Math.max(encabezados.length, 1), filas: filas };
+}
+
+function agregarFilas_(tabla, objetos, tz) {
+  if (!objetos.length) return;
+  const hoja = tabla.hoja;
+  const claves = Object.keys(tabla.idx);
+  const filas = objetos.map(function (o) {
+    const fila = new Array(tabla.ancho).fill('');
+    claves.forEach(function (k) {
+      if (Object.prototype.hasOwnProperty.call(o, k)) fila[tabla.idx[k]] = aCelda_(o[k], tabla.tipos[k], tz);
+    });
+    return fila;
+  });
+  const inicio = hoja.getLastRow() + 1;
+  const fin = inicio + filas.length - 1;
+  const max = hoja.getMaxRows();
+  if (fin > max) hoja.insertRowsAfter(max, fin - max + 200);
+  hoja.getRange(inicio, 1, filas.length, tabla.ancho).setValues(filas);
+  claves.forEach(function (k) {
+    const formato = FORMATOS[tabla.tipos[k]];
+    if (formato) hoja.getRange(inicio, tabla.idx[k] + 1, filas.length, 1).setNumberFormat(formato);
+  });
+  // v2.2: las filas nuevas quedan también en memoria (para cálculos posteriores de la misma operación) y en la auditoría.
+  if (tabla.filas) {
+    objetos.forEach(function (o, i) {
+      const obj = { _fila: inicio + i };
+      claves.forEach(function (k) { obj[k] = deCelda_(filas[i][tabla.idx[k]], tabla.tipos[k], tz); });
+      tabla.filas.push(obj);
+    });
+  }
+  registrarAltaAuditoria_(tabla, objetos, tz);
+}
+
+function actualizarCeldas_(tabla, fila, cambios, tz) {
+  const enMemoria = tabla.filas ? tabla.filas.find(function (f) { return f._fila === fila; }) : null;
+  Object.keys(cambios).forEach(function (k) {
+    if (tabla.idx[k] === undefined) return;
+    const tipo = tabla.tipos[k];
+    const celda = tabla.hoja.getRange(fila, tabla.idx[k] + 1);
+    const valor = aCelda_(cambios[k], tipo, tz);
+    celda.setValue(valor);
+    if (tipo === 'fecha' || tipo === 'fechahora') celda.setNumberFormat(FORMATOS[tipo]);
+    // v2.2: auditoría (valor anterior → nuevo) y copia en memoria actualizada.
+    if (enMemoria) {
+      const nuevo = deCelda_(valor, tipo, tz);
+      registrarCambioAuditoria_(tabla, enMemoria, k, enMemoria[k], nuevo);
+      enMemoria[k] = nuevo;
+    }
+  });
+}
+
+/**
+ * v2.2: escribe de una sola vez una columna calculada (por ejemplo «Saldo (automático)»).
+ * valores: { númeroDeFila: valor }. Las filas que no figuran conservan su contenido.
+ */
+function escribirColumna_(tabla, clave, valores, tz) {
+  if (tabla.idx[clave] === undefined) return;
+  const ultima = tabla.hoja.getLastRow();
+  if (ultima < 2) return;
+  const rango = tabla.hoja.getRange(2, tabla.idx[clave] + 1, ultima - 1, 1);
+  const actuales = rango.getValues();
+  let cambio = false;
+  for (let r = 2; r <= ultima; r++) {
+    if (!Object.prototype.hasOwnProperty.call(valores, r)) continue;
+    const v = aCelda_(valores[r], tabla.tipos[clave], tz);
+    const previo = actuales[r - 2][0];
+    const igual = (v instanceof Date && previo instanceof Date) ? v.getTime() === previo.getTime()
+      : String(v).replace(/^'/, '') === String(previo);
+    if (!igual) { actuales[r - 2][0] = v; cambio = true; }
+  }
+  if (cambio) rango.setValues(actuales);
+  if (tabla.filas) {
+    tabla.filas.forEach(function (f) {
+      if (Object.prototype.hasOwnProperty.call(valores, f._fila)) f[clave] = deCelda_(aCelda_(valores[f._fila], tabla.tipos[clave], tz), tabla.tipos[clave], tz);
+    });
+  }
+}
+
+/**
+ * v2.3: cambios en muchas filas con una escritura por columna (lotes: migraciones, recálculos, backfills).
+ * cambios: [{ fila, valores: { clave: valor } }]. Audita cada campo que cambia (anterior → nuevo).
+ * Devuelve la cantidad de filas con cambios.
+ */
+function actualizarFilas_(tabla, cambios, tz) {
+  if (!cambios || !cambios.length) return 0;
+  const enMemoria = {};
+  if (tabla.filas) tabla.filas.forEach(function (f) { enMemoria[f._fila] = f; });
+  const porClave = {};
+  let n = 0;
+  cambios.forEach(function (c) {
+    const f = enMemoria[c.fila];
+    let alguno = false;
+    Object.keys(c.valores).forEach(function (k) {
+      if (tabla.idx[k] === undefined) return;
+      const nuevo = deCelda_(aCelda_(c.valores[k], tabla.tipos[k], tz), tabla.tipos[k], tz);
+      if (f && textoAuditoria_(f[k]) === textoAuditoria_(nuevo)) return;
+      if (f) registrarCambioAuditoria_(tabla, f, k, f[k], nuevo);
+      (porClave[k] = porClave[k] || {})[c.fila] = c.valores[k];
+      alguno = true;
+    });
+    if (alguno) n++;
+  });
+  Object.keys(porClave).forEach(function (k) { escribirColumna_(tabla, k, porClave[k], tz); });
+  return n;
+}
+
+function deCelda_(valor, tipo, tz) {
+  switch (tipo) {
+    case 'fecha': return fechaATexto_(valor, tz);
+    case 'fechahora': return fechaHoraATexto_(valor, tz);
+    case 'gs':
+    case 'entero': { const n = entero_(valor); return isNaN(n) ? 0 : n; }
+    case 'decimal': { const n = decimal_(valor); return isNaN(n) ? 0 : n; }
+    case 'gsopc': { // v2.2: vacío se conserva como '' (no es 0)
+      if (valor === '' || valor === null || valor === undefined) return '';
+      const n = entero_(valor);
+      return isNaN(n) ? '' : n;
+    }
+    case 'libre': // v2.2: número o texto tal cual
+      if (valor instanceof Date) return fechaATexto_(valor, tz);
+      if (typeof valor === 'number') return valor;
+      return String(valor === null || valor === undefined ? '' : valor).trim();
+    default:
+      if (valor instanceof Date) return fechaATexto_(valor, tz);
+      return String(valor === null || valor === undefined ? '' : valor).trim();
+  }
+}
+
+function aCelda_(valor, tipo, tz) {
+  if (valor === null || valor === undefined || valor === '') return '';
+  switch (tipo) {
+    case 'fecha': return valor instanceof Date ? valor : textoAFecha_(String(valor), tz);
+    case 'fechahora': return valor instanceof Date ? valor : (/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$/.test(String(valor)) ? textoAFechaHora_(String(valor), tz) : '');
+    case 'gs':
+    case 'entero': return Math.round(Number(valor)) || 0;
+    case 'gsopc': { const n = Math.round(Number(valor)); return isNaN(n) ? '' : n; }
+    case 'decimal': return Number(valor) || 0;
+    case 'libre': return typeof valor === 'number' ? valor : celdaTexto_(String(valor));
+    default: return celdaTexto_(String(valor));
+  }
+}
+
+/** Evita que Sheets convierta texto en número, fecha o fórmula (ej.: "0981…", "+595…", "=…"). */
+function celdaTexto_(s) {
+  s = String(s === null || s === undefined ? '' : s);
+  if (!s) return s;
+  if (/^[=+\-@0-9.,'#$(]/.test(s) || /^(true|false|verdadero|falso)$/i.test(s)) return "'" + s;
+  return s;
+}
+
+/** Escribe el stock calculado en la columna «Stock actual (automático)» de Productos. */
+function escribirStock_(tabla, stock) {
+  if (!tabla.filas.length) return;
+  const porFila = {};
+  let ultima = 2;
+  tabla.filas.forEach(function (p) {
+    porFila[p._fila] = stock[clave_(p.codigo)] || 0;
+    if (p._fila > ultima) ultima = p._fila;
+  });
+  const valores = [];
+  for (let r = 2; r <= ultima; r++) {
+    valores.push([Object.prototype.hasOwnProperty.call(porFila, r) ? porFila[r] : '']);
+  }
+  tabla.hoja.getRange(2, tabla.idx.stock + 1, valores.length, 1).setValues(valores);
+}
+
+function calcularStock_(movimientos) {
+  const stock = {};
+  movimientos.forEach(function (m) {
+    const k = clave_(m.codigo);
+    if (k) stock[k] = (stock[k] || 0) + (Number(m.cantidad) || 0);
+  });
+  return stock;
+}
+
+// ─────────────────────── 8. Operaciones: inventario ───────────────────────
+
+function guardarProducto_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tabla = leerTabla_(ctx.ss, 'productos', tz);
+  const datos = {
+    nombre: requerirTexto_(d.nombre, 'Producto', 120),
+    marca: texto_(d.marca, 60),
+    categoria: texto_(d.categoria, 60),
+    presentacion: texto_(d.presentacion, 40),
+    costo: enteroOpcional_(d.costo, 'Costo unitario', LIMITES.PRECIO_UNITARIO),
+    precio: requerirEntero_(d.precio, 'Precio a peluquerías', 0, LIMITES.PRECIO_UNITARIO),
+    stockMinimo: enteroOpcional_(d.stockMinimo, 'Stock mínimo', LIMITES.CANTIDAD),
+    activo: activoDe_(d.activo),
+    actualizado: new Date(),
+    usuario: ctx.email,
+  };
+  // v2.3: Tasa IVA, Línea y Código proveedor solo se tocan si la pantalla los envía (las pantallas viejas no los borran).
+  if (Object.prototype.hasOwnProperty.call(d, 'iva')) datos.iva = String(d.iva) === '' ? '' : textoTasa_(tasaIva_(d.iva, null));
+  if (Object.prototype.hasOwnProperty.call(d, 'linea')) {
+    const linea = texto_(d.linea, 60).toUpperCase();
+    if (linea && LISTAS.LINEAS.indexOf(linea) < 0) throw errorUsuario_('Línea / centro de costo no válida. Opciones: ' + LISTAS.LINEAS.join(', ') + '.');
+    datos.linea = linea;
+  }
+  if (Object.prototype.hasOwnProperty.call(d, 'proveedor')) {
+    const prov = clave_(d.proveedor);
+    if (prov) {
+      const provs = leerTabla_(ctx.ss, 'proveedores', tz).filas;
+      if (!buscarPorCodigo_(provs, prov)) throw errorUsuario_('El proveedor ' + prov + ' no existe en «Proveedores».');
+    }
+    datos.proveedor = prov;
+  }
+
+  const original = clave_(d.codigoOriginal);
+  let existente = null;
+  if (original) {
+    existente = buscarPorCodigo_(tabla.filas, original);
+    if (!existente) throw errorUsuario_('El producto ' + original + ' no existe. Actualice los datos e intente nuevamente.');
+  }
+  const duplicado = tabla.filas.find(function (p) {
+    return p !== existente && normalizar_(p.nombre) === normalizar_(datos.nombre) && normalizar_(p.marca) === normalizar_(datos.marca);
+  });
+  if (duplicado) {
+    throw errorUsuario_('Ya existe «' + duplicado.nombre + '»' + (duplicado.marca ? ' de ' + duplicado.marca : '') + ' (código ' + duplicado.codigo + ').');
+  }
+
+  if (existente) {
+    actualizarCeldas_(tabla, existente._fila, datos, tz);
+    return { mensaje: 'Producto ' + existente.codigo + ' actualizado.', codigo: existente.codigo };
+  }
+
+  let codigo = clave_(d.codigo);
+  if (codigo) {
+    if (!/^[A-Z0-9][A-Z0-9._\-\/]{0,29}$/.test(codigo)) {
+      throw errorUsuario_('El código solo admite letras, números, guiones, puntos o barras (máximo 30 caracteres).');
+    }
+    if (buscarPorCodigo_(tabla.filas, codigo)) throw errorUsuario_('El código ' + codigo + ' ya está en uso.');
+  } else {
+    codigo = siguienteCodigo_(tabla.filas.map(function (p) { return p.codigo; }), 'P-', 4);
+  }
+  const stockInicial = enteroOpcional_(d.stockInicial, 'Stock inicial', LIMITES.CANTIDAD);
+  datos.codigo = codigo;
+  datos.stock = stockInicial;
+  if (datos.iva === undefined) datos.iva = '10';
+  if (datos.linea === undefined) datos.linea = lineaPropuesta_(datos.categoria, false);
+  agregarFilas_(tabla, [datos], tz);
+
+  if (stockInicial > 0) {
+    const movs = leerTabla_(ctx.ss, 'movimientos', tz);
+    agregarFilas_(movs, [{
+      id: siguienteCodigo_(movs.filas.map(function (m) { return m.id; }), 'M-', 6),
+      fecha: hoy_(tz), tipo: 'Stock inicial', codigo: codigo, producto: datos.nombre,
+      cantidad: stockInicial, costoUnitario: datos.costo, referencia: codigo,
+      nota: 'Alta del producto', usuario: ctx.email, registrado: new Date(), unidad: 'DISTRIBUIDORA',
+    }], tz);
+  }
+  return {
+    mensaje: 'Producto ' + codigo + ' creado' + (stockInicial > 0 ? ' con ' + miles_(stockInicial) + ' unidades en stock.' : '.'),
+    codigo: codigo,
+  };
+}
+
+/**
+ * v2.3 (R4.3): «Uso en salón» es una transferencia interna de la distribuidora al salón, valorizada con el
+ * «Precio de transferencia» de «Configuración» (por defecto, el costo MB).
+ */
+function precioTransferencia_(ss, producto) {
+  const modo = String(leerConfig_(ss, CFG.TRANSFERENCIA) || 'COSTO MB').toUpperCase();
+  if (/LISTA|PRECIO/.test(modo)) return Number(producto.precio) || 0;
+  return Number(producto.costo) || 0;
+}
+
+function registrarMovimiento_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tipo = TIPOS_MOVIMIENTO[d.tipo];
+  if (!tipo) throw errorUsuario_('Seleccione el tipo de movimiento.');
+  const productos = leerTabla_(ctx.ss, 'productos', tz);
+  const producto = buscarPorCodigo_(productos.filas, d.codigo);
+  if (!producto) throw errorUsuario_('Seleccione un producto válido.');
+  if (!esActivo_(producto.activo)) {
+    throw errorUsuario_('«' + producto.nombre + '» está inactivo. Actívelo (Editar) antes de registrar movimientos.');
+  }
+  const cantidad = requerirEntero_(d.cantidad, 'Cantidad', 1, LIMITES.CANTIDAD);
+  const fecha = validarFecha_(d.fecha, tz, 'el movimiento');
+  const nota = texto_(d.nota, 300);
+  if (tipo.notaObligatoria && nota.length < 3) throw errorUsuario_('Escriba el motivo del ajuste en «Nota».');
+  // Solo una administradora puede informar el costo de una compra (las operativas no ven costos).
+  const puedeCosto = esAdministradora_(ctx.usuario);
+  const costoNuevo = d.tipo === 'ingreso' && puedeCosto ? enteroOpcional_(d.costoUnitario, 'Costo unitario', LIMITES.PRECIO_UNITARIO, true) : null;
+
+  const movs = leerTabla_(ctx.ss, 'movimientos', tz);
+  const stock = calcularStock_(movs.filas);
+  const k = clave_(producto.codigo);
+  const actual = stock[k] || 0;
+  if (tipo.signo < 0 && cantidad > actual) {
+    throw errorUsuario_('Stock insuficiente de «' + producto.nombre + '»: disponible ' + miles_(actual) + ', solicitado ' + miles_(cantidad) + '.');
+  }
+  const id = siguienteCodigo_(movs.filas.map(function (m) { return m.id; }), 'M-', 6);
+  const usoSalon = d.tipo === 'uso';
+  agregarFilas_(movs, [{
+    id: id, fecha: fecha, tipo: tipo.etiqueta, codigo: producto.codigo, producto: producto.nombre,
+    cantidad: tipo.signo * cantidad, costoUnitario: costoNuevo !== null ? costoNuevo : producto.costo,
+    referencia: '', nota: nota, usuario: ctx.email, registrado: new Date(),
+    unidad: usoSalon ? 'SALÓN' : 'DISTRIBUIDORA',
+    precioTransferencia: usoSalon ? precioTransferencia_(ctx.ss, producto) : '',
+  }], tz);
+  stock[k] = actual + tipo.signo * cantidad;
+  escribirStock_(productos, stock);
+
+  let extra = '';
+  if (costoNuevo !== null && costoNuevo > 0 && costoNuevo !== producto.costo) {
+    actualizarCeldas_(productos, producto._fila, { costo: costoNuevo, actualizado: new Date(), usuario: ctx.email }, tz);
+    extra = ' Costo unitario actualizado a Gs. ' + miles_(costoNuevo) + '.';
+  }
+  return 'Movimiento ' + id + ' registrado. Stock de «' + producto.nombre + '»: ' + miles_(stock[k]) + '.' + extra;
+}
+
+// ─────────────────────── 9. Operaciones: ventas ───────────────────────
+
+/**
+ * Alta o edición de una peluquería / clienta de la distribuidora. Con el módulo de clientes (Clientes.gs, R1)
+ * se aplican los obligatorios por tipo; sin él, se conserva el comportamiento vigente con RUC y celular validados.
+ */
+function guardarPeluqueria_(ctx) {
+  if (typeof guardarCliente_ === 'function') return guardarCliente_(ctx, 'peluquerias');
+  const d = ctx.datos;
+  const tabla = leerTabla_(ctx.ss, 'peluquerias', ctx.tz);
+  const original = clave_(d.codigoOriginal);
+  const actual = original ? buscarPorCodigo_(tabla.filas, original) : null;
+  // Al editar, un campo que la pantalla no envía conserva su valor (no se borra por omisión).
+  const tiene = function (k) { return !actual || Object.prototype.hasOwnProperty.call(d, k); };
+  const datos = {
+    nombre: requerirTexto_(d.nombre, 'Peluquería', 100),
+    contacto: tiene('contacto') ? texto_(d.contacto, 80) : actual.contacto,
+    telefono: tiene('telefono') ? texto_(d.telefono, 40) : actual.telefono,
+    ciudad: tiene('ciudad') ? texto_(d.ciudad, 60) : actual.ciudad,
+    direccion: tiene('direccion') ? texto_(d.direccion, 150) : actual.direccion,
+    ruc: tiene('ruc') ? validarRuc_(d.ruc, { validarDv: configSi_(ctx.ss, CFG.RUC_DV) }) : actual.ruc,
+    activo: tiene('activo') ? activoDe_(d.activo) : actual.activo,
+    actualizado: new Date(),
+    usuario: ctx.email,
+  };
+  const celular = normalizarCelular_(tiene('celular') && d.celular ? d.celular : datos.telefono);
+  if (celular) datos.celular = celular;
+  if (!original) datos.alta = hoy_(ctx.tz);
+  if (Object.prototype.hasOwnProperty.call(d, 'categoria') && texto_(d.categoria, 30) !== (actual ? actual.categoria : '')) {
+    exigirAdministradora_(ctx, 'asignar o cambiar la categoría de crédito');
+    datos.categoria = validarCategoria_(ctx.ss, ctx.tz, d.categoria);
+  }
+  const r = guardarCatalogo_(tabla, d.codigoOriginal, datos, 'C-', 4, 'La peluquería', ctx.tz);
+  if (typeof recalcularCartera_ === 'function') recalcularCartera_(ctx.ss, ctx.tz);
+  return r;
+}
+
+/**
+ * Valida lo común a toda venta de productos (fecha, cliente, productos, stock) sin escribir nada.
+ * Devuelve las tablas leídas y las líneas listas para escribir (con tasa de IVA, línea y precio de lista).
+ */
+function prepararVenta_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const fecha = validarFecha_(d.fecha, tz, 'la venta');
+  const peluquerias = leerTabla_(ctx.ss, 'peluquerias', tz);
+  let cliente = buscarPorCodigo_(peluquerias.filas, d.codigoCliente);
+  if (!cliente && typeof buscarClienteEnBase_ === 'function') cliente = buscarClienteEnBase_(ctx.ss, tz, d.codigoCliente);
+  if (!cliente) throw errorUsuario_('Seleccione el cliente.');
+  if (!esActivo_(cliente.activo)) throw errorUsuario_('El cliente «' + cliente.nombre + '» está inactivo.');
+  const items = Array.isArray(d.items) ? d.items : [];
+  if (!items.length) throw errorUsuario_('Agregue al menos un producto a la venta.');
+  if (items.length > LIMITES.ITEMS_POR_VENTA) {
+    throw errorUsuario_('Una venta admite hasta ' + LIMITES.ITEMS_POR_VENTA + ' líneas. Divídala en dos ventas.');
+  }
+  const P = leerParametros_(ctx.ss, tz);
+  const productos = leerTabla_(ctx.ss, 'productos', tz);
+  const movs = leerTabla_(ctx.ss, 'movimientos', tz);
+  const stock = calcularStock_(movs.filas);
+  const pedido = {};
+  const lineas = items.map(function (it, i) {
+    const p = buscarPorCodigo_(productos.filas, it && it.codigo);
+    if (!p) throw errorUsuario_('El producto de la línea ' + (i + 1) + ' no existe.');
+    if (!esActivo_(p.activo)) throw errorUsuario_('«' + p.nombre + '» está inactivo.');
+    const cantidad = requerirEntero_(it.cantidad, 'Cantidad de «' + p.nombre + '»', 1, LIMITES.CANTIDAD);
+    const precio = requerirEntero_(it.precio, 'Precio de «' + p.nombre + '»', 0, LIMITES.PRECIO_UNITARIO);
+    const k = clave_(p.codigo);
+    pedido[k] = (pedido[k] || 0) + cantidad;
+    const tasa = tasaIva_(p.iva, P);
+    return {
+      p: p, k: k, cantidad: cantidad, precio: precio, subtotal: cantidad * precio, tasa: tasa,
+      lista: Number(p.precio) || 0, linea: p.linea || lineaPropuesta_(p.categoria, false),
+    };
+  });
+  Object.keys(pedido).forEach(function (k) {
+    const disponible = stock[k] || 0;
+    if (pedido[k] > disponible) {
+      const p = buscarPorCodigo_(productos.filas, k);
+      throw errorUsuario_('Stock insuficiente de «' + p.nombre + '»: disponible ' + miles_(disponible) + ', en la venta ' + miles_(pedido[k]) + '.');
+    }
+  });
+  const subtotal = lineas.reduce(function (t, l) { return t + l.subtotal; }, 0);
+  return {
+    fecha: fecha, cliente: cliente, peluquerias: peluquerias, productos: productos, movs: movs, stock: stock,
+    lineas: lineas, subtotal: subtotal, nota: texto_(d.nota, 300), P: P,
+  };
+}
+
+/**
+ * Escribe la venta (una fila por línea, mismo N° de venta), descuenta el stock con el mecanismo existente y agrega
+ * líneas extra sin stock (recargo financiero «REC-FIN»). op: { condicion, nroCredito, autorizadoPor, motivoAutorizacion,
+ * ticket, unidad, extras, origen, id }.
+ */
+function escribirVenta_(ctx, prep, op) {
+  const tz = ctx.tz;
+  const ventas = leerTabla_(ctx.ss, 'ventas', tz);
+  const id = op.id || siguienteCodigo_(ventas.filas.map(function (v) { return v.id; }), 'V-', 5);
+  const ahora = new Date();
+  const contado = op.condicion === 'Contado';
+  const unidad = op.unidad || 'DISTRIBUIDORA';
+  const comunes = {
+    id: id, fecha: prep.fecha, codigoCliente: prep.cliente.codigo, cliente: prep.cliente.nombre,
+    condicion: op.condicion, estado: contado ? 'Cobrada' : 'Pendiente', fechaCobro: contado ? prep.fecha : '',
+    nota: prep.nota, usuario: ctx.email, registrado: ahora,
+    ticket: op.ticket || '', unidad: unidad, origen: op.origen || 'NUEVO', nroCredito: op.nroCredito || '',
+    autorizadoPor: op.autorizadoPor || '', motivoAutorizacion: op.motivoAutorizacion || '',
+  };
+  let total = 0;
+  const filasVenta = prep.lineas.map(function (l) {
+    total += l.subtotal;
+    return Object.assign({}, comunes, {
+      codigo: l.p.codigo, producto: l.p.nombre, cantidad: l.cantidad, precio: l.precio, subtotal: l.subtotal,
+      costoUnitario: l.p.costo, precioLista: l.lista || '', descuento: Math.round(descuentoLinea_(l.precio, l.lista) * 10000) / 100,
+      iva: textoTasa_(l.tasa), ivaMonto: ivaIncluido_(l.subtotal, l.tasa), linea: l.linea,
+      codigoProfesional: l.codigoProfesional || '', profesional: l.profesional || '', porcentaje: l.porcentaje || '', comision: l.comision || '',
+    });
+  });
+  (op.extras || []).forEach(function (x) {
+    total += x.subtotal;
+    filasVenta.push(Object.assign({}, comunes, {
+      codigo: x.codigo, producto: x.producto, cantidad: x.cantidad, precio: x.precio, subtotal: x.subtotal,
+      costoUnitario: 0, precioLista: x.precio, descuento: 0, iva: textoTasa_(x.tasa), ivaMonto: ivaIncluido_(x.subtotal, x.tasa), linea: x.linea || '',
+    }));
+  });
+  let siguiente = siguienteNumero_(prep.movs.filas.map(function (m) { return m.id; }), 'M-');
+  const filasMov = prep.lineas.map(function (l) {
+    prep.stock[l.k] = (prep.stock[l.k] || 0) - l.cantidad;
+    return {
+      id: formatoCodigo_('M-', siguiente++, 6), fecha: prep.fecha, tipo: 'Venta', codigo: l.p.codigo,
+      producto: l.p.nombre, cantidad: -l.cantidad, costoUnitario: l.p.costo, referencia: id,
+      nota: prep.cliente.nombre, usuario: ctx.email, registrado: ahora, unidad: unidad, ticket: op.ticket || '',
+    };
+  });
+  agregarFilas_(ventas, filasVenta, tz);
+  agregarFilas_(prep.movs, filasMov, tz);
+  escribirStock_(prep.productos, prep.stock);
+  return { id: id, total: total, filas: filasVenta.length };
+}
+
+/**
+ * Venta de productos (compatibilidad con la pantalla vigente). Con el módulo de tickets (Tickets.gs, R4) toda venta
+ * crea su ticket; con el de cartera (Cartera.gs, R0) la venta a crédito exige plan y política.
+ */
+function registrarVenta_(ctx) {
+  const d = ctx.datos;
+  const condicion = d.condicion === 'Contado' || d.condicion === 'Crédito' ? d.condicion : '';
+  if (!condicion) throw errorUsuario_('Indique si la venta es al contado o a crédito.');
+  if (typeof registrarVentaComoTicket_ === 'function') return registrarVentaComoTicket_(ctx);
+  if (condicion === 'Crédito' && typeof registrarVentaCredito_ === 'function') return registrarVentaCredito_(ctx);
+
+  const prep = prepararVenta_(ctx);
+  const r = escribirVenta_(ctx, prep, { condicion: condicion });
+  return {
+    mensaje: 'Venta ' + r.id + ' registrada: ' + prep.cliente.nombre + ', Gs. ' + miles_(r.total) + ' (' + condicion.toLowerCase() + ').',
+    id: r.id,
+  };
+}
+
+function cambiarEstadoVenta_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const id = clave_(d.id);
+  const ventas = leerTabla_(ctx.ss, 'ventas', tz);
+  const filas = ventas.filas.filter(function (v) { return clave_(v.id) === id; });
+  if (!id || !filas.length) throw errorUsuario_('No se encontró la venta ' + id + '.');
+  const estado = filas[0].estado;
+  const total = filas.reduce(function (t, f) { return t + f.subtotal; }, 0);
+  const hoy = hoy_(tz);
+
+  if (d.accion === 'cobrar') {
+    if (estado === 'Anulada') throw errorUsuario_('La venta ' + id + ' está anulada; no se puede cobrar.');
+    if (estado === 'Cobrada') return 'La venta ' + id + ' ya figuraba como cobrada.';
+    // R0.5: una venta a crédito solo queda «Cobrada» cuando sus cobros registrados cancelan el saldo.
+    if (filas[0].condicion === 'Crédito' && typeof registrarCobro_ === 'function') {
+      throw errorUsuario_('Las ventas a crédito se cobran registrando el pago en «Cartera › Cobrar» (queda el recibo, ' +
+        'se aplica a las cuotas y la venta pasa a «Cobrada» sola al cancelar el saldo).');
+    }
+    filas.forEach(function (f) { actualizarCeldas_(ventas, f._fila, { estado: 'Cobrada', fechaCobro: hoy }, tz); });
+    return 'Venta ' + id + ' marcada como cobrada (Gs. ' + miles_(total) + ').';
+  }
+
+  if (d.accion === 'anular') {
+    exigirAdministradora_(ctx, 'anular una venta');
+    if (estado === 'Anulada') return 'La venta ' + id + ' ya estaba anulada.';
+    const motivo = texto_(d.motivo, 200);
+    if (motivo.length < 3) throw errorUsuario_('Escriba el motivo de la anulación.');
+    if (filas[0].ticket && typeof anularTicket_ === 'function') {
+      return anularTicket_(Object.assign({}, ctx, { datos: { id: filas[0].ticket, motivo: motivo } }));
+    }
+    return anularVentaFilas_(ctx, id, filas, motivo);
+  }
+  throw errorUsuario_('Acción no reconocida.');
+}
+
+/** Anula las filas de una venta: repone stock (salvo líneas de sistema como REC-FIN), anula su crédito y su comprobante. */
+function anularVentaFilas_(ctx, id, filas, motivo) {
+  const tz = ctx.tz;
+  const ventas = leerTabla_(ctx.ss, 'ventas', tz);
+  const hoy = hoy_(tz);
+  const credito = filas[0].condicion === 'Crédito' && typeof anularCreditoDeVenta_ === 'function' ? anularCreditoDeVenta_(ctx, id, motivo) : '';
+  const P = leerParametros_(ctx.ss, tz);
+  const codRecargo = clave_(P.P_COD_REC || '');
+  const productos = leerTabla_(ctx.ss, 'productos', tz);
+  const movs = leerTabla_(ctx.ss, 'movimientos', tz);
+  const stock = calcularStock_(movs.filas);
+  let siguiente = siguienteNumero_(movs.filas.map(function (m) { return m.id; }), 'M-');
+  const ahora = new Date();
+  const reposiciones = filas.filter(function (f) {
+    return (!codRecargo || clave_(f.codigo) !== codRecargo) && !!buscarPorCodigo_(productos.filas, f.codigo);
+  }).map(function (f) {
+    const k = clave_(f.codigo);
+    stock[k] = (stock[k] || 0) + f.cantidad;
+    return {
+      id: formatoCodigo_('M-', siguiente++, 6), fecha: hoy, tipo: 'Anulación de venta', codigo: f.codigo,
+      producto: f.producto, cantidad: f.cantidad, costoUnitario: f.costoUnitario, referencia: id,
+      nota: motivo, usuario: ctx.email, registrado: ahora, unidad: f.unidad || 'DISTRIBUIDORA', ticket: f.ticket || '',
+    };
+  });
+  actualizarFilas_(ventas, filas.map(function (f) {
+    return { fila: f._fila, valores: { estado: 'Anulada', nota: (f.nota ? f.nota + ' · ' : '') + 'Anulada: ' + motivo } };
+  }), tz);
+  agregarFilas_(movs, reposiciones, tz);
+  escribirStock_(productos, stock);
+  const fiscal = typeof marcarComprobanteAnulado_ === 'function' ? marcarComprobanteAnulado_(ctx.ss, tz, id, motivo) : '';
+  if (credito && typeof recalcularCartera_ === 'function') recalcularCartera_(ctx.ss, tz);
+  return 'Venta ' + id + ' anulada. Se repuso el stock de sus productos.' + (credito ? ' ' + credito : '') + (fiscal ? ' ' + fiscal : '');
+}
+
+// ─────────────────────── 10. Operaciones: salón y comisiones ───────────────────────
+
+function guardarProfesional_(ctx) {
+  const d = ctx.datos;
+  const tabla = leerTabla_(ctx.ss, 'personal', ctx.tz);
+  const original = clave_(d.codigoOriginal);
+  const anterior = original ? buscarPorCodigo_(tabla.filas, original) : null;
+  const comision = requerirPorcentaje_(d.comision, '% Comisión');
+  const r = guardarCatalogo_(tabla, d.codigoOriginal, {
+    nombre: requerirTexto_(d.nombre, 'Nombre', 80),
+    rol: texto_(d.rol, 60),
+    comision: comision,
+    telefono: texto_(d.telefono, 40),
+    activo: activoDe_(d.activo),
+    actualizado: new Date(),
+    usuario: ctx.email,
+  }, 'E-', 3, 'El profesional', ctx.tz);
+  // R3.6: todo cambio de % queda en «Historial de porcentajes» (con el módulo de comisiones).
+  if (typeof anotarCambioPorcentaje_ === 'function' && (!anterior || Number(anterior.comision) !== comision)) {
+    anotarCambioPorcentaje_(ctx, { codigoProfesional: r.codigo, profesional: d.nombre, porcentaje: comision, aplicacion: d.aplicacion, desde: d.desde });
+  }
+  return r;
+}
+
+function guardarServicio_(ctx) {
+  const d = ctx.datos;
+  const tabla = leerTabla_(ctx.ss, 'servicios', ctx.tz);
+  const vacio = d.comision === '' || d.comision === null || d.comision === undefined;
+  const datos = {
+    nombre: requerirTexto_(d.nombre, 'Servicio', 100),
+    precio: requerirEntero_(d.precio, 'Precio base', 0, LIMITES.PRECIO_SERVICIO),
+    comision: vacio ? 0 : requerirPorcentaje_(d.comision, '% Comisión del servicio'),
+    activo: activoDe_(d.activo),
+    actualizado: new Date(),
+    usuario: ctx.email,
+  };
+  if (Object.prototype.hasOwnProperty.call(d, 'iva')) datos.iva = String(d.iva) === '' ? '' : textoTasa_(tasaIva_(d.iva, null));
+  if (Object.prototype.hasOwnProperty.call(d, 'duracion')) datos.duracion = enteroOpcional_(d.duracion, 'Duración (min)', 720, true);
+  if (!clave_(d.codigoOriginal)) {
+    if (datos.iva === undefined) datos.iva = '10';
+    datos.linea = 'SERVICIOS Y CAPACITACIÓN';
+  }
+  return guardarCatalogo_(tabla, d.codigoOriginal, datos, 'SV-', 3, 'El servicio', ctx.tz);
+}
+
+/**
+ * Registrar un servicio (compatibilidad). Con el módulo de tickets (R4.5) crea el ticket internamente.
+ * El % lo decide la regla vigente; solo una administradora puede indicar otro.
+ */
+function registrarServicio_(ctx) {
+  if (typeof registrarServicioComoTicket_ === 'function') return registrarServicioComoTicket_(ctx);
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const fecha = validarFecha_(d.fecha, tz, 'el servicio');
+  const personal = leerTabla_(ctx.ss, 'personal', tz);
+  const prof = buscarPorCodigo_(personal.filas, d.codigoProfesional);
+  if (!prof) throw errorUsuario_('Seleccione el profesional que realizó el servicio.');
+  if (!esActivo_(prof.activo)) throw errorUsuario_(prof.nombre + ' está inactivo en «Personal».');
+  const servicios = leerTabla_(ctx.ss, 'servicios', tz);
+  const serv = buscarPorCodigo_(servicios.filas, d.codigoServicio);
+  if (!serv) throw errorUsuario_('Seleccione el servicio realizado.');
+  if (!esActivo_(serv.activo)) throw errorUsuario_('El servicio «' + serv.nombre + '» está inactivo.');
+  const precio = requerirEntero_(d.precio, 'Precio cobrado', 0, LIMITES.PRECIO_SERVICIO);
+  const vacio = d.porcentaje === '' || d.porcentaje === null || d.porcentaje === undefined;
+  if (!vacio) exigirAdministradora_(ctx, 'indicar un % de comisión distinto de la regla');
+  const porcentaje = vacio ? porcentajeSugerido_(serv, prof) : requerirPorcentaje_(d.porcentaje, '% Comisión');
+  const comision = gsEnteros_(precio * porcentaje / 100);
+  const P = leerParametros_(ctx.ss, tz);
+  const tasa = tasaIva_(serv.iva, P);
+
+  const realizados = leerTabla_(ctx.ss, 'realizados', tz);
+  const id = siguienteCodigo_(realizados.filas.map(function (r) { return r.id; }), 'S-', 5);
+  agregarFilas_(realizados, [{
+    id: id, fecha: fecha, codigoProfesional: prof.codigo, profesional: prof.nombre,
+    codigoServicio: serv.codigo, servicio: serv.nombre, cliente: texto_(d.cliente, 80),
+    precio: precio, porcentaje: porcentaje, comision: comision, estado: 'Realizado', liquidado: '',
+    nota: texto_(d.nota, 300), usuario: ctx.email, registrado: new Date(),
+    codigoCliente: clave_(d.codigoCliente), unidad: 'SALÓN', origen: 'NUEVO', precioLista: serv.precio || '',
+    descuento: Math.round(descuentoLinea_(precio, Number(serv.precio) || 0) * 10000) / 100, iva: textoTasa_(tasa), ivaMonto: ivaIncluido_(precio, tasa),
+  }], tz);
+  return {
+    mensaje: 'Servicio ' + id + ' registrado.' + (esAdministradora_(ctx.usuario) ? ' Comisión de ' + prof.nombre + ': Gs. ' + miles_(comision) +
+      ' (' + numeroTexto_(porcentaje) + '%).' : ''),
+    id: id,
+  };
+}
+
+/** Regla vigente: si el servicio tiene % propio (> 0) se usa ese; si no, el % del profesional. */
+function porcentajeSugerido_(serv, prof) {
+  return serv.comision > 0 ? serv.comision : (prof.comision || 0);
+}
+
+function anularServicio_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const id = clave_(d.id);
+  const realizados = leerTabla_(ctx.ss, 'realizados', tz);
+  const fila = realizados.filas.find(function (r) { return clave_(r.id) === id; });
+  if (!id || !fila) throw errorUsuario_('No se encontró el servicio ' + id + '.');
+  if (fila.estado === 'Anulado') return 'El servicio ' + id + ' ya estaba anulado.';
+  if (fila.liquidado) {
+    throw errorUsuario_('La comisión del servicio ' + id + ' ya se liquidó el ' + formatoFecha_(fila.liquidado) + '; no se puede anular.');
+  }
+  const motivo = texto_(d.motivo, 200);
+  if (motivo.length < 3) throw errorUsuario_('Escriba el motivo de la anulación.');
+  if (fila.ticket && typeof anularLineaServicioDeTicket_ === 'function') return anularLineaServicioDeTicket_(ctx, fila, motivo);
+  actualizarCeldas_(realizados, fila._fila, {
+    estado: 'Anulado',
+    nota: (fila.nota ? fila.nota + ' · ' : '') + 'Anulado: ' + motivo,
+  }, tz);
+  return 'Servicio ' + id + ' anulado. Su comisión ya no se contabiliza.';
+}
+
+/**
+ * Liquida las comisiones pendientes del mes de una profesional: servicios, comisiones por venta de productos
+ * en el salón (R4.7) y ajustes de recálculos sobre lo ya liquidado (R3.4).
+ */
+function liquidarComisiones_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const k = clave_(d.codigoProfesional);
+  if (!k) throw errorUsuario_('Seleccione el profesional.');
+  const mes = ctx.mes;
+  const hoy = hoy_(tz);
+  const realizados = leerTabla_(ctx.ss, 'realizados', tz);
+  const pendientes = realizados.filas.filter(function (r) {
+    return clave_(r.codigoProfesional) === k && r.fecha.slice(0, 7) === mes && r.estado !== 'Anulado' && !r.liquidado;
+  });
+  const personal = leerTabla_(ctx.ss, 'personal', tz);
+  const prof = buscarPorCodigo_(personal.filas, k);
+  const nombre = prof ? prof.nombre : (pendientes.length ? pendientes[0].profesional : k);
+  let total = 0;
+  let partes = 0;
+  pendientes.forEach(function (r) { total += r.comision; });
+  actualizarFilas_(realizados, pendientes.map(function (r) { return { fila: r._fila, valores: { liquidado: hoy } }; }), tz);
+  partes += pendientes.length;
+  // Comisión por venta de productos en el salón (líneas de «Ventas» con profesional).
+  const ventas = leerTabla_(ctx.ss, 'ventas', tz);
+  const deVentas = ventas.filas.filter(function (v) {
+    return clave_(v.codigoProfesional) === k && v.fecha.slice(0, 7) === mes && v.estado !== 'Anulada' && !v.liquidado && v.comision > 0;
+  });
+  deVentas.forEach(function (v) { total += v.comision; });
+  actualizarFilas_(ventas, deVentas.map(function (v) { return { fila: v._fila, valores: { liquidado: hoy } }; }), tz);
+  partes += deVentas.length;
+  // Ajustes de recálculos (positivos o negativos) todavía no liquidados.
+  const ajustes = leerTabla_(ctx.ss, 'ajustes', tz);
+  const deAjustes = ajustes.filas.filter(function (a) { return clave_(a.codigoProfesional) === k && !a.liquidado && !esActivo_(a.anulado); });
+  deAjustes.forEach(function (a) { total += a.monto; });
+  actualizarFilas_(ajustes, deAjustes.map(function (a) { return { fila: a._fila, valores: { liquidado: hoy } }; }), tz);
+  partes += deAjustes.length;
+  if (!partes) return 'No hay comisiones pendientes de ' + nombre + ' en ' + etiquetaMes_(mes) + '.';
+  return 'Comisiones de ' + nombre + ' (' + etiquetaMes_(mes) + ') liquidadas: Gs. ' + miles_(total) + ' (' +
+    pendientes.length + ' servicios' + (deVentas.length ? ', ' + deVentas.length + ' ventas de productos' : '') +
+    (deAjustes.length ? ', ' + deAjustes.length + ' ajustes' : '') + ').';
+}
+
+/** Alta o edición genérica de catálogos con código automático y control de duplicados por nombre. */
+function guardarCatalogo_(tabla, codigoOriginal, datos, prefijo, ancho, etiqueta, tz) {
+  const original = clave_(codigoOriginal);
+  let existente = null;
+  if (original) {
+    existente = buscarPorCodigo_(tabla.filas, original);
+    if (!existente) throw errorUsuario_(etiqueta + ' ' + original + ' no existe. Actualice los datos e intente nuevamente.');
+  }
+  const duplicado = tabla.filas.find(function (f) {
+    return f !== existente && normalizar_(f.nombre) === normalizar_(datos.nombre);
+  });
+  if (duplicado) throw errorUsuario_(etiqueta + ' «' + duplicado.nombre + '» ya existe (código ' + duplicado.codigo + ').');
+  if (existente) {
+    actualizarCeldas_(tabla, existente._fila, datos, tz);
+    return { mensaje: 'Datos de «' + datos.nombre + '» actualizados.', codigo: existente.codigo };
+  }
+  datos.codigo = siguienteCodigo_(tabla.filas.map(function (f) { return f.codigo; }), prefijo, ancho);
+  agregarFilas_(tabla, [datos], tz);
+  return { mensaje: 'Se registró «' + datos.nombre + '» con el código ' + datos.codigo + '.', codigo: datos.codigo };
+}
+
+// ─────────────────────── 11. Datos para la aplicación ───────────────────────
+
+/**
+ * Arma los datos que recibe la aplicación según el rol (RT.2). A una OPERATIVA se le envía una LISTA BLANCA:
+ * nunca costos, márgenes, valor del inventario, utilidades, comisiones de otras personas, condiciones de proveedores
+ * ni el enlace a la hoja. Cada módulo de fase posterior aporta su parte solo si está instalado.
+ */
+function construirDatos_(ss, mes, tz, usuario) {
+  const admin = esAdministradora_(usuario);
+  const P = leerParametros_(ss, tz);
+  const prod = leerTabla_(ss, 'productos', tz).filas;
+  const movs = leerTabla_(ss, 'movimientos', tz).filas;
+  const pelu = leerTabla_(ss, 'peluquerias', tz).filas;
+  const vent = leerTabla_(ss, 'ventas', tz).filas;
+  const stock = calcularStock_(movs);
+  const tasaGeneral = P.P_IVA !== null ? Math.round(P.P_IVA * 1000) / 10 : 10;
+
+  const productos = prod.map(function (p) {
+    let tasa = tasaGeneral;
+    try { tasa = p.iva === '' ? tasaGeneral : tasaIva_(p.iva, null); } catch (e) { tasa = tasaGeneral; }
+    const o = {
+      codigo: p.codigo, nombre: p.nombre, marca: p.marca, categoria: p.categoria, presentacion: p.presentacion,
+      precio: p.precio, stockMinimo: p.stockMinimo, stock: stock[clave_(p.codigo)] || 0,
+      activo: esActivo_(p.activo), iva: tasa, linea: p.linea,
+    };
+    if (admin) { o.costo = p.costo; o.proveedor = p.proveedor; }
+    return o;
+  }).sort(ordenarPor_(['marca', 'nombre']));
+
+  const movimientos = movs.slice(-200).reverse().map(function (m) {
+    return {
+      id: m.id, fecha: m.fecha, tipo: m.tipo, codigo: m.codigo, producto: m.producto, cantidad: m.cantidad,
+      referencia: m.referencia, nota: m.nota, usuario: m.usuario, unidad: m.unidad,
+    };
+  });
+
+  const grupos = agruparVentas_(vent);
+  const ventasMes = grupos.filter(function (v) { return v.fecha.slice(0, 7) === mes; }).sort(porFechaDesc_);
+  const pendientes = grupos.filter(function (v) { return v.estado === 'Pendiente'; }).sort(porFechaAsc_);
+  const ventasVigentes = ventasMes.filter(function (v) { return v.estado !== 'Anulada'; });
+  const activos = productos.filter(function (p) { return p.activo; });
+
+  const pers = leerTabla_(ss, 'personal', tz).filas;
+  const serv = leerTabla_(ss, 'servicios', tz).filas;
+  const real = leerTabla_(ss, 'realizados', tz).filas;
+  const realizadosMes = real.filter(function (r) { return r.fecha.slice(0, 7) === mes; }).map(function (r) {
+    const o = {
+      id: r.id, fecha: r.fecha, codigoProfesional: r.codigoProfesional, profesional: r.profesional,
+      codigoServicio: r.codigoServicio, servicio: r.servicio, cliente: r.cliente, codigoCliente: r.codigoCliente,
+      precio: r.precio, estado: r.estado, nota: r.nota, ticket: r.ticket,
+    };
+    if (admin) { o.porcentaje = r.porcentaje; o.comision = r.comision; o.liquidado = r.liquidado; }
+    return o;
+  }).sort(porFechaDesc_);
+  const serviciosVigentes = realizadosMes.filter(function (r) { return r.estado !== 'Anulado'; });
+
+  const datos = {
+    mes: mes,
+    etiquetaMes: etiquetaMes_(mes),
+    hoy: hoy_(tz),
+    usuario: { email: usuario ? usuario.email : '', rol: usuario ? usuario.rol : ROLES.OPERATIVO, nombre: usuario ? usuario.nombre : '' },
+    productos: productos,
+    movimientos: movimientos,
+    peluquerias: pelu.map(function (c) {
+      return {
+        codigo: c.codigo, nombre: c.nombre, contacto: c.contacto, telefono: c.telefono, ciudad: c.ciudad,
+        direccion: c.direccion, ruc: c.ruc, activo: esActivo_(c.activo), ci: c.ci, observacion: c.observacion,
+        razonSocial: c.razonSocial, celular: c.celular, correo: c.correo, tipo: c.tipo, categoria: c.categoria,
+        zona: c.zona, legado: c.legado, alias: c.alias, completitud: c.completitud, faltantes: c.faltantes,
+        limite: c.limite, saldo: c.saldo, vencido: c.vencido, atraso: c.atraso, estadoCredito: c.estadoCredito,
+        disponible: c.disponible, sugerencia: admin ? c.sugerencia : '',
+      };
+    }).sort(ordenarPor_(['nombre'])),
+    ventas: ventasMes,
+    pendientes: pendientes,
+    marcas: unicos_(CONFIG.MARCAS_BASE.concat(productos.map(function (p) { return p.marca; }))),
+    categorias: unicos_(productos.map(function (p) { return p.categoria; })),
+    tiposMovimiento: Object.keys(TIPOS_MOVIMIENTO).map(function (k) {
+      return { clave: k, etiqueta: TIPOS_MOVIMIENTO[k].etiqueta, signo: TIPOS_MOVIMIENTO[k].signo, notaObligatoria: TIPOS_MOVIMIENTO[k].notaObligatoria };
+    }),
+    personal: pers.map(function (p) {
+      const o = { codigo: p.codigo, nombre: p.nombre, rol: p.rol, telefono: p.telefono, activo: esActivo_(p.activo) };
+      if (admin) o.comision = p.comision;
+      return o;
+    }).sort(ordenarPor_(['nombre'])),
+    servicios: serv.map(function (s) {
+      const o = { codigo: s.codigo, nombre: s.nombre, precio: s.precio, activo: esActivo_(s.activo), duracion: s.duracion || '', iva: s.iva, linea: s.linea };
+      if (admin) o.comision = s.comision;
+      return o;
+    }).sort(ordenarPor_(['nombre'])),
+    realizados: realizadosMes,
+    comisiones: [],
+    listas: { medios: LISTAS.MEDIOS_PAGO, unidades: LISTAS.UNIDADES, tiposCliente: LISTAS.TIPOS_CLIENTE, zonas: LISTAS.ZONAS,
+      lineas: LISTAS.LINEAS, comprobantes: LISTAS.COMPROBANTES, frecuencias: LISTAS.FRECUENCIAS, conceptos: LISTAS.CONCEPTOS_COBRO },
+    config: {
+      registroAbierto: registroAbierto_(ss), version: CONFIG.VERSION,
+      sifen: modoIntegracion_(ss, 'sifen'), whatsapp: modoIntegracion_(ss, 'whatsapp'), facturacion: modoFacturacion_(ss),
+      modulos: modulosInstalados_(),
+    },
+    kpis: {
+      stockBajo: activos.filter(function (p) { return p.stock <= p.stockMinimo; }).length,
+      productosActivos: activos.length,
+      cantidadVentas: ventasVigentes.length,
+      cantidadServicios: serviciosVigentes.length,
+      porCobrar: suma_(pendientes, 'total'),
+      cantidadPorCobrar: pendientes.length,
+    },
+  };
+
+  // Módulos de las fases siguientes (cada uno aplica su propia lista blanca según el rol).
+  const contexto = { P: P, productos: prod, ventas: vent, grupos: grupos, peluquerias: pelu, realizados: real, personal: pers, servicios: serv, mes: mes };
+  if (typeof datosCartera_ === 'function') datos.cartera = datosCartera_(ss, tz, usuario, contexto);
+  if (typeof datosClientes_ === 'function') datos.clientes = datosClientes_(ss, tz, usuario, contexto);
+  if (typeof datosTickets_ === 'function') datos.tickets = datosTickets_(ss, tz, usuario, contexto);
+  if (typeof datosAgenda_ === 'function') datos.agenda = datosAgenda_(ss, tz, usuario, contexto);
+  if (datos.cartera && datos.cartera.totales) {
+    datos.kpis.porCobrar = datos.cartera.totales.cartera;
+    datos.kpis.cantidadPorCobrar = datos.cartera.totales.creditosConSaldo;
+    datos.kpis.carteraVencida = datos.cartera.totales.vencido;
+  }
+
+  if (!admin) return datos;
+
+  // ── Solo administradoras ──
+  datos.comisiones = resumenComisiones_(realizadosMes, pers);
+  datos.kpis.ventasMes = suma_(ventasVigentes, 'total');
+  datos.kpis.serviciosMes = suma_(serviciosVigentes, 'precio');
+  datos.kpis.comisionesMes = suma_(serviciosVigentes, 'comision');
+  datos.kpis.comisionesPendientes = suma_(serviciosVigentes.filter(function (r) { return !r.liquidado; }), 'comision');
+  datos.kpis.valorInventario = activos.reduce(function (t, p) { return t + Math.max(p.stock, 0) * (p.costo || 0); }, 0);
+  datos.config.admin = CONFIG.CORREO_ADMIN;
+  datos.pendientesPanel = pendientesSistema_(ss, tz, contexto);
+  if (typeof datosProveedores_ === 'function') datos.proveedores = datosProveedores_(ss, tz, usuario, contexto);
+  if (typeof datosComisiones_ === 'function') datos.recalculo = datosComisiones_(ss, tz, usuario, contexto);
+  if (typeof datosAdmin_ === 'function') datos.admin = datosAdmin_(ss, tz, usuario, contexto);
+  return datos;
+}
+
+/** Módulos v2.3 instalados (para la navegación y el diagnóstico). */
+function modulosInstalados_() {
+  return {
+    cartera: typeof datosCartera_ === 'function',
+    migracion: typeof migrarDatosAntiguos_ === 'function',
+    reportes: typeof obtenerReporte_ === 'function',
+    clientes: typeof datosClientes_ === 'function',
+    proveedores: typeof datosProveedores_ === 'function',
+    comisiones: typeof datosComisiones_ === 'function',
+    tickets: typeof datosTickets_ === 'function',
+    agenda: typeof datosAgenda_ === 'function',
+    fiscal: typeof procesarColaSifen_ === 'function',
+    whatsapp: typeof dispararAlertasCobranzaMora_ === 'function',
+    salonDatos: typeof DATOS_SALON !== 'undefined',
+  };
+}
+
+/**
+ * Panel «Pendientes» (solo administradoras): lo que falta completar o confirmar, con su cantidad. Nunca se completa
+ * con supuestos. Cada módulo agrega los suyos (clientes incompletos, saldos dudosos, acuerdos por vencer…).
+ */
+function pendientesSistema_(ss, tz, c) {
+  const lista = [];
+  function agregar(clave, titulo, n, detalle, accion) {
+    if (n > 0) lista.push({ clave: clave, titulo: titulo, cantidad: n, detalle: (detalle || []).slice(0, 30), accion: accion || '' });
+  }
+  const activos = c.productos.filter(function (p) { return esActivo_(p.activo); });
+  const sinCosto = activos.filter(function (p) { return !(p.costo > 0); });
+  agregar('costos', 'Productos sin costo cargado', sinCosto.length, sinCosto.map(function (p) { return p.codigo + ' ' + p.nombre; }), 'Editar el producto (Inventario).');
+  const sinLinea = activos.filter(function (p) { return !p.linea || p.linea === 'REVISAR'; });
+  agregar('lineas', 'Productos sin línea / centro de costo (o en REVISAR)', sinLinea.length, sinLinea.map(function (p) { return p.codigo + ' ' + p.nombre + ' (' + (p.categoria || 'sin categoría') + ')'; }), 'Asignar la línea en Inventario.');
+  const sinIva = activos.filter(function (p) { return String(p.iva) === ''; });
+  agregar('iva', 'Productos sin tasa de IVA confirmada', sinIva.length, sinIva.map(function (p) { return p.codigo + ' ' + p.nombre; }), 'Confirmar 10%, 5% o exenta con el contador.');
+  agregar('marcas', 'Marcas escritas de distintas formas', duplicadosPorMayusculas_(c.productos.map(function (p) { return p.marca; })).length,
+    duplicadosPorMayusculas_(c.productos.map(function (p) { return p.marca; })), 'Unificar el nombre en Inventario.');
+  agregar('categorias', 'Categorías de producto duplicadas o sin normalizar', duplicadosPorMayusculas_(c.productos.map(function (p) { return p.categoria; })).length,
+    duplicadosPorMayusculas_(c.productos.map(function (p) { return p.categoria; })), 'Unificar el nombre en Inventario.');
+  const sinDuracion = c.servicios.filter(function (s) { return esActivo_(s.activo) && !(s.duracion > 0); });
+  agregar('duracion', 'Servicios sin duración', sinDuracion.length, sinDuracion.map(function (s) { return s.codigo + ' ' + s.nombre; }), 'Cargar la duración (min) en Salón › Servicios.');
+  agregar('parametros', 'Parámetros de crédito vacíos o inválidos', c.P._faltan.length, c.P._faltan.map(function (k) { return c.P._nombres[k] || k; }), 'Completar en «Parámetros de crédito».');
+  const opcionales = ['P_META_ASISTENTE', 'P_REPOSICION', 'P_POLITICA_FIRMADA', 'P_IVA_RECARGO'].filter(function (k) { return c.P[k] === null; });
+  agregar('pendientesMirian', 'Datos por confirmar con Mirian o el contador', opcionales.length, opcionales.map(function (k) { return c.P._nombres[k] || k; }), 'Ver «Parámetros de crédito».');
+  let entidades = [];
+  try { entidades = leerTabla_(ss, 'entidades', tz).filas.filter(function (e) { return e.estado !== 'COMPLETO'; }); } catch (e) { entidades = []; }
+  agregar('fiscal', 'Datos fiscales pendientes (Entidades fiscales)', entidades.length, entidades.map(function (e) { return e.unidad; }), 'Completar con el contador.');
+  if (typeof pendientesCartera_ === 'function') pendientesCartera_(ss, tz, c).forEach(function (p) { lista.push(p); });
+  if (typeof pendientesClientes_ === 'function') pendientesClientes_(ss, tz, c).forEach(function (p) { lista.push(p); });
+  if (typeof pendientesProveedores_ === 'function') pendientesProveedores_(ss, tz, c).forEach(function (p) { lista.push(p); });
+  if (typeof pendientesComisiones_ === 'function') pendientesComisiones_(ss, tz, c).forEach(function (p) { lista.push(p); });
+  return lista;
+}
+
+/** Valores que difieren solo en mayúsculas, tildes o plural simple («Herramientas» / «Herramienta»). */
+function duplicadosPorMayusculas_(valores) {
+  const grupos = {};
+  valores.forEach(function (v) {
+    const s = String(v || '').trim();
+    if (!s) return;
+    const k = normalizar_(s).replace(/s$/, '');
+    (grupos[k] = grupos[k] || {})[s] = true;
+  });
+  return Object.keys(grupos).filter(function (k) { return Object.keys(grupos[k]).length > 1; }).map(function (k) { return Object.keys(grupos[k]).join(' / '); });
+}
+
+function agruparVentas_(filas) {
+  const mapa = {};
+  const lista = [];
+  filas.forEach(function (f) {
+    const id = clave_(f.id);
+    if (!id) return;
+    let v = mapa[id];
+    if (!v) {
+      v = mapa[id] = {
+        id: f.id, fecha: f.fecha, codigoCliente: f.codigoCliente, cliente: f.cliente, condicion: f.condicion,
+        estado: f.estado, fechaCobro: f.fechaCobro, nota: f.nota, usuario: f.usuario, total: 0, unidades: 0, items: [],
+        ticket: f.ticket || '', unidad: f.unidad || '', origen: f.origen || '', nroCredito: f.nroCredito || '', autorizadoPor: f.autorizadoPor || '',
+      };
+      lista.push(v);
+    }
+    v.items.push({ codigo: f.codigo, producto: f.producto, cantidad: f.cantidad, precio: f.precio, subtotal: f.subtotal, iva: f.iva, precioLista: f.precioLista });
+    v.total += f.subtotal;
+    v.unidades += f.cantidad;
+  });
+  return lista;
+}
+
+function resumenComisiones_(realizadosMes, personal) {
+  const mapa = {};
+  const orden = [];
+  realizadosMes.forEach(function (r) {
+    if (r.estado === 'Anulado') return;
+    const k = clave_(r.codigoProfesional);
+    if (!mapa[k]) {
+      const p = buscarPorCodigo_(personal, k);
+      mapa[k] = {
+        codigo: r.codigoProfesional, nombre: p ? p.nombre : r.profesional, rol: p ? p.rol : '',
+        servicios: 0, facturado: 0, comision: 0, liquidado: 0, pendiente: 0,
+      };
+      orden.push(mapa[k]);
+    }
+    const m = mapa[k];
+    m.servicios += 1;
+    m.facturado += r.precio;
+    m.comision += r.comision;
+    if (r.liquidado) m.liquidado += r.comision; else m.pendiente += r.comision;
+  });
+  return orden.sort(function (a, b) { return b.comision - a.comision; });
+}
+
+// ─────────────────────── 12. Utilidades ───────────────────────
+
+function normalizarCorreo_(valor, esSesion) {
+  const correo = String(valor === null || valor === undefined ? '' : valor).trim().toLowerCase();
+  if (!correo) throw errorUsuario_((esSesion ? PREFIJO_SESION : '') + 'Ingrese su correo electrónico.');
+  if (correo.length > 254 || !/^[^\s@,;:<>()\[\]"']+@[^\s@,;:<>()\[\]"']+\.[a-z]{2,}$/i.test(correo)) {
+    throw errorUsuario_((esSesion ? PREFIJO_SESION : '') + 'El correo «' + String(valor).trim() + '» no es válido. Revíselo e intente nuevamente.');
+  }
+  return correo;
+}
+
+function normalizarMes_(valor) {
+  const s = String(valor || '');
+  if (/^\d{4}-(0[1-9]|1[0-2])$/.test(s)) return s;
+  return Utilities.formatDate(new Date(), CONFIG.ZONA_HORARIA, 'yyyy-MM');
+}
+
+function clave_(v) {
+  return String(v === null || v === undefined ? '' : v).trim().toUpperCase();
+}
+
+function normalizar_(s) {
+  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function buscarPorCodigo_(filas, codigo) {
+  const k = clave_(codigo);
+  if (!k) return null;
+  return filas.find(function (f) { return clave_(f.codigo) === k; }) || null;
+}
+
+function esActivo_(v) {
+  return !/^(no|n|false|falso|0|inactivo)$/i.test(String(v === null || v === undefined ? '' : v).trim());
+}
+
+function activoDe_(v) {
+  return v === false || /^(no|false|0)$/i.test(String(v === null || v === undefined ? '' : v).trim()) ? 'No' : 'Sí';
+}
+
+function unicos_(lista) {
+  const vistos = {};
+  const salida = [];
+  lista.forEach(function (v) {
+    const s = String(v === null || v === undefined ? '' : v).trim();
+    const k = normalizar_(s);
+    if (s && !vistos[k]) {
+      vistos[k] = true;
+      salida.push(s);
+    }
+  });
+  return salida;
+}
+
+function ordenarPor_(campos) {
+  return function (a, b) {
+    for (let i = 0; i < campos.length; i++) {
+      const x = normalizar_(a[campos[i]]);
+      const y = normalizar_(b[campos[i]]);
+      if (x < y) return -1;
+      if (x > y) return 1;
+    }
+    return 0;
+  };
+}
+
+function porFechaDesc_(a, b) {
+  if (a.fecha !== b.fecha) return a.fecha < b.fecha ? 1 : -1;
+  return String(a.id) < String(b.id) ? 1 : -1;
+}
+
+function porFechaAsc_(a, b) {
+  return -porFechaDesc_(a, b);
+}
+
+function suma_(lista, campo) {
+  return lista.reduce(function (t, x) { return t + (Number(x[campo]) || 0); }, 0);
+}
+
+function texto_(valor, max) {
+  let s = String(valor === null || valor === undefined ? '' : valor)
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (max && s.length > max) s = s.slice(0, max).trim();
+  return s;
+}
+
+function requerirTexto_(valor, etiqueta, max) {
+  const s = texto_(valor, max);
+  if (!s) throw errorUsuario_('Complete el campo «' + etiqueta + '».');
+  return s;
+}
+
+/** Acepta números o textos como "85.000" (separador de miles paraguayo). */
+function entero_(valor) {
+  if (typeof valor === 'number') return isFinite(valor) ? Math.round(valor) : NaN;
+  const s = String(valor === null || valor === undefined ? '' : valor).trim();
+  if (!s) return NaN;
+  const digitos = s.replace(/[^0-9]/g, '');
+  if (!digitos) return NaN;
+  const n = parseInt(digitos, 10);
+  return /^-/.test(s) ? -n : n;
+}
+
+/** Acepta "37,5", "37.5" o "37,5 %". */
+function decimal_(valor) {
+  if (typeof valor === 'number') return isFinite(valor) ? valor : NaN;
+  let s = String(valor === null || valor === undefined ? '' : valor).replace(/[%\s]/g, '');
+  if (!s) return NaN;
+  if (s.indexOf(',') >= 0 && s.indexOf('.') >= 0) s = s.replace(/\./g, '').replace(',', '.');
+  else s = s.replace(',', '.');
+  const n = Number(s);
+  return isFinite(n) ? n : NaN;
+}
+
+function requerirEntero_(valor, etiqueta, min, max) {
+  const n = entero_(valor);
+  if (isNaN(n)) throw errorUsuario_('Ingrese un número válido en «' + etiqueta + '».');
+  if (min !== null && min !== undefined && n < min) throw errorUsuario_('«' + etiqueta + '» no puede ser menor que ' + miles_(min) + '.');
+  if (max !== null && max !== undefined && n > max) throw errorUsuario_('«' + etiqueta + '» no puede ser mayor que ' + miles_(max) + '. Revise si sobra algún cero.');
+  return n;
+}
+
+/** Entero ≥ 0 opcional: vacío = 0 (o null si devolverNulo). */
+function enteroOpcional_(valor, etiqueta, max, devolverNulo) {
+  if (valor === '' || valor === null || valor === undefined) return devolverNulo ? null : 0;
+  return requerirEntero_(valor, etiqueta, 0, max);
+}
+
+function requerirPorcentaje_(valor, etiqueta) {
+  const n = decimal_(valor);
+  if (isNaN(n) || n < 0 || n > 100) throw errorUsuario_('«' + etiqueta + '» debe ser un porcentaje entre 0 y 100.');
+  return Math.round(n * 100) / 100;
+}
+
+function siguienteNumero_(lista, prefijo) {
+  const re = new RegExp('^' + prefijo.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&') + '(\\d+)$', 'i');
+  let max = 0;
+  lista.forEach(function (v) {
+    const m = String(v || '').trim().match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  });
+  return max + 1;
+}
+
+function formatoCodigo_(prefijo, n, ancho) {
+  return prefijo + String(n).padStart(ancho, '0');
+}
+
+function siguienteCodigo_(lista, prefijo, ancho) {
+  return formatoCodigo_(prefijo, siguienteNumero_(lista, prefijo), ancho);
+}
+
+function miles_(n) {
+  const v = Math.round(Number(n) || 0);
+  return (v < 0 ? '-' : '') + String(Math.abs(v)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+function numeroTexto_(n) {
+  return String(n).replace('.', ',');
+}
+
+function hoy_(tz) {
+  return Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+}
+
+function etiquetaMes_(mes) {
+  const p = String(mes).split('-');
+  return MESES_[Number(p[1]) - 1] + ' de ' + p[0];
+}
+
+function formatoFecha_(iso) {
+  const p = String(iso || '').split('-');
+  return p.length === 3 ? p[2] + '/' + p[1] + '/' + p[0] : String(iso || '');
+}
+
+function sumarDias_(iso, dias) {
+  const p = iso.split('-').map(Number);
+  const f = new Date(Date.UTC(p[0], p[1] - 1, p[2] + dias));
+  return f.getUTCFullYear() + '-' + ('0' + (f.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + f.getUTCDate()).slice(-2);
+}
+
+/** Valida 'AAAA-MM-DD': fecha real, no futura y no anterior a 2015. */
+function validarFecha_(valor, tz, etiqueta) {
+  const s = String(valor || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw errorUsuario_('Ingrese una fecha válida para ' + etiqueta + '.');
+  const p = s.split('-').map(Number);
+  const f = new Date(Date.UTC(p[0], p[1] - 1, p[2]));
+  if (f.getUTCFullYear() !== p[0] || f.getUTCMonth() !== p[1] - 1 || f.getUTCDate() !== p[2]) {
+    throw errorUsuario_('La fecha ' + formatoFecha_(s) + ' no existe.');
+  }
+  if (s > sumarDias_(hoy_(tz), 1)) throw errorUsuario_('No se permiten fechas futuras (' + formatoFecha_(s) + '). Revise la fecha.');
+  if (s < '2015-01-01') throw errorUsuario_('Revise el año de la fecha (' + formatoFecha_(s) + ').');
+  return s;
+}
+
+function fechaATexto_(valor, tz) {
+  if (valor instanceof Date) return isNaN(valor.getTime()) ? '' : Utilities.formatDate(valor, tz, 'yyyy-MM-dd');
+  const s = String(valor === null || valor === undefined ? '' : valor).trim();
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return m[3] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2);
+  return '';
+}
+
+function fechaHoraATexto_(valor, tz) {
+  if (valor instanceof Date) return isNaN(valor.getTime()) ? '' : Utilities.formatDate(valor, tz, 'yyyy-MM-dd HH:mm');
+  return String(valor === null || valor === undefined ? '' : valor).trim();
+}
+
+/** 'AAAA-MM-DD' → fecha a las 12:00 en la zona de la hoja (evita corrimientos de día). */
+function textoAFecha_(iso, tz) {
+  return Utilities.parseDate(iso + ' 12:00', tz, 'yyyy-MM-dd HH:mm');
+}
+
+/** v2.2: 'AAAA-MM-DD HH:mm' (o solo la fecha) → fecha y hora en la zona de la hoja. */
+function textoAFechaHora_(texto, tz) {
+  const s = String(texto).trim();
+  return Utilities.parseDate(s.length === 10 ? s + ' 00:00' : s, tz, 'yyyy-MM-dd HH:mm');
+}
+
+/** v2.2: días entre dos fechas 'AAAA-MM-DD' (b − a). */
+function diasEntre_(a, b) {
+  const p = String(a).split('-').map(Number);
+  const q = String(b).split('-').map(Number);
+  return Math.round((Date.UTC(q[0], q[1] - 1, q[2]) - Date.UTC(p[0], p[1] - 1, p[2])) / 86400000);
+}
+
+// ─────────────────────── 13. Paquetes de actualización (mecanismo de la v2.1) ───────────────────────
+/*
+ * Paquetes de datos que el sistema aplica SOLO, una única vez por libro (clave «id de paquete | id de hoja»),
+ * al ejecutar «instalarActualizacionMB» o en el primer ingreso de una administradora.
+ *  - «salon-2026-10-05» (v2.1) ya está aplicado en el libro vivo: NUNCA se vuelve a ejecutar. Si su marca se
+ *    perdiera, se detecta por sus hojas «Salón · …» y se marca sin ejecutarlo (no pisa las ediciones de Mirian).
+ *  - v2.3: un paquete por fase. Si el módulo de una fase todavía no está instalado, su paquete se omite sin
+ *    marcarse (se aplicará cuando se instale). Todo paquete que toca filas existentes hace antes un respaldo.
+ *  - Si algo falla, el paquete no se marca y se reintenta. Repetirlo no duplica nada.
+ */
+const CLAVE_PAQUETES = 'MB_PAQUETES_APLICADOS';
+const CLAVE_PAQUETES_AVISADOS = 'MB_PAQUETES_AVISADOS';
+const HOJA_ACTUALIZACIONES = 'Salón · Actualizaciones';
+const HOJA_CONTROL_SALON = 'Salón · Control mensual';
+const COLOR_SALON = '#7A5C3E';
+const USUARIO_ACTUALIZACION = 'Actualización automática del sistema';
+
+const PAQUETES = [
+  {
+    id: 'salon-2026-10-05',
+    titulo: 'tarifario, comisiones y rentabilidad del salón (05/10/2026)',
+    soloAdministradoras: true,
+    detectarAplicado: function (ss) { return !!ss.getSheetByName(HOJA_ACTUALIZACIONES) || !!ss.getSheetByName('Salón · Tarifario'); },
+    disponible: function () { return typeof DATOS_SALON !== 'undefined'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteSalon_(ss, email, tz); },
+  },
+  {
+    id: 'v23-f1-nucleo',
+    titulo: 'núcleo de la versión 2.3',
+    aviso: 'Versión 2.3: ingreso con Google, roles (ADMINISTRADOR / OPERATIVO), auditoría de cada movimiento y panel de pendientes.',
+    disponible: function () { return typeof aplicarPaqueteNucleo_ === 'function'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteNucleo_(ss, email, tz); },
+  },
+  {
+    id: 'v23-f2-cartera',
+    titulo: 'cartera de crédito y cobranzas (v2.3)',
+    aviso: 'Nuevo: «Cartera» (ventas a crédito con plan de pagos, cobros en cascada, estado de cada clienta y cierre mensual).',
+    disponible: function () { return typeof aplicarPaqueteCartera_ === 'function'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteCartera_(ss, email, tz); },
+  },
+  {
+    id: 'v23-f3-clientes',
+    titulo: 'base de clientes y proveedores (v2.3)',
+    aviso: 'Nuevo: «Base de datos» de clientes (con campos obligatorios y pendientes de completar) y «Proveedores».',
+    disponible: function () { return typeof aplicarPaqueteClientes_ === 'function'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteClientes_(ss, email, tz); },
+  },
+  {
+    id: 'v23-f4-tickets',
+    titulo: 'venta en un solo ticket y recálculo de comisiones (v2.3)',
+    aviso: 'Nuevo: «Venta» (cliente + servicios y productos en un solo ticket, con IVA en tiempo real) y «Recalcular comisiones».',
+    disponible: function () { return typeof aplicarPaqueteTickets_ === 'function'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteTickets_(ss, email, tz); },
+  },
+  {
+    id: 'v23-f5-agenda',
+    titulo: 'agenda del salón (v2.3)',
+    aviso: 'Nuevo: «Agenda» del salón (día y semana por profesional) sincronizada con Google Calendar.',
+    disponible: function () { return typeof aplicarPaqueteAgenda_ === 'function'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteAgenda_(ss, email, tz); },
+  },
+  {
+    id: 'v23-f6-fiscal',
+    titulo: 'facturación electrónica, WhatsApp y reportes (v2.3)',
+    aviso: 'Nuevo: «Reportes» (día, semana, mes y año; A4 y PDF) y libro de ventas. SIFEN y WhatsApp siguen en SIMULACIÓN.',
+    disponible: function () { return typeof aplicarPaqueteFiscal_ === 'function'; },
+    aplicar: function (ss, email, tz) { return aplicarPaqueteFiscal_(ss, email, tz); },
+  },
+];
+
+/** EDITOR: aplica ya los paquetes pendientes (seleccionar y pulsar «Ejecutar»). instalarActualizacionMB lo incluye. */
+function aplicarActualizacionesAhora() {
+  exigirEditorOTrigger_(null);
+  return conBloqueo_(function () {
+    const ss = abrirHoja_();
+    const tz = zonaHoraria_(ss);
+    const email = String(Session.getEffectiveUser().getEmail() || CONFIG.CORREO_ADMIN).toLowerCase();
+    asegurarEstructura_(ss);
+    const avisos = aplicarPaquetes_(ss, email, tz, ROLES.ADMIN);
+    SpreadsheetApp.flush();
+    console.log(avisos.length ? avisos.join('\n') : 'No hay actualizaciones pendientes: el sistema ya está al día.');
+    return avisos;
+  });
+}
+
+/**
+ * Aplica los paquetes pendientes y devuelve los avisos para quien ingresa (cada aviso se muestra una sola vez por correo).
+ * Los avisos de paquetes «soloAdministradoras» no se muestran a las operativas. Devuelve también el detalle en
+ * aplicarPaquetes_.ultimo (para el informe de instalación).
+ */
+function aplicarPaquetes_(ss, email, tz, rol) {
+  const props = PropertiesService.getScriptProperties();
+  const aplicados = leerJsonPropiedad_(props, CLAVE_PAQUETES);
+  const avisados = leerJsonPropiedad_(props, CLAVE_PAQUETES_AVISADOS);
+  const avisos = [];
+  const detalle = [];
+  const idHoja = ss.getId();
+  PAQUETES.forEach(function (paq) {
+    const clave = paq.id + '|' + idHoja;
+    if (!aplicados[clave]) {
+      if (paq.disponible && !paq.disponible()) { detalle.push({ id: paq.id, estado: 'NO INSTALADO' }); return; }
+      if (paq.detectarAplicado && paq.detectarAplicado(ss)) {
+        aplicados[clave] = { fecha: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'), por: email, resumen: 'ya estaba aplicado en este libro (detectado; no se volvió a ejecutar).' };
+        props.setProperty(CLAVE_PAQUETES, JSON.stringify(aplicados));
+        detalle.push({ id: paq.id, estado: 'DETECTADO' });
+        return;
+      }
+      try {
+        const resumen = paq.aplicar(ss, email, tz);
+        SpreadsheetApp.flush();
+        aplicados[clave] = { fecha: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'), por: email, resumen: resumen };
+        props.setProperty(CLAVE_PAQUETES, JSON.stringify(aplicados));
+        detalle.push({ id: paq.id, estado: 'APLICADO', resumen: resumen });
+      } catch (e) {
+        console.error('Paquete ' + paq.id + ': ' + (e && e.stack ? e.stack : e));
+        detalle.push({ id: paq.id, estado: 'ERROR', resumen: String(e && e.message ? e.message : e) });
+        avisos.push('No se pudo completar la actualización del ' + paq.titulo + ' (' + String(e && e.message ? e.message : e) + '). Se reintentará sola.');
+        return;
+      }
+    } else {
+      detalle.push({ id: paq.id, estado: 'YA APLICADO' });
+    }
+    const vistos = avisados[clave] || [];
+    if (email && vistos.indexOf(email) < 0) {
+      const esAdmin = rol === ROLES.ADMIN;
+      if (paq.aviso) avisos.push(paq.aviso);
+      else if (!paq.soloAdministradoras || esAdmin) avisos.push('Actualización aplicada: ' + aplicados[clave].resumen);
+      vistos.push(email);
+      avisados[clave] = vistos;
+      props.setProperty(CLAVE_PAQUETES_AVISADOS, JSON.stringify(avisados));
+    }
+  });
+  aplicarPaquetes_.ultimo = detalle;
+  return avisos;
+}
+
+function leerJsonPropiedad_(props, clave) {
+  try {
+    const v = JSON.parse(props.getProperty(clave) || '{}');
+    return v && typeof v === 'object' ? v : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+/** Paquete del salón: catálogo de servicios + hojas de referencia + control mensual. */
+function aplicarPaqueteSalon_(ss, email, tz) {
+  if (typeof DATOS_SALON === 'undefined') throw new Error('Falta el archivo DatosSalon.gs (datos del salón de la v2.1).');
+  const D = DATOS_SALON;
+  const r = cargarServiciosSalon_(ss, D.servicios, tz);
+  D.hojas.forEach(function (spec) { escribirHojaReferencia_(ss, spec, D.estilos); });
+  const tarifario = ss.getSheetByName(D.tarifario.hoja);
+  if (tarifario && r.codigos.length) {
+    tarifario.getRange(D.tarifario.fila, D.tarifario.columna, r.codigos.length, 1)
+      .setValues(r.codigos.map(function (c) { return [c]; }));
+  }
+  crearControlMensualSalon_(ss, D.control);
+  anotarLeameYVersion_(ss);
+  const resumen = D.servicios.length + ' servicios del salón en «Servicios» (' + r.creados + ' nuevos, ' + r.actualizados +
+    ' actualizados) y ' + (D.hojas.length + 2) + ' hojas «Salón · …» con el tarifario, las comisiones, la rentabilidad y el control mensual. «Personal» no se modificó.';
+  const registro = r.cambios.map(function (c) { return [D.version, c[0], c[1], email]; });
+  registro.push([D.version, 'Hojas de referencia', D.hojas.map(function (h) { return h.n; }).join(', ') + ', ' + HOJA_CONTROL_SALON, email]);
+  registro.push([D.version, 'Paquete aplicado', resumen, email]);
+  registrarActualizaciones_(ss, registro);
+  return resumen;
+}
+
+/** Agrega o actualiza los servicios del tarifario en «Servicios» (por nombre, sin duplicar). */
+function cargarServiciosSalon_(ss, lista, tz) {
+  const tabla = leerTabla_(ss, 'servicios', tz);
+  let siguiente = siguienteNumero_(tabla.filas.map(function (f) { return f.codigo; }), 'SV-');
+  const ahora = new Date();
+  const nuevos = [], codigos = [], cambios = [];
+  let creados = 0, actualizados = 0;
+  lista.forEach(function (s) {
+    const precio = Math.round(Number(s.precio)) || 0;
+    const comision = Math.round((Number(s.comision) || 0) * 100) / 100;
+    const textoPct = comision > 0 ? numeroTexto_(comision) + '%' : '% de cada profesional';
+    const existente = tabla.filas.find(function (f) { return normalizar_(f.nombre) === normalizar_(s.nombre); });
+    if (existente) {
+      codigos.push(existente.codigo);
+      if (existente.precio !== precio || Math.abs((existente.comision || 0) - comision) > 0.001) {
+        actualizarCeldas_(tabla, existente._fila, { precio: precio, comision: comision, actualizado: ahora, usuario: USUARIO_ACTUALIZACION }, tz);
+        cambios.push(['Servicio actualizado', existente.codigo + ' · ' + existente.nombre + ': precio Gs. ' + miles_(existente.precio) + ' → ' +
+          miles_(precio) + '; comisión ' + (existente.comision > 0 ? numeroTexto_(existente.comision) + '%' : '% de cada profesional') + ' → ' + textoPct]);
+        actualizados++;
+      }
+      return;
+    }
+    const codigo = formatoCodigo_('SV-', siguiente++, 3);
+    codigos.push(codigo);
+    nuevos.push({ codigo: codigo, nombre: s.nombre, precio: precio, comision: comision, activo: 'Sí', actualizado: ahora, usuario: USUARIO_ACTUALIZACION });
+    cambios.push(['Servicio creado', codigo + ' · ' + s.nombre + ': Gs. ' + miles_(precio) + ' · comisión: ' + textoPct]);
+    creados++;
+  });
+  agregarFilas_(tabla, nuevos, tz);
+  return { codigos: codigos, cambios: cambios, creados: creados, actualizados: actualizados };
+}
+
+/** Recrea una hoja de referencia a partir de su especificación (valores, formatos, combinaciones y anchos). */
+function escribirHojaReferencia_(ss, spec, estilos) {
+  let hoja = ss.getSheetByName(spec.n);
+  const conservados = [];
+  if (hoja) {
+    (spec.k || []).forEach(function (a1) { conservados.push([a1, hoja.getRange(a1).getValues()]); });
+    quitarProtecciones_(hoja);
+    hoja.getRange(1, 1, hoja.getMaxRows(), hoja.getMaxColumns()).breakApart();
+    hoja.clear();
+    hoja.getRange(1, 1, hoja.getMaxRows(), hoja.getMaxColumns()).clearDataValidations();
+  } else {
+    hoja = ss.insertSheet(spec.n, ss.getSheets().length);
+  }
+  const nf = spec.v.length;
+  const nc = spec.nc;
+  asegurarTamano_(hoja, nf, nc);
+
+  const formatos = [], valores = [], tamanos = [], negritas = [], cursivas = [], ajustes = [];
+  const colores = {}, fondos = {}, horizontales = {}, verticales = {}, conBorde = [];
+  for (let i = 0; i < nf; i++) {
+    const fila = spec.v[i];
+    const ids = [];
+    (spec.s[i] || []).forEach(function (par) { for (let k = 0; k < par[1]; k++) ids.push(par[0]); });
+    while (ids.length < nc) ids.push(0);
+    const fFmt = [], fVal = [], fTam = [], fNeg = [], fCur = [], fAju = [];
+    for (let j = 0; j < nc; j++) {
+      const e = estilos[ids[j]];
+      const v = j < fila.length ? fila[j] : '';
+      fVal.push(v);
+      fFmt.push(typeof v === 'number' ? e[0] : '@');
+      fTam.push(e[3]);
+      fNeg.push(e[1] ? 'bold' : 'normal');
+      fCur.push(e[2] ? 'italic' : 'normal');
+      fAju.push(!!e[6]);
+    }
+    formatos.push(fFmt); valores.push(fVal); tamanos.push(fTam); negritas.push(fNeg); cursivas.push(fCur); ajustes.push(fAju);
+    agruparTramos_(colores, tramosFila_(ids, estilos, 4, i + 1, '#000000'));
+    agruparTramos_(fondos, tramosFila_(ids, estilos, 5, i + 1, null));
+    agruparTramos_(horizontales, tramosFila_(ids, estilos, 7, i + 1, null));
+    agruparTramos_(verticales, tramosFila_(ids, estilos, 8, i + 1, null));
+    tramosFila_(ids, estilos, 9, i + 1, false).forEach(function (t) { conBorde.push(t[1]); });
+  }
+  const rango = hoja.getRange(1, 1, nf, nc);
+  intentar_('formatos de número', function () { rango.setNumberFormats(formatos); });
+  rango.setValues(valores);
+  intentar_('fuentes', function () {
+    rango.setFontFamily('Arial').setFontSizes(tamanos).setFontWeights(negritas).setFontStyles(cursivas).setFontColor('#000000');
+  });
+  intentar_('ajuste de texto', function () { rango.setWraps(ajustes).setVerticalAlignment('middle'); });
+  aplicarGrupos_(hoja, colores, 'colores', function (rl, v) { rl.setFontColor(v); });
+  aplicarGrupos_(hoja, fondos, 'fondos', function (rl, v) { rl.setBackground(v); });
+  aplicarGrupos_(hoja, horizontales, 'alineación', function (rl, v) { rl.setHorizontalAlignment(v); });
+  aplicarGrupos_(hoja, verticales, 'alineación vertical', function (rl, v) { rl.setVerticalAlignment(v); });
+  if (conBorde.length) {
+    aplicarGrupos_(hoja, { borde: conBorde }, 'bordes', function (rl) {
+      rl.setBorder(true, true, true, true, true, true, '#D9D4CA', SpreadsheetApp.BorderStyle.SOLID);
+    });
+  }
+  const merges = (spec.m || []).map(rangoNumerico_);
+  merges.forEach(function (m) {
+    intentar_('combinar ' + m.a1, function () { hoja.getRange(m.r1, m.c1, m.r2 - m.r1 + 1, m.c2 - m.c1 + 1).merge(); });
+  });
+  (spec.w || []).forEach(function (px, j) {
+    if (px > 0) intentar_('ancho', function () { hoja.setColumnWidth(j + 1, px); });
+  });
+  (spec.h || []).forEach(function (par) { intentar_('alto', function () { hoja.setRowHeight(par[0], par[1]); }); });
+  const fr = merges.some(function (m) { return m.r1 <= spec.fr && spec.fr < m.r2; }) ? 0 : (spec.fr || 0);
+  const fc = merges.some(function (m) { return m.c1 <= spec.fc && spec.fc < m.c2; }) ? 0 : (spec.fc || 0);
+  intentar_('inmovilizar', function () { hoja.setFrozenRows(fr); hoja.setFrozenColumns(fc); });
+  if (spec.g === false) intentar_('líneas de cuadrícula', function () { hoja.setHiddenGridlines(true); });
+  intentar_('color de pestaña', function () { hoja.setTabColor(COLOR_SALON); });
+  conservados.forEach(function (par) { hoja.getRange(par[0]).setValues(par[1]); });
+  const descripcion = 'Salón: hoja de referencia (copia del archivo Excel)';
+  if (spec.p === 'hoja') {
+    hoja.protect().setDescription(descripcion).setWarningOnly(true);
+  } else if (spec.p === 'rangos') {
+    (spec.pr || []).forEach(function (a1) { hoja.getRange(a1).protect().setDescription(descripcion).setWarningOnly(true); });
+  }
+  return hoja;
+}
+
+/** Control mensual que se completa solo con «Servicios realizados» y «Movimientos de stock». */
+function crearControlMensualSalon_(ss, control) {
+  let hoja = ss.getSheetByName(HOJA_CONTROL_SALON);
+  const n = control.meses.length;
+  let cargados = null;
+  if (hoja) {
+    cargados = hoja.getRange(5, 6, n, 1).getValues();
+    quitarProtecciones_(hoja);
+    hoja.getRange(1, 1, hoja.getMaxRows(), hoja.getMaxColumns()).breakApart();
+    hoja.clear();
+  } else {
+    hoja = ss.insertSheet(HOJA_CONTROL_SALON, ss.getSheets().length);
+  }
+  asegurarTamano_(hoja, n + 10, 14);
+  const R = ESQUEMA.realizados, MV = ESQUEMA.movimientos;
+  const hR = ss.getSheetByName(R.hoja), hM = ss.getSheetByName(MV.hoja);
+  const ultR = letraColumna_(Math.max(hR ? hR.getMaxColumns() : 26, R.columnas.length));
+  const ultM = letraColumna_(Math.max(hM ? hM.getMaxColumns() : 26, MV.columnas.length));
+  const col = function (def, clave, ultima) {
+    const titulo = def.columnas.filter(function (c) { return c[0] === clave; })[0][1];
+    const h = "'" + def.hoja + "'";
+    return 'INDEX(' + h + '!$A:$' + ultima + ',0,MATCH("' + titulo + '",' + h + '!$1:$1,0))';
+  };
+  const F = col(R, 'fecha', ultR), E = col(R, 'estado', ultR), P = col(R, 'precio', ultR);
+  const K = col(R, 'comision', ultR), CL = col(R, 'cliente', ultR);
+  const MT = col(MV, 'tipo', ultM), MF = col(MV, 'fecha', ultM), MQ = col(MV, 'cantidad', ultM), MC = col(MV, 'costoUnitario', ultM);
+  const uso = TIPOS_MOVIMIENTO.uso.etiqueta;
+
+  hoja.getRange(1, 1).setValue('Control mensual del salón: real (sistema MB) frente al plan').setFontSize(14).setFontWeight('bold').setFontColor('#2B2A27');
+  hoja.getRange(2, 1).setValue('Se completa solo con los servicios realizados y el «Uso en salón» registrados en el sistema. Solo la columna F se carga a mano (opcional).')
+    .setFontStyle('italic').setFontColor('#595959');
+  const enc = ['Mes', 'Facturación de servicios (IVA incl.)', 'N° de servicios', 'Comisiones del período', 'Uso en salón a costo (insumos)',
+    'Venta de productos en el salón (IVA incl.; opcional, a mano)', 'Clientas atendidas', 'Ticket por servicio', '% comisiones s/ facturación',
+    '% insumos s/ ingresos sin IVA', 'Meta de facturación (plan con curva de arranque)', 'Cumplimiento de la meta', 'Desde', 'Hasta'];
+  const rEnc = hoja.getRange(4, 1, 1, enc.length);
+  rEnc.setValues([enc]);
+  estiloEncabezado_(rEnc);
+  rEnc.setHorizontalAlignment('center');
+  hoja.setRowHeight(4, 62);
+
+  const filas = control.meses.map(function (m, i) {
+    const r = 5 + i;
+    const fin = m.mes === 12 ? [m.anio + 1, 1] : [m.anio, m.mes + 1];
+    const enMes = '(' + F + '>=$M' + r + ')*(' + F + '<$N' + r + ')';
+    return [
+      m.etiqueta,
+      '=SUMPRODUCT(' + enMes + '*(' + E + '<>"Anulado"),' + P + ')',
+      '=SUMPRODUCT(' + enMes + '*(' + E + '<>"Anulado"))',
+      '=SUMPRODUCT(' + enMes + '*(' + E + '<>"Anulado"),' + K + ')',
+      '=-SUMPRODUCT((' + MT + '="' + uso + '")*(' + MF + '>=$M' + r + ')*(' + MF + '<$N' + r + '),' + MQ + ',' + MC + ')',
+      '',
+      '=IFERROR(COUNTUNIQUE(FILTER(' + CL + ',' + F + '>=$M' + r + ',' + F + '<$N' + r + ',' + E + '<>"Anulado",' + CL + '<>"")),0)',
+      '=IF(C' + r + '>0,B' + r + '/C' + r + ',"")',
+      '=IF(B' + r + '>0,D' + r + '/B' + r + ',"")',
+      '=IF(B' + r + '>0,E' + r + '/(B' + r + '/1.1),"")',
+      m.meta,
+      '=IF(AND(K' + r + '>0,B' + r + '>0),B' + r + '/K' + r + ',"")',
+      '=DATE(' + m.anio + ',' + m.mes + ',1)',
+      '=DATE(' + fin[0] + ',' + fin[1] + ',1)',
+    ];
+  });
+  hoja.getRange(5, 1, n, 1).setNumberFormat('@');
+  hoja.getRange(5, 1, n, 14).setValues(filas);
+  const rp = 5 + n;
+  hoja.getRange(rp, 1, 1, 14).setValues([['Plan (escenario base)', '', '', '', '', '', '', control.plan.ticket, control.plan.comisiones,
+    control.plan.insumos, '=SUM(K5:K' + (rp - 1) + ')', '', '', '']]);
+  hoja.getRange(rp, 1, 1, 14).setFontWeight('bold').setBackground('#EFEAE1');
+  intentar_('formatos del control', function () {
+    hoja.getRange(5, 2, n + 1, 1).setNumberFormat('#,##0');
+    hoja.getRange(5, 3, n + 1, 1).setNumberFormat('#,##0');
+    hoja.getRange(5, 4, n + 1, 3).setNumberFormat('#,##0');
+    hoja.getRange(5, 7, n + 1, 1).setNumberFormat('#,##0');
+    hoja.getRange(5, 8, n + 1, 1).setNumberFormat('#,##0');
+    hoja.getRange(5, 9, n + 1, 2).setNumberFormat('0.0%');
+    hoja.getRange(5, 11, n + 1, 1).setNumberFormat('#,##0');
+    hoja.getRange(5, 12, n + 1, 1).setNumberFormat('0.0%');
+    hoja.getRange(5, 13, n, 2).setNumberFormat('dd/mm/yyyy');
+    hoja.getRange(5, 6, n, 1).setFontColor('#0000FF').setBackground('#FFFDE7');
+    hoja.getRange(4, 1, n + 2, 14).setFontFamily('Arial');
+    hoja.getRange(4, 1, n + 2, 12).setBorder(true, true, true, true, true, true, '#D9D4CA', SpreadsheetApp.BorderStyle.SOLID);
+    [110, 150, 90, 140, 150, 170, 100, 120, 120, 120, 170, 120, 90, 90].forEach(function (px, j) { hoja.setColumnWidth(j + 1, px); });
+    hoja.setFrozenRows(4);
+    hoja.setFrozenColumns(1);
+    hoja.hideColumns(13, 2);
+    hoja.setTabColor(COLOR_SALON);
+  });
+  hoja.getRange(rp + 2, 1).setValue('Alerta: si el % de insumos real supera al del plan en más de 2 puntos, revisar el recetario, las porciones y los registros de «Uso en salón».').setFontStyle('italic');
+  hoja.getRange(rp + 3, 1).setValue('Meta de facturación: plan del escenario base con curva de arranque (archivo Excel del 05/10/2026).').setFontStyle('italic');
+  if (cargados) hoja.getRange(5, 6, n, 1).setValues(cargados);
+  const descripcion = 'Salón: control mensual (fórmulas automáticas)';
+  hoja.getRange(1, 1, rp, 5).protect().setDescription(descripcion).setWarningOnly(true);
+  hoja.getRange(1, 7, rp, 8).protect().setDescription(descripcion).setWarningOnly(true);
+  hoja.getRange(1, 6, 4, 1).protect().setDescription(descripcion).setWarningOnly(true);
+  return hoja;
+}
+
+/** Agrega líneas en «Léame» (sin repetir) y actualiza «Versión del sistema» en «Configuración». */
+function anotarLeameYVersion_(ss, lineas) {
+  const leame = ss.getSheetByName(HOJA_LEAME);
+  if (leame) {
+    const textos = lineas && lineas.length ? lineas
+      : ['• Hojas «Salón · …»: tarifario, comisiones, costos, rentabilidad, mercado y marco legal del salón (copia de referencia); «Salón · Control mensual» se completa solo con los registros del sistema.'];
+    textos.forEach(function (texto) {
+      const ultima = Math.max(leame.getLastRow(), 1);
+      const existentes = leame.getRange(1, 1, ultima, 1).getValues().map(function (f) { return String(f[0]); });
+      if (existentes.indexOf(texto) < 0) leame.getRange(ultima + 1, 1).setValue(texto).setWrap(true);
+    });
+  }
+  const conf = ss.getSheetByName(HOJA_CONFIG);
+  if (conf && conf.getLastRow() >= 1) {
+    const v = conf.getRange(1, 1, conf.getLastRow(), 1).getValues();
+    for (let i = 0; i < v.length; i++) {
+      if (String(v[i][0]).trim() === 'Versión del sistema') {
+        conf.getRange(i + 1, 2).setValue(celdaTexto_(CONFIG.VERSION));
+        break;
+      }
+    }
+  }
+}
+
+/** Anota filas [paquete, acción, detalle, correo] en «Salón · Actualizaciones». */
+function registrarActualizaciones_(ss, filas) {
+  if (!filas.length) return;
+  let hoja = ss.getSheetByName(HOJA_ACTUALIZACIONES);
+  if (!hoja) {
+    hoja = ss.insertSheet(HOJA_ACTUALIZACIONES, ss.getSheets().length);
+    const enc = hoja.getRange(1, 1, 1, 5);
+    enc.setValues([['Fecha y hora', 'Paquete', 'Acción', 'Detalle', 'Ingresó']]);
+    estiloEncabezado_(enc);
+    intentar_('formato del registro', function () {
+      hoja.setFrozenRows(1);
+      [140, 150, 200, 640, 240].forEach(function (px, j) { hoja.setColumnWidth(j + 1, px); });
+      hoja.setTabColor(COLOR_SALON);
+    });
+    hoja.protect().setDescription('Registro de actualizaciones automáticas').setWarningOnly(true);
+  }
+  const ahora = new Date();
+  const datos = filas.map(function (f) { return [ahora].concat(f.map(function (x) { return celdaTexto_(String(x)); })); });
+  const inicio = hoja.getLastRow() + 1;
+  const fin = inicio + datos.length - 1;
+  if (fin > hoja.getMaxRows()) hoja.insertRowsAfter(hoja.getMaxRows(), fin - hoja.getMaxRows() + 100);
+  hoja.getRange(inicio, 1, datos.length, 5).setValues(datos);
+  hoja.getRange(inicio, 1, datos.length, 1).setNumberFormat('dd/mm/yyyy hh:mm');
+}
+
+// Auxiliares de las actualizaciones
+
+function quitarProtecciones_(hoja) {
+  hoja.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+    .concat(hoja.getProtections(SpreadsheetApp.ProtectionType.RANGE))
+    .forEach(function (p) { p.remove(); });
+}
+
+function asegurarTamano_(hoja, filas, columnas) {
+  if (hoja.getMaxRows() < filas) hoja.insertRowsAfter(hoja.getMaxRows(), filas - hoja.getMaxRows());
+  if (hoja.getMaxColumns() < columnas) hoja.insertColumnsAfter(hoja.getMaxColumns(), columnas - hoja.getMaxColumns());
+}
+
+/** Tramos contiguos de una fila con el mismo valor de una propiedad de estilo: [[valor, 'B5:D5'], …]. */
+function tramosFila_(ids, estilos, prop, fila, omitir) {
+  const salida = [];
+  let actual = null, inicio = 0;
+  for (let j = 0; j <= ids.length; j++) {
+    let v = j < ids.length ? estilos[ids[j]][prop] : null;
+    if (v === omitir || v === null || v === undefined || v === false) v = null;
+    if (v !== actual) {
+      if (actual !== null) salida.push([actual, rangoA1_(fila, inicio + 1, fila, j)]);
+      actual = v;
+      inicio = j;
+    }
+  }
+  return salida;
+}
+
+function agruparTramos_(mapa, tramos) {
+  tramos.forEach(function (t) {
+    const clave = String(t[0]);
+    (mapa[clave] = mapa[clave] || []).push(t[1]);
+  });
+}
+
+function aplicarGrupos_(hoja, mapa, etiqueta, fn) {
+  Object.keys(mapa).forEach(function (clave) {
+    const lista = mapa[clave];
+    for (let i = 0; i < lista.length; i += 300) {
+      const lote = lista.slice(i, i + 300);
+      intentar_(etiqueta, function () { fn(hoja.getRangeList(lote), clave === 'true' ? true : clave); });
+    }
+  });
+}
+
+/** Ejecuta un paso cosmético: si falla, lo anota y sigue (los datos nunca dependen de estos pasos). */
+function intentar_(etiqueta, fn) {
+  try {
+    fn();
+  } catch (e) {
+    console.warn('Formato omitido (' + etiqueta + '): ' + (e && e.message ? e.message : e));
+  }
+}
+
+function letraColumna_(n) {
+  let s = '';
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function rangoA1_(f1, c1, f2, c2) {
+  const a = letraColumna_(c1) + f1;
+  const b = letraColumna_(c2) + f2;
+  return a === b ? a : a + ':' + b;
+}
+
+function rangoNumerico_(a1) {
+  const m = String(a1).match(/^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/);
+  const num = function (letras) {
+    let n = 0;
+    for (let i = 0; i < letras.length; i++) n = n * 26 + (letras.charCodeAt(i) - 64);
+    return n;
+  };
+  const c1 = num(m[1]), r1 = Number(m[2]);
+  const c2 = m[3] ? num(m[3]) : c1, r2 = m[4] ? Number(m[4]) : r1;
+  return { a1: a1, r1: r1, c1: c1, r2: r2, c2: c2 };
+}
+
+// Datos del paquete «salon-2026-10-05» (generados desde Salon-MB_Tarifario-Comisiones-Rentabilidad.xlsx)

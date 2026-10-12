@@ -1,0 +1,1034 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Seguridad (v2.3)
+ *  Identidad verificada por Google, sesiones, roles, permisos, lista blanca y auditoría.
+ * =====================================================================
+ *
+ *  POR QUÉ ASÍ (cuentas @gmail.com, documentación oficial de Apps Script):
+ *  - Con «Ejecutar como: Yo», Session.getActiveUser().getEmail() devuelve vacío para
+ *    cuentas @gmail.com: la app principal no puede saber quién la usa.
+ *  - ScriptApp.getIdentityToken() entrega un token OpenID Connect firmado por Google
+ *    (con scopes openid + userinfo.email incluye el correo). Lo obtiene el proyecto
+ *    chico «MB Acceso», que se ejecuta como la usuaria que accede y solo pide esos
+ *    dos permisos (no toca la hoja).
+ *  - Flujo: «Ingresar con Google» → MB Acceso → «Continuar» → esta app recibe
+ *    ?acceso=<token> (un solo uso) → lo valida con el endpoint tokeninfo de Google
+ *    (iss, aud = Client ID de MB Acceso, exp, email_verified) → crea una sesión
+ *    aleatoria con vencimiento y la entrega a la página. Cada llamada lleva el token
+ *    de sesión; el servidor resuelve correo y rol y valida PERMISOS en CADA función.
+ *  - Sesiones: en el servidor solo se guarda la huella SHA-256 del token (Script
+ *    Properties + caché). 12 horas, o 30 días con «Recordar este dispositivo».
+ *  - Respaldo: código de 6 dígitos por correo, SOLO si «Ingreso con código por
+ *    correo» = Sí en «Configuración» (por defecto No).
+ *
+ *  LÍMITES (declarados):
+ *  - No hay redirección sin clic: Google solo permite cambiar de página en la
+ *    pestaña principal con un clic de la persona (por eso «Continuar»).
+ *  - Cada usuaria acepta UNA vez el consentimiento de Google de «MB Acceso».
+ *  - Con varias cuentas de Google abiertas en el mismo navegador, Apps Script puede
+ *    fallar o tomar otra cuenta: use un perfil de navegador por persona.
+ *  - Quien tenga la sesión abierta en un dispositivo «recordado» entra como esa
+ *    persona: use «Salir» en equipos compartidos.
+ *  - tokeninfo es un servicio de Google que puede limitar consultas muy seguidas:
+ *    el sistema reintenta y, si está habilitado, ofrece el código por correo.
+ * =====================================================================
+ */
+
+const ROLES = Object.freeze({ ADMIN: 'ADMINISTRADOR', OPERATIVO: 'OPERATIVO' });
+
+const SEGURIDAD = Object.freeze({
+  CODIGO_MINUTOS: 10,
+  CODIGO_INTENTOS: 5,
+  CODIGOS_POR_HORA: 5,
+  CODIGOS_POR_DIA: 60,
+  BLOQUEO_MINUTOS: 60,
+  SESION_HORAS: 12,
+  DISPOSITIVO_DIAS: 30,
+  MAX_SESIONES_POR_USUARIA: 12,
+  CACHE_USUARIOS_SEG: 300,
+  PREFIJO_SESION: 'MB_S_',
+  TOKENINFO: 'https://oauth2.googleapis.com/tokeninfo?id_token=',
+  EMISORES_GOOGLE: Object.freeze(['accounts.google.com', 'https://accounts.google.com']),
+  REINTENTOS_TOKENINFO: 3,
+  PATRON_ENLACE_ACCESO: /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]{20,}\/exec$/,
+});
+
+/** Filas de «Configuración» que usa la identidad (las crea la instalación; si faltan, valen vacío / No). */
+const CFG_CLIENT_ID = 'Client ID de MB Acceso';
+const CFG_ENLACE_ACCESO = 'Enlace de MB Acceso';
+const CFG_CODIGO_CORREO = 'Ingreso con código por correo';
+
+/**
+ * Permisos por función del servidor (se verifican en CADA llamada, antes de leer datos).
+ * Función no listada = solo administradoras (falla cerrada). Incluye las de todas las fases:
+ * si una función todavía no existe, su permiso no hace nada.
+ */
+const TODAS_ = [ROLES.ADMIN, ROLES.OPERATIVO];
+const SOLO_ADMIN_ = [ROLES.ADMIN];
+const PERMISOS = Object.freeze({
+  obtenerDatos: TODAS_,
+  // Inventario y ventas (v2.1)
+  guardarProducto: SOLO_ADMIN_, // precios y costos
+  registrarMovimiento: TODAS_, // el costo de un ingreso solo lo fija una administradora
+  guardarPeluqueria: TODAS_, // la categoría de crédito solo la asigna una administradora
+  registrarVenta: TODAS_,
+  cambiarEstadoVenta: TODAS_, // anular: solo administradoras (se valida adentro)
+  // Salón y comisiones
+  guardarProfesional: SOLO_ADMIN_,
+  guardarServicio: SOLO_ADMIN_,
+  registrarServicio: TODAS_, // el % lo decide la regla vigente; solo una administradora lo cambia
+  anularServicio: SOLO_ADMIN_,
+  liquidarComisiones: SOLO_ADMIN_,
+  // R0 Cartera
+  calcularPlanCredito: TODAS_,
+  registrarCobro: TODAS_,
+  anularCobro: SOLO_ADMIN_,
+  conciliarCobros: SOLO_ADMIN_,
+  guardarCategoriaCliente: SOLO_ADMIN_,
+  confirmarSaldoHistorico: SOLO_ADMIN_,
+  confirmarPlanCredito: SOLO_ADMIN_,
+  resolverCobroAConfirmar: SOLO_ADMIN_,
+  obtenerFichaCliente: TODAS_,
+  obtenerCartera: TODAS_,
+  exportarEstadoCuenta: TODAS_,
+  obtenerCierreMensual: SOLO_ADMIN_,
+  registrarCierreMensual: SOLO_ADMIN_,
+  guardarParametro: SOLO_ADMIN_,
+  vistaPreviaMigracion: SOLO_ADMIN_,
+  ejecutarMigracion: SOLO_ADMIN_,
+  // R1 Clientes e historial
+  obtenerClientes: TODAS_,
+  guardarCliente: TODAS_,
+  exportarClientesCsv: SOLO_ADMIN_,
+  resolverUnificacion: SOLO_ADMIN_,
+  vincularClienteServicio: SOLO_ADMIN_,
+  cargarImportacion: SOLO_ADMIN_,
+  obtenerImportacion: SOLO_ADMIN_,
+  aprobarImportacion: SOLO_ADMIN_,
+  vistaPreviaImportacion: SOLO_ADMIN_, // v2.3 · Fase 3
+  editarImportacion: SOLO_ADMIN_,
+  vistaPreviaAprobacion: SOLO_ADMIN_,
+  plantillaImportacion: SOLO_ADMIN_,
+  // R2 Proveedores (confidencial)
+  obtenerProveedores: SOLO_ADMIN_,
+  guardarProveedor: SOLO_ADMIN_,
+  renovarAcuerdo: SOLO_ADMIN_,
+  asignarProductosProveedor: SOLO_ADMIN_, // v2.3 · Fase 3
+  revisarAcuerdosAhora: SOLO_ADMIN_,
+  // R3 Comisiones
+  vistaPreviaRecalculo: SOLO_ADMIN_,
+  aplicarRecalculo: SOLO_ADMIN_,
+  revertirLoteRecalculo: SOLO_ADMIN_,
+  registrarCambioPorcentaje: SOLO_ADMIN_,
+  obtenerRecalculos: SOLO_ADMIN_,
+  // R4 Ticket
+  calcularTicket: TODAS_,
+  registrarTicket: TODAS_,
+  anularTicket: SOLO_ADMIN_,
+  obtenerTicket: TODAS_,
+  // R5 Agenda
+  obtenerAgenda: TODAS_,
+  guardarTurno: TODAS_,
+  cambiarEstadoTurno: TODAS_,
+  prepararCobroTurno: TODAS_,
+  guardarBloqueo: SOLO_ADMIN_,
+  sincronizarAgendaAhora: SOLO_ADMIN_,
+  // RT Fiscal, WhatsApp y reportes
+  emitirComprobante: SOLO_ADMIN_,
+  reenviarKude: SOLO_ADMIN_,
+  enviarRecordatorio: SOLO_ADMIN_,
+  obtenerReporte: SOLO_ADMIN_,
+  exportarReportePdf: SOLO_ADMIN_,
+  obtenerLibroVentas: SOLO_ADMIN_,
+  // Sistema
+  guardarUsuario: SOLO_ADMIN_,
+  revocarSesiones: SOLO_ADMIN_,
+  guardarRegistro: SOLO_ADMIN_,
+  quitarAccesoHoja: SOLO_ADMIN_,
+  guardarIntegracion: SOLO_ADMIN_,
+  guardarConfiguracion: SOLO_ADMIN_,
+  obtenerSalud: SOLO_ADMIN_,
+  obtenerAuditoria: SOLO_ADMIN_,
+  ejecutarMantenimiento: SOLO_ADMIN_,
+  moverLibroACarpeta: SOLO_ADMIN_,
+});
+
+// ─────────────────────── Memoria por ejecución ───────────────────────
+
+let memoria_ = { usuarios: null, parametros: null, categorias: null, config: null };
+let AUDITORIA_ = null;
+
+/** Cada llamada del navegador es una ejecución nueva; por las dudas se limpia todo al comenzar. */
+function reiniciarMemoriaEjecucion_() {
+  memoria_ = { usuarios: null, parametros: null, categorias: null, config: null };
+  AUDITORIA_ = null;
+}
+
+// ─────────────────────── Roles ───────────────────────
+
+function esAdminFijo_(email) {
+  const e = String(email || '').toLowerCase().trim();
+  if (!e) return false;
+  return CONFIG.ADMINS_FIJOS.indexOf(e) >= 0 || e === CONFIG.CORREO_ADMIN;
+}
+
+function esAdministradora_(usuario) {
+  return !!usuario && usuario.rol === ROLES.ADMIN;
+}
+
+function normalizarRol_(v) {
+  return /^admin/i.test(String(v || '').trim()) ? ROLES.ADMIN : ROLES.OPERATIVO;
+}
+
+/** Lee «Usuarios» sin exigir las columnas nuevas. Devuelve { correo: { activo, rol, nombre, fila } }. */
+function mapaUsuarios_(ss) {
+  if (memoria_.usuarios) return memoria_.usuarios;
+  const cache = CacheService.getScriptCache();
+  const clave = 'mb_usuarios_' + ss.getId();
+  const enCache = cache.get(clave);
+  if (enCache) {
+    try { memoria_.usuarios = JSON.parse(enCache); return memoria_.usuarios; } catch (e) { /* se relee */ }
+  }
+  const hoja = ss.getSheetByName(ESQUEMA.usuarios.hoja);
+  const mapa = {};
+  if (hoja && hoja.getLastRow() >= 2) {
+    const valores = hoja.getDataRange().getValues();
+    const enc = valores[0].map(function (v) { return String(v).trim(); });
+    const iCorreo = enc.indexOf('Correo');
+    const iActivo = enc.indexOf('Activo');
+    const iRol = enc.indexOf('Rol');
+    const iNombre = enc.indexOf('Nombre');
+    for (let r = 1; r < valores.length; r++) {
+      const correo = String(valores[r][iCorreo] || '').trim().toLowerCase();
+      if (!correo) continue;
+      mapa[correo] = {
+        activo: iActivo < 0 ? true : esActivo_(valores[r][iActivo]),
+        rol: iRol < 0 ? '' : String(valores[r][iRol] || '').trim(),
+        nombre: iNombre < 0 ? '' : String(valores[r][iNombre] || '').trim(),
+        fila: r + 1,
+      };
+    }
+  }
+  memoria_.usuarios = mapa;
+  try { cache.put(clave, JSON.stringify(mapa), SEGURIDAD.CACHE_USUARIOS_SEG); } catch (e) { /* sin caché */ }
+  return mapa;
+}
+
+function olvidarUsuariosEnCache_(ss) {
+  memoria_.usuarios = null;
+  try { CacheService.getScriptCache().remove('mb_usuarios_' + ss.getId()); } catch (e) { /* nada */ }
+}
+
+/** Usuario efectivo de un correo: { email, rol, nombre, activo, existe }. Las administradoras fijas siempre son ADMINISTRADOR. */
+function usuarioPorCorreo_(ss, email) {
+  const e = String(email || '').toLowerCase();
+  const u = mapaUsuarios_(ss)[e];
+  if (esAdminFijo_(e)) return { email: e, rol: ROLES.ADMIN, nombre: u ? u.nombre : '', activo: true, existe: !!u, fijo: true };
+  if (!u) return { email: e, rol: ROLES.OPERATIVO, nombre: '', activo: false, existe: false };
+  return { email: e, rol: normalizarRol_(u.rol), nombre: u.nombre, activo: u.activo, existe: true };
+}
+
+/**
+ * ¿Puede ingresar este correo (ya verificado)? Lanza un error claro si no.
+ * Devuelve { nuevo: true } cuando entra por registro abierto (se crea como OPERATIVO).
+ */
+function evaluarAccesoCorreo_(ss, email, tz) {
+  const u = usuarioPorCorreo_(ss, email);
+  if (u.fijo) return { nuevo: !u.existe, rol: ROLES.ADMIN };
+  if (u.existe && !u.activo) {
+    throw errorUsuario_('El correo ' + email + ' está desactivado en el sistema. Consulte con la administración de Distribuidora MB.');
+  }
+  if (!u.existe) {
+    if (!registroAbierto_(ss)) {
+      throw errorUsuario_('El correo ' + email + ' no está habilitado y el registro de nuevos correos está cerrado. ' +
+        'Pida a la administración de Distribuidora MB que la habilite en Sistema › Usuarias.');
+    }
+    return { nuevo: true, rol: ROLES.OPERATIVO };
+  }
+  return { nuevo: false, rol: u.rol };
+}
+
+// ─────────────────────── Utilidades criptográficas ───────────────────────
+
+function hashHex_(texto) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(texto), Utilities.Charset.UTF_8);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += ('0' + (bytes[i] & 0xff).toString(16)).slice(-2);
+  return s;
+}
+
+function enmascararCorreo_(email) {
+  const p = String(email).split('@');
+  if (p.length !== 2) return email;
+  const n = p[0];
+  return (n.length <= 2 ? n.charAt(0) : n.slice(0, 2)) + '•••@' + p[1];
+}
+
+/** Comparación de longitud fija (evita filtrar información por tiempos). */
+function iguales_(a, b) {
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+// ─────────────────────── Identidad con Google («MB Acceso») ───────────────────────
+
+/** Configuración pública del ingreso (para la página): se lee de «Configuración» con caché de 5 minutos. */
+function configuracionIngreso_() {
+  const cache = CacheService.getScriptCache();
+  const enCache = cache.get('mb_cfg_ingreso');
+  if (enCache) {
+    try { return JSON.parse(enCache); } catch (e) { /* se relee */ }
+  }
+  let r = { enlaceAcceso: '', clientId: '', codigoPorCorreo: false };
+  try {
+    const ss = abrirHoja_();
+    const enlace = String(leerConfig_(ss, CFG_ENLACE_ACCESO) || '').trim();
+    r = {
+      enlaceAcceso: SEGURIDAD.PATRON_ENLACE_ACCESO.test(enlace) ? enlace : '',
+      clientId: String(leerConfig_(ss, CFG_CLIENT_ID) || '').trim(),
+      codigoPorCorreo: /^s[ií]/i.test(String(leerConfig_(ss, CFG_CODIGO_CORREO) || '').trim()),
+    };
+  } catch (e) {
+    console.warn('Configuración de ingreso no disponible: ' + e);
+  }
+  try { cache.put('mb_cfg_ingreso', JSON.stringify(r), 300); } catch (e) { /* sin caché */ }
+  return r;
+}
+
+function olvidarConfiguracionIngreso_() {
+  try { CacheService.getScriptCache().remove('mb_cfg_ingreso'); } catch (e) { /* nada */ }
+}
+
+/** Decodifica (sin validar) la parte central de un JWT. Solo para mensajes; la validación la hace Google. */
+function leerJwtSinValidar_(token) {
+  try {
+    const partes = String(token).split('.');
+    const b64 = partes[1].replace(/-/g, '+').replace(/_/g, '/');
+    const relleno = b64 + '==='.slice((b64.length + 3) % 4);
+    return JSON.parse(Utilities.newBlob(Utilities.base64Decode(relleno)).getDataAsString('UTF-8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Consulta tokeninfo de Google (con reintentos ante 429/5xx o fallas de red) y devuelve los «claims».
+ * Lanza un error de usuario si Google rechaza el token o no responde.
+ */
+function consultarTokenInfo_(idToken) {
+  let ultimo = '';
+  for (let intento = 0; intento < SEGURIDAD.REINTENTOS_TOKENINFO; intento++) {
+    if (intento > 0) Utilities.sleep(400 * Math.pow(2, intento - 1));
+    let resp;
+    try {
+      resp = UrlFetchApp.fetch(SEGURIDAD.TOKENINFO + encodeURIComponent(idToken), { muteHttpExceptions: true, followRedirects: false });
+    } catch (e) {
+      ultimo = String(e && e.message ? e.message : e);
+      continue;
+    }
+    const codigo = resp.getResponseCode();
+    if (codigo === 200) {
+      try { return JSON.parse(resp.getContentText()); } catch (e) { ultimo = 'respuesta ilegible'; continue; }
+    }
+    if (codigo === 429 || codigo >= 500) { ultimo = 'HTTP ' + codigo; continue; }
+    throw errorUsuario_('Google no confirmó su identidad (el ingreso venció o no es válido). Vuelva a pulsar «Ingresar con Google».');
+  }
+  throw errorUsuario_('Google no respondió a tiempo para verificar su identidad (' + ultimo + '). Intente nuevamente en unos segundos.');
+}
+
+/**
+ * Valida los datos devueltos por tokeninfo. Devuelve el correo verificado (minúsculas).
+ * clientId: el «Client ID de MB Acceso» registrado ('' = todavía no registrado).
+ */
+function validarClaimsGoogle_(claims, clientId, ahoraMs) {
+  if (!claims || typeof claims !== 'object') throw errorUsuario_('Respuesta de Google inválida.');
+  if (SEGURIDAD.EMISORES_GOOGLE.indexOf(String(claims.iss || '')) < 0) {
+    throw errorUsuario_('El ingreso no proviene de Google (emisor «' + String(claims.iss || '') + '»).');
+  }
+  const exp = Number(claims.exp || 0) * 1000;
+  if (!exp || exp <= ahoraMs) throw errorUsuario_('El ingreso con Google venció. Vuelva a pulsar «Ingresar con Google».');
+  const verificado = claims.email_verified === true || String(claims.email_verified) === 'true';
+  const email = String(claims.email || '').trim().toLowerCase();
+  if (!email || !verificado) throw errorUsuario_('Google no informó un correo verificado. Revise el consentimiento de «MB Acceso» (debe permitir ver su correo).');
+  if (clientId && String(claims.aud || '') !== clientId) {
+    throw errorUsuario_('Este ingreso no proviene de «MB Acceso» de Distribuidora MB. Use el botón «Ingresar con Google» de la aplicación.');
+  }
+  return email;
+}
+
+/**
+ * Canjea el token de identidad de «MB Acceso» por una sesión (lo llama doGet con ?acceso=…).
+ * - Un solo uso: la huella del token queda en caché hasta su vencimiento.
+ * - Primera vez sin «Client ID» registrado: SOLO el ingreso verificado de la cuenta propietaria lo registra
+ *   (y también el enlace de MB Acceso, si llegó y tiene el formato oficial). Queda en Auditoría y se avisa por correo.
+ */
+function canjearTokenGoogle_(idToken, recordar, desde) {
+  const t = String(idToken || '').trim();
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(t) || t.length > 4096) {
+    throw errorUsuario_('El enlace de ingreso está incompleto. Vuelva a pulsar «Ingresar con Google».');
+  }
+  const ss = abrirHoja_();
+  const tz = zonaHoraria_(ss);
+  return conBloqueo_(function () {
+    const cache = CacheService.getScriptCache();
+    const huella = 'mb_idt_' + hashHex_('idt|' + t).slice(0, 40);
+    if (cache.get(huella)) throw errorUsuario_('Este enlace de ingreso ya se usó. Vuelva a pulsar «Ingresar con Google».');
+    const cfg = configuracionIngreso_();
+    const claims = consultarTokenInfo_(t);
+    const email = validarClaimsGoogle_(claims, cfg.clientId, Date.now());
+    const restante = Math.max(60, Math.min(21600, Math.floor((Number(claims.exp) * 1000 - Date.now()) / 1000)));
+    cache.put(huella, '1', restante);
+
+    if (!cfg.clientId) {
+      if (email !== CONFIG.CORREO_ADMIN) {
+        throw errorUsuario_('El ingreso con Google todavía no está activado. La cuenta propietaria (' + CONFIG.CORREO_ADMIN +
+          ') debe ingresar primero con «Ingresar con Google» para registrarlo.');
+      }
+      registrarClienteAcceso_(ss, String(claims.aud || ''), desde, email);
+    } else if (desde && !cfg.enlaceAcceso && SEGURIDAD.PATRON_ENLACE_ACCESO.test(String(desde))) {
+      escribirConfig_(ss, CFG_ENLACE_ACCESO, String(desde));
+      olvidarConfiguracionIngreso_();
+    }
+    const acceso = evaluarAccesoCorreo_(ss, email, tz); // lanza si no puede ingresar
+    const nueva = crearSesion_(email, recordar === true, 'GOOGLE');
+    auditarEvento_(ss, email, acceso.rol, 'Identidad verificada con Google', 'Sesión ' + (recordar ? 'recordada ' + SEGURIDAD.DISPOSITIVO_DIAS + ' días.' : 'de ' + SEGURIDAD.SESION_HORAS + ' horas.'), '', '', '', 'GOOGLE');
+    return { token: nueva.token, email: email, recordado: !!recordar, nuevo: !!acceso.nuevo };
+  });
+}
+
+/** Registro inicial (TOFU) del Client ID y del enlace de «MB Acceso» por la cuenta propietaria. */
+function registrarClienteAcceso_(ss, aud, desde, email) {
+  if (!/^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/.test(aud)) {
+    throw errorUsuario_('El token no trae un Client ID reconocible («' + aud + '»). Copie el Client ID desde «MB Acceso» (?config=1) a «Configuración».');
+  }
+  escribirConfig_(ss, CFG_CLIENT_ID, aud);
+  const enlace = SEGURIDAD.PATRON_ENLACE_ACCESO.test(String(desde || '')) ? String(desde) : '';
+  if (enlace) escribirConfig_(ss, CFG_ENLACE_ACCESO, enlace);
+  olvidarConfiguracionIngreso_();
+  auditarEvento_(ss, email, ROLES.ADMIN, 'Activación del ingreso con Google', 'Se registró el Client ID de MB Acceso' + (enlace ? ' y su enlace' : '') + '.', CFG_CLIENT_ID, '', aud, 'GOOGLE');
+  alertarSeguridad_(ss, 'Ingreso con Google activado', 'Se registró el Client ID de «MB Acceso»: ' + aud + (enlace ? '\nEnlace: ' + enlace : '') +
+    '\nSi usted no hizo esto, borre el valor en «Configuración» y avise de inmediato.');
+}
+
+// ─────────────────────── Código por correo (respaldo, desactivado por defecto) ───────────────────────
+
+function codigoPorCorreoHabilitado_() {
+  return configuracionIngreso_().codigoPorCorreo === true;
+}
+
+/** Envía un código de 6 dígitos al correo (con límites de frecuencia) y responde para que la app lo pida. */
+function solicitarCodigoAcceso_(ss, tz, email, acceso) {
+  const cache = CacheService.getScriptCache();
+  const h = hashHex_('correo|' + email).slice(0, 40);
+  if (cache.get('mb_otp_bloq_' + h)) {
+    throw errorUsuario_('Por seguridad, el ingreso con este correo quedó pausado unos minutos por varios intentos fallidos. Intente más tarde.');
+  }
+  const vigente = cache.get('mb_otp_' + h);
+  if (vigente) {
+    try {
+      const o = JSON.parse(vigente);
+      if (Date.now() - o.t < 45000) {
+        return { ok: true, verificacion: true, destino: enmascararCorreo_(email), minutos: SEGURIDAD.CODIGO_MINUTOS, reenviado: false };
+      }
+    } catch (e) { /* se genera otro */ }
+  }
+  const nHora = Number(cache.get('mb_otp_n_' + h) || 0);
+  if (nHora >= SEGURIDAD.CODIGOS_POR_HORA) {
+    throw errorUsuario_('Se enviaron varios códigos a este correo en la última hora. Revise su bandeja (y «Spam») o intente más tarde.');
+  }
+  const props = PropertiesService.getScriptProperties();
+  const hoy = hoy_(tz);
+  const dia = leerJsonPropiedad_(props, 'MB_OTP_DIA');
+  const nDia = dia.fecha === hoy ? Number(dia.n || 0) : 0;
+  if (nDia >= SEGURIDAD.CODIGOS_POR_DIA) {
+    throw errorUsuario_('Se alcanzó el máximo diario de códigos de ingreso. Intente mañana o avise a la administración.');
+  }
+  const codigo = codigoNumerico_();
+  const salt = Utilities.getUuid();
+  cache.put('mb_otp_' + h, JSON.stringify({ h: hashHex_(salt + '|' + codigo), s: salt, n: 0, t: Date.now() }), SEGURIDAD.CODIGO_MINUTOS * 60);
+  cache.put('mb_otp_n_' + h, String(nHora + 1), 3600);
+  props.setProperty('MB_OTP_DIA', JSON.stringify({ fecha: hoy, n: nDia + 1 }));
+  enviarCorreoCodigo_(email, codigo, acceso);
+  return { ok: true, verificacion: true, destino: enmascararCorreo_(email), minutos: SEGURIDAD.CODIGO_MINUTOS, reenviado: true };
+}
+
+function codigoNumerico_() {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, Utilities.getUuid() + Date.now(), Utilities.Charset.UTF_8);
+  let n = 0;
+  for (let i = 0; i < 6; i++) n = (n * 256 + (bytes[i] & 0xff)) % 1000000000;
+  return ('000000' + (n % 1000000)).slice(-6);
+}
+
+function enviarCorreoCodigo_(email, codigo, acceso) {
+  const html = '<div style="font-family:Arial,sans-serif;color:#1C1C1A;max-width:460px">' +
+    '<p style="letter-spacing:.16em;text-transform:uppercase;font-size:12px;color:#7E7B73">Distribuidora MB · Inventario y gestión</p>' +
+    '<p>Su código para ingresar es:</p>' +
+    '<p style="font-size:30px;letter-spacing:.3em;font-weight:bold;color:#8C6D46">' + codigo + '</p>' +
+    '<p style="font-size:13px;color:#45443F">Vence en ' + SEGURIDAD.CODIGO_MINUTOS + ' minutos. Si usted no intentó ingresar, ignore este correo y avise a la administración.</p>' +
+    (acceso && acceso.nuevo ? '<p style="font-size:13px;color:#45443F">Es su primer ingreso: quedará registrada con perfil operativo.</p>' : '') +
+    '</div>';
+  enviarCorreo_({
+    to: email,
+    subject: 'Código de ingreso: ' + codigo + ' · Distribuidora MB',
+    body: 'Su código para ingresar al sistema de Distribuidora MB es: ' + codigo + '\n\nVence en ' + SEGURIDAD.CODIGO_MINUTOS +
+      ' minutos. Si usted no intentó ingresar, ignore este correo y avise a la administración.',
+    htmlBody: html,
+  });
+}
+
+/** Valida el código (máximo 5 intentos por código; 3 códigos fallidos seguidos pausan el correo 60 minutos). */
+function comprobarCodigoAcceso_(ss, tz, email, codigo) {
+  const cache = CacheService.getScriptCache();
+  const h = hashHex_('correo|' + email).slice(0, 40);
+  if (cache.get('mb_otp_bloq_' + h)) {
+    throw errorUsuario_('Por seguridad, el ingreso con este correo quedó pausado unos minutos por varios intentos fallidos. Intente más tarde.');
+  }
+  const limpio = String(codigo || '').replace(/\D/g, '');
+  const guardado = cache.get('mb_otp_' + h);
+  if (!guardado) throw errorUsuario_('El código venció o no se pidió. Pulse «Enviar otro código».');
+  const o = JSON.parse(guardado);
+  if (limpio.length !== 6 || !iguales_(hashHex_(o.s + '|' + limpio), o.h)) {
+    o.n = (o.n || 0) + 1;
+    if (o.n >= SEGURIDAD.CODIGO_INTENTOS) {
+      cache.remove('mb_otp_' + h);
+      const fallidos = Number(cache.get('mb_otp_fallos_' + h) || 0) + 1;
+      cache.put('mb_otp_fallos_' + h, String(fallidos), 3600);
+      if (fallidos >= 3) {
+        cache.put('mb_otp_bloq_' + h, '1', SEGURIDAD.BLOQUEO_MINUTOS * 60);
+        alertarSeguridad_(ss, 'Ingreso pausado por intentos fallidos', 'Se pausó 60 minutos el ingreso de ' + email + ' por códigos incorrectos repetidos.');
+      }
+      throw errorUsuario_('Código incorrecto. Se agotaron los intentos: pida un código nuevo.');
+    }
+    cache.put('mb_otp_' + h, JSON.stringify(o), SEGURIDAD.CODIGO_MINUTOS * 60);
+    throw errorUsuario_('Código incorrecto. Le quedan ' + (SEGURIDAD.CODIGO_INTENTOS - o.n) + ' intentos.');
+  }
+  cache.remove('mb_otp_' + h);
+  cache.remove('mb_otp_fallos_' + h);
+  return true;
+}
+
+// ─────────────────────── Sesiones ───────────────────────
+
+function tokenAleatorio_() {
+  return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+}
+
+function claveSesion_(token) {
+  return SEGURIDAD.PREFIJO_SESION + hashHex_('sesion|' + token).slice(0, 48);
+}
+
+/** metodo: 'GOOGLE' | 'CÓDIGO'. Solo se guarda la huella del token. */
+function crearSesion_(email, recordar, metodo) {
+  const token = tokenAleatorio_();
+  const ahora = Date.now();
+  const horas = recordar ? SEGURIDAD.DISPOSITIVO_DIAS * 24 : SEGURIDAD.SESION_HORAS;
+  const sesion = { e: email, c: ahora, x: ahora + horas * 3600000, r: recordar ? 1 : 0, m: metodo || 'GOOGLE' };
+  const clave = claveSesion_(token);
+  PropertiesService.getScriptProperties().setProperty(clave, JSON.stringify(sesion));
+  try { CacheService.getScriptCache().put(clave, JSON.stringify(sesion), 600); } catch (e) { /* sin caché */ }
+  limitarSesiones_(email);
+  return { token: token, sesion: sesion };
+}
+
+function leerSesion_(token) {
+  if (!token || token.length < 32) return null;
+  const clave = claveSesion_(token);
+  const cache = CacheService.getScriptCache();
+  let txt = cache.get(clave);
+  if (txt === 'X') return null;
+  if (!txt) {
+    txt = PropertiesService.getScriptProperties().getProperty(clave);
+    if (!txt) { cache.put(clave, 'X', 120); return null; }
+    cache.put(clave, txt, 600);
+  }
+  let s;
+  try { s = JSON.parse(txt); } catch (e) { return null; }
+  if (!s || !s.e || Number(s.x) < Date.now()) {
+    revocarSesion_(token);
+    return null;
+  }
+  return s;
+}
+
+function revocarSesion_(token) {
+  const clave = claveSesion_(token);
+  PropertiesService.getScriptProperties().deleteProperty(clave);
+  try { CacheService.getScriptCache().put(clave, 'X', 600); } catch (e) { /* nada */ }
+}
+
+function sesionesGuardadas_() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const lista = [];
+  Object.keys(props).forEach(function (k) {
+    if (k.indexOf(SEGURIDAD.PREFIJO_SESION) !== 0) return;
+    try { const s = JSON.parse(props[k]); s.clave = k; lista.push(s); } catch (e) { lista.push({ clave: k, x: 0 }); }
+  });
+  return lista;
+}
+
+/** Deja como máximo N sesiones por usuaria (borra las más viejas). */
+function limitarSesiones_(email) {
+  const propias = sesionesGuardadas_().filter(function (s) { return s.e === email; }).sort(function (a, b) { return b.c - a.c; });
+  const props = PropertiesService.getScriptProperties();
+  propias.slice(SEGURIDAD.MAX_SESIONES_POR_USUARIA).forEach(function (s) { props.deleteProperty(s.clave); });
+}
+
+/** Revoca todas las sesiones de un correo (al desactivarlo, cambiarle el rol o a pedido). Devuelve cuántas. */
+function revocarSesionesDe_(email) {
+  const props = PropertiesService.getScriptProperties();
+  const cache = CacheService.getScriptCache();
+  let n = 0;
+  sesionesGuardadas_().forEach(function (s) {
+    if (s.e === email) {
+      props.deleteProperty(s.clave);
+      try { cache.put(s.clave, 'X', 600); } catch (e) { /* nada */ }
+      n++;
+    }
+  });
+  return n;
+}
+
+/** Borra sesiones vencidas (tarea diaria). */
+function limpiarSesionesVencidas_() {
+  const props = PropertiesService.getScriptProperties();
+  let n = 0;
+  sesionesGuardadas_().forEach(function (s) {
+    if (!s.x || Number(s.x) < Date.now()) { props.deleteProperty(s.clave); n++; }
+  });
+  return n;
+}
+
+/**
+ * Usuario de la llamada a partir del token. Lanza [SESION] si no hay sesión válida, si el correo fue
+ * desactivado o si ya no está en «Usuarios».
+ */
+function usuarioDeSesion_(ss, token, tz) {
+  const s = leerSesion_(token);
+  if (!s) throw errorUsuario_(PREFIJO_SESION + 'Su sesión venció o se cerró. Ingrese nuevamente con Google.');
+  const u = usuarioPorCorreo_(ss, s.e);
+  if (!u.fijo && (!u.existe || !u.activo)) {
+    revocarSesion_(token);
+    throw errorUsuario_(PREFIJO_SESION + 'Este correo ya no está habilitado en el sistema. Consulte con la administración.');
+  }
+  return { email: u.email, rol: u.rol, nombre: u.nombre, metodo: s.m || 'GOOGLE' };
+}
+
+function verificarPermiso_(nombre, usuario) {
+  const permitidos = PERMISOS[nombre] || SOLO_ADMIN_;
+  if (permitidos.indexOf(usuario.rol) < 0) {
+    throw errorUsuario_('Esta acción es solo para administradoras. Si la necesita, pídasela a Mirian.');
+  }
+}
+
+/** Exige rol administradora dentro de una función que también usan las operativas (por ejemplo, anular). */
+function exigirAdministradora_(ctx, accion) {
+  if (!ctx || !esAdministradora_(ctx.usuario)) {
+    throw errorUsuario_((accion ? 'Para ' + accion + ' ' : 'Esta acción ') + 'se necesita una administradora.');
+  }
+}
+
+/** Ingreso completo (con sesión válida): estructura, paquetes (solo administradoras), registro del ingreso y datos según el rol. */
+function completarIngreso_(ss, tz, email, token, sesion, mes, base, acceso) {
+  return conBloqueo_(function () {
+    asegurarEstructura_(ss);
+    olvidarUsuariosEnCache_(ss);
+    const tabla = leerTabla_(ss, 'usuarios', tz);
+    const existente = tabla.filas.find(function (u) { return u.correo.toLowerCase() === email; }) || null;
+    const metodo = sesion.m === 'CÓDIGO' ? 'Código por correo' : 'Google';
+    registrarIngreso_(tabla, existente, email, existente ? existente.acceso : (esAdminFijo_(email) ? '' : 'Sin acceso (protegido)'), tz, {
+      verificado: true,
+      metodo: metodo,
+      rol: acceso && acceso.rol ? acceso.rol : ROLES.OPERATIVO,
+      notas: existente ? '' : (esAdminFijo_(email) ? 'Administradora fija (definida en el código).' : 'Alta por registro abierto (correo verificado por ' + metodo + ').'),
+    });
+    olvidarUsuariosEnCache_(ss);
+    const usuario = usuarioPorCorreo_(ss, email);
+    if (!existente && !esAdminFijo_(email)) {
+      alertarSeguridad_(ss, 'Nueva usuaria registrada: ' + email,
+        'El correo ' + email + ' ingresó por primera vez (verificado por ' + metodo + ') y quedó como OPERATIVO porque el registro de nuevos correos está abierto.\n' +
+        'Si no la conoce, desactívela en Sistema › Usuarias y cierre el registro.');
+    }
+    const avisos = (base && base.avisos ? base.avisos.slice() : []);
+    if (usuario.rol === ROLES.ADMIN) aplicarPaquetes_(ss, email, tz, usuario.rol).forEach(function (a) { avisos.push(a); });
+    auditarEvento_(ss, email, usuario.rol, 'Ingreso', 'Método: ' + metodo + (sesion.r ? ' · dispositivo recordado' : ''), '', '', '', sesion.m || 'GOOGLE');
+    SpreadsheetApp.flush();
+    const admin = usuario.rol === ROLES.ADMIN;
+    return {
+      ok: true,
+      sesion: {
+        email: email,
+        token: token,
+        rol: usuario.rol,
+        nombre: usuario.nombre,
+        metodo: metodo,
+        expira: Utilities.formatDate(new Date(Number(sesion.x)), tz, 'yyyy-MM-dd HH:mm'),
+        recordado: !!sesion.r,
+        url: admin ? ss.getUrl() : '', // el enlace a la hoja solo lo ven las administradoras (RT.2)
+        nombreHoja: ss.getName(),
+        creada: !!(base && base.creada),
+        propietario: admin ? correoPropietario_() : '',
+        editores: [],
+        avisos: avisos,
+      },
+      datos: construirDatos_(ss, mes, tz, { email: usuario.email, rol: usuario.rol, nombre: usuario.nombre }),
+    };
+  });
+}
+
+// ─────────────────────── Auditoría (RT.3) ───────────────────────
+
+/** Unidad de negocio por hoja (cuando el registro no la trae). */
+const UNIDAD_POR_HOJA_ = Object.freeze({
+  'Servicios realizados': 'SALÓN', 'Agenda': 'SALÓN', 'Agenda · servicios': 'SALÓN', 'Bloqueos de agenda': 'SALÓN',
+  'Personal': 'SALÓN', 'Servicios': 'SALÓN', 'Historial de porcentajes': 'SALÓN', 'Recálculos de comisiones': 'SALÓN',
+  'Ajustes de comisiones': 'SALÓN', 'Clientas salón': 'SALÓN',
+  'Ventas': 'DISTRIBUIDORA', 'Productos': 'DISTRIBUIDORA', 'Movimientos de stock': 'DISTRIBUIDORA', 'Peluquerías': 'DISTRIBUIDORA',
+  'Proveedores': 'DISTRIBUIDORA', 'Acuerdos de proveedores': 'DISTRIBUIDORA',
+});
+
+function iniciarAuditoria_(usuario, operacion, idSolicitud, unidad) {
+  AUDITORIA_ = {
+    activa: true, usuario: usuario ? usuario.email : '', rol: usuario ? usuario.rol : '', metodo: usuario ? (usuario.metodo || '') : '',
+    operacion: operacion, solicitud: idSolicitud || '', unidad: unidad || '', filas: [],
+  };
+}
+
+function textoAuditoria_(v) {
+  if (v === null || v === undefined) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, CONFIG.ZONA_HORARIA, 'yyyy-MM-dd HH:mm');
+  // v2.3 · Fase 3: sin el apóstrofo con el que se guarda como texto un valor que parece número (RUC, celular, recibo).
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v).replace(/^'/, '');
+  return s.length > 300 ? s.slice(0, 297) + '…' : s;
+}
+
+function referenciaFila_(o) {
+  if (!o) return '';
+  if (o.credito && o.numero !== undefined && o.vencimiento) return o.credito + ' #' + o.numero;
+  if (o.turno && o.codigoServicio) return o.turno + ' · ' + o.codigoServicio;
+  if (o.ticket && o.medio && o.monto !== undefined && !o.id) return o.ticket + ' · ' + o.medio;
+  return String(o.id || o.codigo || o.correo || o.clave || o.unidad || o.nombre || o.mes || o.lote || '').slice(0, 60);
+}
+
+function unidadAuditoria_(hoja, o) {
+  const u = o && o.unidad ? String(o.unidad) : '';
+  if (LISTAS.UNIDADES.indexOf(u) >= 0) return u;
+  if (AUDITORIA_ && AUDITORIA_.unidad) return AUDITORIA_.unidad;
+  return UNIDAD_POR_HOJA_[hoja] || '';
+}
+
+/** Hook de agregarFilas_: una entrada «ALTA» por fila con un resumen de sus campos. */
+function registrarAltaAuditoria_(tabla, objetos, tz) {
+  if (!AUDITORIA_ || !AUDITORIA_.activa || !tabla.def || HOJAS_SIN_AUDITORIA.indexOf(tabla.def.hoja) >= 0) return;
+  objetos.forEach(function (o) {
+    const partes = [];
+    Object.keys(o).forEach(function (k) {
+      if (k === 'usuario' || k === 'registrado' || k === 'actualizado' || o[k] === '' || o[k] === null || o[k] === undefined) return;
+      partes.push(k + '=' + textoAuditoria_(o[k]));
+    });
+    AUDITORIA_.filas.push({ accion: 'ALTA', hoja: tabla.def.hoja, referencia: referenciaFila_(o), campo: '', anterior: '', nuevo: '',
+      detalle: textoAuditoria_(partes.join('; ')), unidad: unidadAuditoria_(tabla.def.hoja, o) });
+  });
+}
+
+/** Hook de actualizarCeldas_ / actualizarFilas_: valor anterior → nuevo (omite metadatos y columnas automáticas). */
+function registrarCambioAuditoria_(tabla, fila, clave, anterior, nuevo) {
+  if (!AUDITORIA_ || !AUDITORIA_.activa || !tabla.def || HOJAS_SIN_AUDITORIA.indexOf(tabla.def.hoja) >= 0) return;
+  if (clave === 'actualizado' || clave === 'usuario' || clave === 'ultimo' || clave === 'ingresos') return;
+  const col = tabla.def.columnas.filter(function (c) { return c[0] === clave; })[0];
+  if (!col || /automátic/i.test(col[1])) return;
+  if (textoAuditoria_(anterior) === textoAuditoria_(nuevo)) return;
+  AUDITORIA_.filas.push({ accion: 'CAMBIO', hoja: tabla.def.hoja, referencia: referenciaFila_(fila), campo: col[1],
+    anterior: textoAuditoria_(anterior), nuevo: textoAuditoria_(nuevo), detalle: '', unidad: unidadAuditoria_(tabla.def.hoja, fila) });
+}
+
+/** Nota libre dentro de la operación en curso (por ejemplo, «Unidad completada por migración»). */
+function anotarAuditoria_(hoja, referencia, detalle, unidad) {
+  if (!AUDITORIA_ || !AUDITORIA_.activa) return;
+  AUDITORIA_.filas.push({ accion: 'NOTA', hoja: hoja || '', referencia: referencia || '', campo: '', anterior: '', nuevo: '',
+    detalle: textoAuditoria_(detalle), unidad: unidad || unidadAuditoria_(hoja, null) });
+}
+
+/** Escribe en «Auditoría» lo acumulado en la operación (una sola escritura). */
+function volcarAuditoria_(ss, tz, error) {
+  if (!AUDITORIA_) return;
+  const a = AUDITORIA_;
+  AUDITORIA_ = null;
+  const filas = a.filas.slice();
+  if (error) filas.push({ accion: 'ERROR', hoja: '', referencia: '', campo: '', anterior: '', nuevo: '', detalle: textoAuditoria_(error), unidad: a.unidad });
+  if (!filas.length) return;
+  const ahora = new Date();
+  try {
+    anexarFilas_(ss, 'auditoria', filas.map(function (f) {
+      return {
+        fecha: ahora, usuario: a.usuario, rol: a.rol, operacion: a.operacion, hoja: f.hoja, referencia: f.referencia,
+        campo: f.campo, anterior: f.anterior, nuevo: f.nuevo, solicitud: a.solicitud, unidad: f.unidad || a.unidad || '',
+        accion: f.accion, detalle: f.detalle, metodo: a.metodo,
+      };
+    }), tz);
+  } catch (e) {
+    console.error('No se pudo escribir la auditoría: ' + e);
+  }
+}
+
+/** Evento puntual (ingresos, salidas, cambios de integración, tareas automáticas). Debe llamarse dentro de conBloqueo_. */
+function auditarEvento_(ss, email, rol, operacion, detalle, campo, anterior, nuevo, metodo, unidad) {
+  try {
+    anexarFilas_(ss, 'auditoria', [{
+      fecha: new Date(), usuario: email || '', rol: rol || '', operacion: operacion, hoja: '', referencia: '',
+      campo: campo || '', anterior: anterior || '', nuevo: nuevo || '', solicitud: '', unidad: unidad || '',
+      accion: 'EVENTO', detalle: detalle || '', metodo: metodo || '',
+    }], zonaHoraria_(ss));
+  } catch (e) {
+    console.error('Auditoría de evento no registrada: ' + e);
+  }
+}
+
+/**
+ * Agrega filas a una hoja de registro leyendo solo la fila de títulos (para hojas que crecen mucho:
+ * Auditoría, WhatsApp log, Estado de instalación, Alertas enviadas). Crea la hoja si falta.
+ */
+function anexarFilas_(ss, clave, objetos, tz) {
+  if (!objetos.length) return;
+  const def = ESQUEMA[clave];
+  let hoja = ss.getSheetByName(def.hoja);
+  if (!hoja) {
+    hoja = ss.insertSheet(def.hoja, posicionNuevaHoja_(ss, def));
+    formatearHoja_(hoja, def);
+  }
+  const ultimaCol = Math.max(hoja.getLastColumn(), 1);
+  const enc = hoja.getRange(1, 1, 1, ultimaCol).getValues()[0].map(function (v) { return String(v).trim(); });
+  const idx = {};
+  const tipos = {};
+  def.columnas.forEach(function (c) {
+    const i = enc.indexOf(c[1]);
+    if (i >= 0) { idx[c[0]] = i; tipos[c[0]] = c[2]; }
+  });
+  agregarFilas_({ hoja: hoja, def: def, idx: idx, tipos: tipos, ancho: Math.max(enc.length, 1), filas: null }, objetos, tz);
+}
+
+// ─────────────────────── Funciones de mantenimiento: quién puede ejecutarlas ───────────────────────
+
+/**
+ * Las funciones públicas de mantenimiento (instalar, migrar, pruebas, tareas automáticas) también se podrían
+ * invocar desde el navegador con google.script.run. Esta guarda solo deja pasar:
+ *  - un activador (trigger) real de este proyecto (se valida su id contra los activadores existentes), o
+ *  - una ejecución desde el editor por la cuenta propietaria o una administradora fija.
+ * Desde la web app («Ejecutar como: Yo») Session.getActiveUser() viene vacío para @gmail.com: queda rechazada.
+ */
+function exigirEditorOTrigger_(e) {
+  if (e && e.triggerUid) {
+    const uid = String(e.triggerUid);
+    const existe = ScriptApp.getProjectTriggers().some(function (t) { return String(t.getUniqueId()) === uid; });
+    if (existe) return 'trigger';
+  }
+  let activo = '';
+  try { activo = String(Session.getActiveUser().getEmail() || '').toLowerCase(); } catch (err) { activo = ''; }
+  if (activo && esAdminFijo_(activo)) return 'editor';
+  throw new Error('Función de mantenimiento: ejecútela desde el editor de Apps Script con la cuenta propietaria, o desde «Sistema» en la aplicación.');
+}
+
+// ─────────────────────── Acceso a la hoja de cálculo (R6.1 paso 5) ───────────────────────
+
+/**
+ * Revisa quién tiene acceso al libro (contiene costos). SOLO INFORMA, salvo que se pida quitar a un correo
+ * puntual con confirmación expresa (quitar = { correo, confirmado: true }).
+ * Las administradoras y la propietaria se mantienen siempre.
+ */
+function revisarAccesoLibro_(ss, tz, quitar) {
+  const hallazgos = [];
+  let archivo;
+  try { archivo = DriveApp.getFileById(ss.getId()); } catch (e) {
+    return [{ correo: '', acceso: '', estado: 'ERROR', detalle: 'No se pudo leer el archivo: ' + e }];
+  }
+  let dueno = '';
+  try { dueno = String(archivo.getOwner().getEmail() || '').toLowerCase(); } catch (e) { dueno = correoPropietario_(); }
+  olvidarUsuariosEnCache_(ss);
+  const usuarios = mapaUsuarios_(ss);
+  const objetivo = quitar && quitar.confirmado === true ? String(quitar.correo || '').toLowerCase() : '';
+  function revisar(lista, tipo) {
+    lista.forEach(function (correo) {
+      if (!correo || correo === dueno) return;
+      const u = usuarios[correo];
+      const rol = esAdminFijo_(correo) ? ROLES.ADMIN : (u ? normalizarRol_(u.rol) : '');
+      if (rol === ROLES.ADMIN && (esAdminFijo_(correo) || u.activo)) {
+        hallazgos.push({ correo: correo, acceso: tipo, estado: 'OK', detalle: 'Administradora' });
+        return;
+      }
+      if (objetivo && objetivo === correo) {
+        try {
+          if (tipo === 'Editor') archivo.removeEditor(correo); else archivo.removeViewer(correo);
+          hallazgos.push({ correo: correo, acceso: tipo, estado: 'QUITADO', detalle: 'Se quitó el acceso con confirmación de una administradora.' });
+        } catch (e) {
+          hallazgos.push({ correo: correo, acceso: tipo, estado: 'ERROR', detalle: String(e && e.message ? e.message : e) });
+        }
+        return;
+      }
+      hallazgos.push({ correo: correo, acceso: tipo, estado: 'QUITAR', detalle: (u ? 'Operativa o desactivada' : 'No figura en «Usuarios»') +
+        ' con acceso a la hoja (ve costos). Quítelo con confirmación en Sistema › Usuarias.' });
+    });
+  }
+  let editores = [];
+  let lectores = [];
+  try { editores = archivo.getEditors().map(function (u) { return String(u.getEmail()).toLowerCase(); }); } catch (e) { /* sin dato */ }
+  try { lectores = archivo.getViewers().map(function (u) { return String(u.getEmail()).toLowerCase(); }); } catch (e) { /* sin dato */ }
+  revisar(editores, 'Editor');
+  revisar(lectores, 'Lector');
+  try {
+    const acceso = String(archivo.getSharingAccess());
+    if (acceso && acceso !== 'PRIVATE' && acceso !== String(DriveApp.Access.PRIVATE)) {
+      hallazgos.push({ correo: '(enlace)', acceso: acceso, estado: 'QUITAR', detalle: 'El libro está compartido con el enlace: cualquiera con él ve los costos. Cámbielo a «Restringido» en Compartir.' });
+    }
+  } catch (e) { /* algunas cuentas no informan el tipo de acceso */ }
+  // Columna informativa «Acceso a la hoja» en «Usuarios».
+  try {
+    const tabla = leerTabla_(ss, 'usuarios', tz);
+    tabla.filas.forEach(function (f) {
+      const c = f.correo.toLowerCase();
+      const quitado = hallazgos.some(function (h) { return h.correo === c && h.estado === 'QUITADO'; });
+      const acceso = c === dueno ? 'Propietario' : (editores.indexOf(c) >= 0 && !quitado ? 'Editor' : (lectores.indexOf(c) >= 0 && !quitado ? 'Lector' : 'Sin acceso (protegido)'));
+      if (f.acceso !== acceso) actualizarCeldas_(tabla, f._fila, { acceso: acceso }, tz);
+    });
+  } catch (e) { /* informativo */ }
+  return hallazgos;
+}
+
+/** Correo de alerta a las administradoras fijas (máximo uno por tema cada 6 horas). */
+function alertarSeguridad_(ss, tema, detalle) {
+  try {
+    const cache = CacheService.getScriptCache();
+    const clave = 'mb_alerta_' + hashHex_(tema).slice(0, 20);
+    if (cache.get(clave)) return;
+    cache.put(clave, '1', 21600);
+    enviarCorreo_({
+      to: CONFIG.ADMINS_FIJOS.join(','),
+      subject: 'Distribuidora MB · ' + tema,
+      body: detalle + '\n\nAplicación: ' + CONFIG.URL_APP,
+    });
+  } catch (e) {
+    console.error('No se pudo enviar la alerta: ' + e);
+  }
+}
+
+// ─────────────────────── API de administración de usuarias ───────────────────────
+
+function guardarUsuario(req) { return ejecutar_('guardarUsuario', req, 'escritura', guardarUsuario_); }
+function revocarSesiones(req) { return ejecutar_('revocarSesiones', req, 'escritura', revocarSesiones_); }
+function guardarRegistro(req) { return ejecutar_('guardarRegistro', req, 'escritura', guardarRegistro_); }
+function quitarAccesoHoja(req) { return ejecutar_('quitarAccesoHoja', req, 'escritura', quitarAccesoHoja_); }
+
+/** Abre o cierra el registro de nuevos correos (fila «Registro de nuevos correos» de «Configuración»). */
+function guardarRegistro_(ctx) {
+  const abierto = ctx.datos.abierto === true;
+  escribirConfig_(ctx.ss, PARAM_REGISTRO, abierto ? 'Abierto' : 'Cerrado');
+  auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Registro de nuevos correos', abierto ? 'Abierto' : 'Cerrado', PARAM_REGISTRO, '', abierto ? 'Abierto' : 'Cerrado', ctx.usuario.metodo);
+  return abierto
+    ? 'Registro ABIERTO: una persona nueva que ingrese con Google queda como OPERATIVO. Recibirá un aviso por cada alta.'
+    : 'Registro CERRADO: solo ingresan los correos activos de «Usuarios». Las nuevas usuarias se habilitan en Sistema › Usuarias.';
+}
+
+/** Alta o edición en «Usuarios». Las administradoras fijas no se pueden desactivar ni bajar de rol. */
+function guardarUsuario_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const correo = normalizarCorreo_(d.correo, false);
+  const rol = normalizarRol_(d.rol);
+  const activo = activoDe_(d.activo === undefined ? true : d.activo);
+  const fijo = esAdminFijo_(correo);
+  if (fijo && (rol !== ROLES.ADMIN || activo !== 'Sí')) {
+    throw errorUsuario_(correo + ' es administradora fija (definida en el código): no se puede desactivar ni cambiar de rol.');
+  }
+  if (correo === ctx.email && (rol !== ROLES.ADMIN || activo !== 'Sí')) {
+    throw errorUsuario_('No puede quitarse a sí misma el rol de administradora ni desactivarse.');
+  }
+  const tabla = leerTabla_(ctx.ss, 'usuarios', tz);
+  const existente = tabla.filas.find(function (u) { return u.correo.toLowerCase() === correo; }) || null;
+  const datos = { rol: rol, activo: activo, nombre: texto_(d.nombre, 80), notas: texto_(d.notas, 200) };
+  let mensaje;
+  if (existente) {
+    const cambioSensible = normalizarRol_(existente.rol) !== rol || existente.activo !== datos.activo;
+    actualizarCeldas_(tabla, existente._fila, datos, tz);
+    let revocadas = 0;
+    if (cambioSensible) revocadas = revocarSesionesDe_(correo);
+    mensaje = 'Datos de ' + correo + ' actualizados (' + rol + (activo === 'Sí' ? '' : ', desactivada') + ').' + (revocadas ? ' Se cerraron sus sesiones abiertas.' : '');
+  } else {
+    agregarFilas_(tabla, [Object.assign({ correo: correo, acceso: 'Sin acceso (protegido)', ingresos: 0 }, datos)], tz);
+    mensaje = 'Se habilitó ' + correo + ' como ' + rol + '. Ya puede ingresar con «Ingresar con Google».';
+  }
+  // Acceso directo a la hoja: solo administradoras, sin correo de invitación y solo si se pide expresamente.
+  if (d.compartirHoja === true) {
+    if (rol !== ROLES.ADMIN) throw errorUsuario_('La hoja de cálculo contiene costos: solo se comparte con administradoras.');
+    const r = asegurarAcceso_(ctx.ss, [correo]);
+    mensaje += r[correo] === 'Editor' ? ' Tiene acceso de edición a la hoja.' : ' No se pudo compartir la hoja: ' + r[correo];
+  }
+  olvidarUsuariosEnCache_(ctx.ss);
+  if (rol !== ROLES.ADMIN || activo !== 'Sí') {
+    const h = revisarAccesoLibro_(ctx.ss, tz, null).filter(function (x) { return x.correo === correo && x.estado === 'QUITAR'; });
+    if (h.length) mensaje += ' ATENCIÓN: ' + correo + ' todavía tiene acceso a la hoja (ve costos). Use «Quitar acceso a la hoja» para retirarlo.';
+  }
+  return mensaje;
+}
+
+/** Quita el acceso directo a la hoja de un correo que no es administradora (requiere confirmación expresa). */
+function quitarAccesoHoja_(ctx) {
+  const correo = normalizarCorreo_(ctx.datos.correo, false);
+  if (ctx.datos.confirmado !== true) throw errorUsuario_('Confirme que desea quitar el acceso a la hoja de ' + correo + '.');
+  if (esAdminFijo_(correo)) throw errorUsuario_(correo + ' es administradora fija: conserva el acceso.');
+  const h = revisarAccesoLibro_(ctx.ss, ctx.tz, { correo: correo, confirmado: true }).filter(function (x) { return x.correo === correo; });
+  auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Quitar acceso a la hoja', correo + ': ' + (h.map(function (x) { return x.estado; }).join(', ') || 'no tenía acceso'), '', '', '', ctx.usuario.metodo);
+  if (!h.length) return correo + ' no tenía acceso directo a la hoja.';
+  const error = h.filter(function (x) { return x.estado === 'ERROR'; })[0];
+  if (error) throw errorUsuario_('No se pudo quitar el acceso de ' + correo + ': ' + error.detalle);
+  return 'Se quitó el acceso a la hoja de ' + correo + '. Sigue pudiendo usar la aplicación según su rol.';
+}
+
+function revocarSesiones_(ctx) {
+  const correo = normalizarCorreo_(ctx.datos.correo, false);
+  const n = revocarSesionesDe_(correo);
+  auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Cerrar sesiones', 'Se cerraron ' + n + ' sesiones de ' + correo + '.', '', '', '', ctx.usuario.metodo);
+  return n ? 'Se cerraron ' + n + ' sesiones de ' + correo + '. Deberá ingresar de nuevo con Google.' : correo + ' no tenía sesiones abiertas.';
+}
+
+/** Lista para «Sistema › Usuarias» (solo administradoras). */
+function datosUsuarios_(ss, tz) {
+  const tabla = leerTabla_(ss, 'usuarios', tz);
+  const sesiones = sesionesGuardadas_().filter(function (s) { return Number(s.x) > Date.now(); });
+  const lista = tabla.filas.map(function (u) {
+    const c = u.correo.toLowerCase();
+    return {
+      correo: c, nombre: u.nombre, rol: esAdminFijo_(c) ? ROLES.ADMIN : normalizarRol_(u.rol), activo: esAdminFijo_(c) || esActivo_(u.activo),
+      fijo: esAdminFijo_(c), acceso: u.acceso, ultimo: u.ultimo, ingresos: u.ingresos, verificado: u.verificado, metodo: u.metodo, notas: u.notas,
+      sesiones: sesiones.filter(function (s) { return s.e === c; }).length,
+    };
+  });
+  CONFIG.ADMINS_FIJOS.forEach(function (c) {
+    if (!lista.some(function (u) { return u.correo === c; })) {
+      lista.push({ correo: c, nombre: '', rol: ROLES.ADMIN, activo: true, fijo: true, acceso: '', ultimo: '', ingresos: 0, verificado: '', metodo: '', notas: 'Aún no ingresó', sesiones: 0 });
+    }
+  });
+  return lista.sort(function (a, b) { return a.correo < b.correo ? -1 : 1; });
+}
+
+// ─────────────────────── Lista blanca de datos para OPERATIVAS (RT.2) ───────────────────────
+
+/**
+ * Campos que JAMÁS llegan a una operativa, en ninguna respuesta (se eliminan recursivamente antes de
+ * devolver). Las vistas construyen sus datos por lista blanca; esto es la segunda barrera.
+ */
+const CAMPOS_SENSIBLES_ = Object.freeze(['costo', 'costoUnitario', 'costoTotal', 'margen', 'margenPct', 'margenBruto',
+  'valorInventario', 'valorStock', 'utilidad', 'resultado', 'contribucion', 'precioMinimo', 'precioSugerido',
+  'descuentoProveedor', 'plazoProveedor', 'compraMinima', 'condicionesProveedor', 'proveedor', 'proveedores', 'acuerdos',
+  'comisionTotal', 'puntoEquilibrio', 'costosFijos', 'precioTransferencia']);
+
+function filtrarSensibles_(valor, profundidad) {
+  if (profundidad > 8 || valor === null || typeof valor !== 'object') return valor;
+  if (Array.isArray(valor)) return valor.map(function (v) { return filtrarSensibles_(v, profundidad + 1); });
+  const o = {};
+  Object.keys(valor).forEach(function (k) {
+    if (CAMPOS_SENSIBLES_.indexOf(k) >= 0) return;
+    o[k] = filtrarSensibles_(valor[k], profundidad + 1);
+  });
+  return o;
+}

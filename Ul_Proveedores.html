@@ -1,0 +1,285 @@
+<!--
+  DISTRIBUIDORA MB · Proveedores y acuerdos (v2.3 · Fase 3 · R2)
+  Lista con el estado automático del acuerdo (VIGENTE / POR VENCER / VENCIDO / SIN ACUERDO), alta y edición, «Renovar
+  acuerdo» (el anterior queda ARCHIVADO en «Acuerdos de proveedores»), historial, documento (enlace de Drive o archivo),
+  productos de cada proveedor («Código proveedor») y aviso en el Resumen. CONFIDENCIAL: solo administradoras (el servidor
+  nunca envía estos datos a una operativa).
+  Se incluye en Index.html con <?!= incluir_('UI_Proveedores') ?> y se conecta a la app por window.MB.
+-->
+<style>
+  /* ═════════════ Proveedores (v2.3) ═════════════ */
+  .pv-cond { font-size: 12px; color: var(--tinta-2); line-height: 1.55; }
+  .pv-prod { max-height: 50vh; overflow: auto; border: 1px solid var(--linea); border-radius: 4px; background: var(--superficie); margin-top: 10px; }
+  .pv-prod label { display: flex; gap: 10px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--linea); font-size: 13px; cursor: pointer; }
+  .pv-prod label:last-child { border-bottom: 0; }
+  .pv-prod input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--tinta); }
+  .pv-banner { margin: 0 0 16px; }
+  .pv-banner ul { margin: 6px 0 0; padding-left: 18px; }
+  .pv-seccion { border-top: 1px solid var(--linea); margin-top: 18px; padding-top: 14px; }
+</style>
+<script>
+(window.MB_EXT = window.MB_EXT || []).push(function (MB) {
+  'use strict';
+  var S = MB.S, $ = MB.$, esc = MB.esc, gs = MB.gs, miles = MB.miles, fecha = MB.fecha, plural = MB.plural, badge = MB.badge, boton = MB.boton, attr = MB.attr,
+    tabla = MB.tabla, kpi = MB.kpi, cabecera = MB.cabecera, campo = MB.campo, inputGs = MB.inputGs, inputEntero = MB.inputEntero, inputPct = MB.inputPct,
+    api = MB.api, toast = MB.toast, fallo = MB.fallo, conBoton = MB.conBoton, abrirModal = MB.abrirModal, requerir = MB.requerir, enteroDe = MB.enteroDe,
+    decimalDe = MB.decimalDe, norm = MB.norm, uid = MB.uid;
+
+  var PV = S.proveedoresUI = { q: '', filtro: 'activos' };
+  var TONO = { VIGENTE: 'ok', 'POR VENCER': 'alerta', VENCIDO: 'error', 'SIN ACUERDO': 'neutro', ARCHIVADO: 'neutro' };
+
+  function hay() { return !!(S.datos && S.datos.proveedores); }
+  function K() { return S.datos.proveedores; }
+  function render() { MB.render(); }
+  function opcion(valor, texto, sel) { return '<option value="' + esc(valor) + '"' + (sel ? ' selected' : '') + '>' + esc(texto) + '</option>'; }
+  function badgeEstado(e) { var k = String(e || 'SIN ACUERDO'); return badge(k.charAt(0) + k.slice(1).toLowerCase(), TONO[k] || 'neutro'); }
+  function nombreDe(p) { return p.nombre || p.razonSocial || p.codigo; }
+  function diasTexto(d) {
+    if (d === null || d === undefined) return '';
+    if (d < 0) return 'venció hace ' + plural(-d, 'día', 'días');
+    if (d === 0) return 'vence hoy';
+    return 'vence en ' + plural(d, 'día', 'días');
+  }
+  function condiciones(p) {
+    var partes = [];
+    if (Number(p.descuento) > 0) partes.push('descuento ' + MB.pct(p.descuento));
+    if (Number(p.plazo) > 0) partes.push('plazo ' + plural(Number(p.plazo), 'día', 'días'));
+    if (p.compraMinima !== '' && p.compraMinima !== null && p.compraMinima !== undefined) partes.push('compra mínima ' + gs(p.compraMinima));
+    return partes.length ? partes.join(' · ') : '—';
+  }
+  function proveedor(codigo) { return hay() ? MB.buscar(K().lista, codigo) : null; }
+  function leerArchivo(input) {
+    var file = input && input.files && input.files[0];
+    if (!file) return Promise.resolve(null);
+    if (file.size > 10 * 1024 * 1024) return Promise.reject(new Error('El archivo supera los 10 MB: súbalo a Drive y pegue el enlace.'));
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve({ nombre: file.name, tipo: file.type || 'application/pdf', base64: String(fr.result).split(',')[1] || '' }); };
+      fr.onerror = function () { reject(new Error('No se pudo leer el archivo.')); };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  // ═════════════ Vista: Proveedores ═════════════
+  function vProveedores() {
+    if (!MB.esAdmin()) return cabecera('Proveedores', 'Confidencial') + '<div class="vacio">Esta sección es solo para administradoras.</div>';
+    if (!hay()) return cabecera('Proveedores', 'Acuerdos y vencimientos') + '<div class="vacio">El módulo de proveedores todavía no está instalado en el servidor (Fase 3).</div>';
+    var k = K(), r = k.resumen;
+    var html = cabecera('Proveedores', 'Acuerdos y vencimientos · confidencial (solo administradoras)',
+      boton('Nuevo proveedor', 'pv-nuevo', '', 'btn') + ' ' + boton('Revisar vencimientos ahora', 'pv-revisar', '', 'btn btn-sec'));
+    if (r.alertas.length) html += bannerAlertas(r.alertas, false);
+    html += '<div class="kpis kpis-4">' +
+      kpi('Proveedores activos', miles(r.activos), plural(r.total, 'proveedor cargado', 'proveedores cargados')) +
+      kpi('Acuerdos vigentes', miles(r.vigentes), 'sin vencer en los próximos días de aviso') +
+      kpi('Por vencer', miles(r.porVencer), 'dentro de sus días de aviso (30 por defecto)', r.porVencer ? 'alerta' : '') +
+      kpi('Vencidos · sin acuerdo', miles(r.vencidos) + ' · ' + miles(r.sinAcuerdo), 'renovar o cargar el acuerdo', r.vencidos ? 'error' : '') + '</div>';
+    html += '<div class="barra-herr mt-l"><input type="search" placeholder="Buscar proveedor, RUC, marca o contacto" value="' + esc(PV.q) + '" data-al-escribir="pv-buscar" autocomplete="off">' +
+      '<div style="min-width:200px"><select data-al-cambiar="pv-filtro" aria-label="Filtrar proveedores">' +
+      [['activos', 'Activos'], ['alertas', 'Por vencer y vencidos'], ['sin', 'Sin acuerdo'], ['todos', 'Todos (con inactivos)']].map(function (o) { return opcion(o[0], o[1], PV.filtro === o[0]); }).join('') +
+      '</select></div></div>';
+    if (!k.lista.length) {
+      return html + '<div class="vacio">Todavía no hay proveedores cargados. Use «Nuevo proveedor» (con su acuerdo, si lo hay).</div>' + notaPie();
+    }
+    return html + '<div id="pv-tabla">' + tablaProveedores() + '</div>' + notaPie();
+  }
+  function notaPie() {
+    return '<p class="nota-pie">El estado se calcula solo: SIN ACUERDO (no hay condiciones ni vencimiento), VIGENTE, POR VENCER (dentro de los días de aviso) y VENCIDO. ' +
+      'Todos los días a las 08:05 el sistema avisa por correo a las administradoras a 60, 30, 15 y 7 días y el día del vencimiento, una sola vez por hito, y renueva solos los ' +
+      'acuerdos con renovación automática (mismo plazo). Cambiar condiciones = «Renovar acuerdo»: el anterior queda archivado, nunca se pisa.</p>';
+  }
+  function tablaProveedores() {
+    var q = norm(PV.q).trim();
+    var lista = K().lista.filter(function (p) {
+      if (PV.filtro !== 'todos' && !p.activo) return false;
+      if (PV.filtro === 'alertas' && p.estado !== 'POR VENCER' && p.estado !== 'VENCIDO') return false;
+      if (PV.filtro === 'sin' && p.estado !== 'SIN ACUERDO') return false;
+      return !q || norm([p.codigo, p.nombre, p.razonSocial, p.ruc, p.marcas, p.contacto, p.correo].join(' ')).indexOf(q) >= 0;
+    });
+    var filas = lista.map(function (p) {
+      return '<tr class="' + (p.activo ? '' : 'fila-anulada') + '"><td><div class="fuerte">' + esc(nombreDe(p)) + '</div><div class="det">' +
+        esc([p.codigo, p.razonSocial && p.razonSocial !== p.nombre ? p.razonSocial : '', p.ruc ? 'RUC ' + p.ruc : '', p.marcas].filter(Boolean).join(' · ')) + '</div>' +
+        '<div class="solo-movil">' + badgeEstado(p.estado) + '</div></td>' +
+        '<td class="ocultar-movil"><div>' + esc(p.contacto || '—') + '</div><div class="det">' +
+        (p.whatsapp ? '<a href="https://wa.me/' + esc(p.whatsapp) + '" target="_blank" rel="noopener">+' + esc(p.whatsapp) + '</a>' : esc(p.telefono || '')) + (p.correo ? ' · ' + esc(p.correo) : '') + '</div></td>' +
+        '<td class="ocultar-movil"><div class="pv-cond">' + esc(condiciones(p)) + '</div></td>' +
+        '<td><div>' + (p.vencimiento ? fecha(p.vencimiento) : '—') + '</div><div class="det">' + esc(diasTexto(p.dias)) + (p.renovacion === 'Sí' ? ' · se renueva sola' : '') + '</div></td>' +
+        '<td class="ocultar-movil">' + badgeEstado(p.estado) + '</td><td class="num ocultar-movil">' + miles(p.productos || 0) + '</td>' +
+        '<td class="acciones">' + boton('Ficha', 'pv-ficha', attr('codigo', p.codigo)) + boton('Editar', 'pv-editar', attr('codigo', p.codigo)) +
+        boton(p.estado === 'SIN ACUERDO' ? 'Cargar acuerdo' : 'Renovar acuerdo', 'pv-renovar', attr('codigo', p.codigo)) + boton('Productos', 'pv-productos', attr('codigo', p.codigo)) + '</td></tr>';
+    });
+    return '<div class="tabla-plegable">' + tabla(['Proveedor', ['Contacto', 'ocultar-movil'], ['Condiciones', 'ocultar-movil'], 'Vencimiento', ['Estado', 'ocultar-movil'],
+      ['Productos', 'num ocultar-movil'], ''], filas, 'Ningún proveedor coincide con el filtro.') + '</div>';
+  }
+  function bannerAlertas(alertas, enResumen) {
+    return '<div class="aviso-linea' + (alertas.some(function (a) { return a.estado === 'VENCIDO'; }) ? ' grave' : '') + ' pv-banner"' + (enResumen ? ' id="pv-banner-resumen"' : ' id="pv-banner"') + '>' +
+      '<strong>' + plural(alertas.length, 'acuerdo de proveedor por vencer o vencido', 'acuerdos de proveedores por vencer o vencidos') + '</strong>' +
+      '<ul>' + alertas.slice(0, 6).map(function (a) { return '<li>' + esc(a.nombre) + ' (' + esc(a.codigo) + '): ' + esc(diasTexto(a.dias)) + ' · ' + fecha(a.vencimiento) + '</li>'; }).join('') + '</ul>' +
+      (enResumen ? '<div class="mt">' + boton('Ver proveedores', 'ir', attr('destino', 'proveedores:lista'), 'btn btn-sec') + '</div>' : '') + '</div>';
+  }
+
+  // ═════════════ Alta y edición ═════════════
+  function camposAcuerdo(a, sufijo) {
+    a = a || {};
+    return '<div class="form-grid">' +
+      campo('Descuento %', inputPct('descuento', a.descuento === undefined || a.descuento === 0 ? '' : a.descuento, 'Ej.: 12,5'), 'c-4') +
+      campo('Plazo de pago (días)', inputEntero('plazo', a.plazo ? a.plazo : ''), 'c-4') +
+      campo('Compra mínima (Gs.)', inputGs('compraMinima', a.compraMinima === undefined ? '' : a.compraMinima), 'c-4') +
+      campo('Fecha de inicio', '<input type="date" name="inicio" value="' + esc(a.inicio || '') + '">', 'c-4') +
+      campo('Fecha de vencimiento', '<input type="date" name="vencimiento" value="' + esc(a.vencimiento || '') + '">', 'c-4') +
+      '<div class="campo c-4"><label>&nbsp;</label><label class="check"><input type="checkbox" name="renovacion"' + (a.renovacion === 'Sí' ? ' checked' : '') + '> Renovación automática</label>' +
+      '<span class="ayuda">Al vencer se renueva solo, con el mismo plazo.</span></div>' +
+      campo('Documento del acuerdo (enlace de Drive)', '<input name="documento" placeholder="https://drive.google.com/…" value="">', 'c-6', 'O, en lugar del enlace, suba el archivo en «Archivo del acuerdo».') +
+      campo('Archivo del acuerdo', '<input type="file" name="archivo' + (sufijo || '') + '" id="pv-archivo' + (sufijo || '') + '" accept=".pdf,image/*,application/pdf">', 'c-6', 'PDF o imagen, máx. 10 MB. Se guarda en «Distribuidora MB/Proveedores».') +
+      '</div>';
+  }
+  function datosAcuerdo(f) {
+    return {
+      descuento: f.descuento === '' ? '' : decimalDe(f.descuento), plazo: f.plazo === '' ? '' : enteroDe(f.plazo), compraMinima: f.compraMinima === '' ? '' : enteroDe(f.compraMinima),
+      inicio: f.inicio || '', vencimiento: f.vencimiento || '', renovacion: f.renovacion ? 'Sí' : 'No', documento: f.documento || '',
+    };
+  }
+  function hayAcuerdo(a) {
+    return ['descuento', 'plazo', 'compraMinima', 'inicio', 'vencimiento', 'documento'].some(function (k) { return a[k] !== '' && a[k] !== null && a[k] !== undefined && !(typeof a[k] === 'number' && isNaN(a[k])); });
+  }
+  function modalProveedor(codigo) {
+    var p = codigo ? proveedor(codigo) : null;
+    function v(k) { return p ? (p[k] === null || p[k] === undefined ? '' : p[k]) : ''; }
+    var cuerpo = '<div class="form-grid">' +
+      campo('Razón social', '<input name="razonSocial" maxlength="150" value="' + esc(v('razonSocial')) + '">', 'c-6') +
+      campo('Nombre comercial', '<input name="nombre" maxlength="120" value="' + esc(v('nombre')) + '">', 'c-6', 'Complete al menos uno de los dos.') +
+      campo('RUC', '<input name="ruc" maxlength="20" placeholder="1234567-8" value="' + esc(v('ruc')) + '">', 'c-4', 'Con dígito verificador, sin puntos.') +
+      campo('Contacto principal', '<input name="contacto" maxlength="100" value="' + esc(v('contacto')) + '">', 'c-4') +
+      campo('Teléfono / WhatsApp', '<input name="telefono" maxlength="40" inputmode="tel" value="' + esc(v('telefono')) + '">', 'c-4') +
+      campo('Correo', '<input name="correo" maxlength="120" type="email" value="' + esc(v('correo')) + '">', 'c-6') +
+      campo('Dirección', '<input name="direccion" maxlength="150" value="' + esc(v('direccion')) + '">', 'c-6') +
+      campo('Marcas o líneas', '<input name="marcas" maxlength="300" value="' + esc(v('marcas')) + '">', 'c-8') +
+      campo('Días de aviso', inputEntero('diasAviso', p ? p.diasAviso : 30), 'c-4', 'Desde cuántos días antes figura POR VENCER.') +
+      '<div class="campo c-12"><label>Notas</label><textarea name="notas" maxlength="600">' + esc(v('notas')) + '</textarea></div>' +
+      (p ? '<div class="c-12"><label class="check"><input type="checkbox" name="activo"' + (p.activo ? ' checked' : '') + '> Activo (desmarque para ocultarlo sin borrar su historial)</label></div>' : '') + '</div>' +
+      (p ? '<p class="ficha mt">Condiciones vigentes: ' + esc(condiciones(p)) + (p.vencimiento ? ' · vence el ' + fecha(p.vencimiento) : '') +
+        '. Para cambiarlas use «Renovar acuerdo» (el anterior queda archivado).</p>'
+        : '<div class="pv-seccion"><p class="eyebrow">Acuerdo vigente (opcional)</p><div class="mt">' + camposAcuerdo(null, '') + '</div></div>');
+    abrirModal({
+      titulo: p ? 'Editar · ' + nombreDe(p) : 'Nuevo proveedor', cuerpo: cuerpo, ancho: true, aceptar: p ? 'Guardar cambios' : 'Registrar proveedor',
+      alAceptar: function (f, id) {
+        requerir(f.razonSocial || f.nombre, 'Complete la razón social o el nombre comercial.');
+        var datos = { codigoOriginal: p ? p.codigo : '', razonSocial: f.razonSocial, nombre: f.nombre, ruc: f.ruc, contacto: f.contacto, telefono: f.telefono, correo: f.correo,
+          direccion: f.direccion, marcas: f.marcas, diasAviso: f.diasAviso, notas: f.notas };
+        if (p) datos.activo = f.activo;
+        if (p) return api('guardarProveedor', datos, id);
+        var a = datosAcuerdo(f);
+        return leerArchivo($('#pv-archivo')).then(function (archivo) {
+          if (archivo) a.archivo = archivo;
+          if (hayAcuerdo(a) || archivo) datos.acuerdo = a;
+          return api('guardarProveedor', datos, id);
+        });
+      },
+    });
+  }
+  function modalRenovar(codigo) {
+    var p = proveedor(codigo);
+    if (!p) return;
+    var sugerido = { descuento: p.descuento, plazo: p.plazo, compraMinima: p.compraMinima, renovacion: p.renovacion, inicio: '', vencimiento: '' };
+    if (p.vencimiento) sugerido.inicio = MB.sumarDias(p.vencimiento, 1);
+    abrirModal({
+      titulo: (p.estado === 'SIN ACUERDO' ? 'Cargar acuerdo · ' : 'Renovar acuerdo · ') + nombreDe(p), ancho: true, aceptar: 'Registrar acuerdo',
+      cuerpo: (p.estado === 'SIN ACUERDO' ? '<p class="ayuda">Cargue las condiciones y la vigencia del acuerdo.</p>' :
+        '<p class="ficha">Acuerdo actual: ' + esc(condiciones(p)) + (p.vencimiento ? ' · vence el ' + fecha(p.vencimiento) + ' (' + esc(diasTexto(p.dias)) + ')' : '') +
+        '. Al registrar el nuevo, el actual queda ARCHIVADO en el historial (no se borra).</p>') +
+        '<div class="mt">' + camposAcuerdo(sugerido, 'r') + '</div>' + campo('Motivo', '<input name="motivo" maxlength="300" placeholder="Ej.: renovación anual, nuevas condiciones">', 'c-12 mt'),
+      alAceptar: function (f, id) {
+        var a = datosAcuerdo(f);
+        return leerArchivo($('#pv-archivor')).then(function (archivo) {
+          if (archivo) a.archivo = archivo;
+          requerir(hayAcuerdo(a) || archivo, 'Complete al menos el vencimiento o una condición del acuerdo.');
+          return api('renovarAcuerdo', Object.assign({ codigo: p.codigo, motivo: f.motivo }, a), id);
+        });
+      },
+    });
+  }
+
+  // ═════════════ Ficha con historial y productos (R2.2 / R2.4) ═════════════
+  function modalFicha(codigo) {
+    api('obtenerProveedores', { codigo: codigo }).then(function (r) {
+      var p = r.proveedor;
+      var dl = '<dl class="dl">' +
+        '<dt>Código</dt><dd>' + esc(p.codigo) + ' · ' + badgeEstado(p.estado) + (p.dias !== null ? ' <span class="det">' + esc(diasTexto(p.dias)) + '</span>' : '') + '</dd>' +
+        '<dt>Razón social</dt><dd>' + esc(p.razonSocial || '—') + (p.ruc ? ' · RUC ' + esc(p.ruc) : '') + '</dd>' +
+        '<dt>Contacto</dt><dd>' + esc([p.contacto, p.telefono, p.correo].filter(Boolean).join(' · ') || '—') + '</dd>' +
+        '<dt>Dirección</dt><dd>' + esc(p.direccion || '—') + '</dd>' +
+        '<dt>Marcas</dt><dd>' + esc(p.marcas || '—') + '</dd>' +
+        '<dt>Condiciones</dt><dd>' + esc(condiciones(p)) + '</dd>' +
+        '<dt>Vigencia</dt><dd>' + (p.inicio ? fecha(p.inicio) : '—') + ' → ' + (p.vencimiento ? fecha(p.vencimiento) : 'sin vencimiento') + ' · renovación automática: ' + esc(p.renovacion) +
+        ' · aviso desde ' + plural(p.diasAviso, 'día', 'días') + '</dd>' +
+        '<dt>Documento</dt><dd>' + (p.documento ? (/^https:/.test(p.documento) ? '<a href="' + esc(p.documento) + '" target="_blank" rel="noopener">Abrir el documento</a>' : esc(p.documento)) : '—') + '</dd>' +
+        (p.notas ? '<dt>Notas</dt><dd>' + esc(p.notas) + '</dd>' : '') + '</dl>';
+      var hist = tabla(['N° acuerdo', 'Estado', 'Condiciones', 'Vigencia', 'Motivo'], r.acuerdos.map(function (a) {
+        return '<tr class="' + (a.estado === 'ARCHIVADO' ? 'fila-anulada' : '') + '"><td class="cod">' + esc(a.id) + '<div class="det">' + esc(String(a.registrado || '').slice(0, 10).split('-').reverse().join('/')) +
+          '</div></td><td>' + badgeEstado(a.estado) + (a.archivado ? '<div class="det">archivado ' + esc(String(a.archivado).slice(0, 10).split('-').reverse().join('/')) + '</div>' : '') + '</td><td class="pv-cond">' +
+          esc(condiciones(a)) + (a.documento ? '<div>' + (/^https:/.test(a.documento) ? '<a href="' + esc(a.documento) + '" target="_blank" rel="noopener">documento</a>' : esc(a.documento)) + '</div>' : '') +
+          '</td><td>' + (a.inicio ? fecha(a.inicio) : '—') + ' → ' + (a.vencimiento ? fecha(a.vencimiento) : '—') + (a.renovacion === 'Sí' ? '<div class="det">renovación automática</div>' : '') +
+          '</td><td class="det">' + esc(a.motivo || '') + '</td></tr>';
+      }), 'Sin acuerdos registrados.');
+      var mios = r.productos.filter(function (x) { return x.proveedor === p.codigo; });
+      abrirModal({
+        titulo: nombreDe(p), ancho: true, soloCerrar: true,
+        cuerpo: dl + '<div class="chips">' + boton(p.estado === 'SIN ACUERDO' ? 'Cargar acuerdo' : 'Renovar acuerdo', 'pv-renovar', attr('codigo', p.codigo), 'btn btn-sec') +
+          boton('Editar datos', 'pv-editar', attr('codigo', p.codigo), 'btn btn-sec') + boton('Productos', 'pv-productos', attr('codigo', p.codigo), 'btn btn-sec') + '</div>' +
+          '<p class="eyebrow mt-l">Historial de acuerdos</p><div class="mt">' + hist + '</div>' +
+          '<p class="eyebrow mt-l">Productos de este proveedor (' + mios.length + ')</p><p class="ayuda mt">' + (mios.length ? esc(mios.map(function (x) { return x.codigo + ' ' + x.nombre; }).join(' · ')) : 'Ninguno asignado.') + '</p>',
+      });
+    }).catch(fallo);
+  }
+  function modalProductos(codigo) {
+    api('obtenerProveedores', { codigo: codigo }).then(function (r) {
+      var p = r.proveedor;
+      var lista = r.productos.filter(function (x) { return x.activo || x.proveedor === p.codigo; });
+      var cuerpo = '<p class="ayuda">Marque los productos que compra a este proveedor (columna «Código proveedor» de Productos). Un producto de otro proveedor pasa a este si lo marca.</p>' +
+        '<div class="barra-herr mt"><input type="search" placeholder="Filtrar por nombre, marca o código" data-al-escribir="pv-prod-filtro" autocomplete="off"></div>' +
+        '<div class="pv-prod" id="pv-prod-lista">' + lista.map(function (x) {
+          var otro = x.proveedor && x.proveedor !== p.codigo;
+          return '<label data-texto="' + esc(norm([x.codigo, x.nombre, x.marca, x.categoria].join(' '))) + '"><input type="checkbox" name="prod-' + esc(x.codigo) + '" value="' + esc(x.codigo) + '"' +
+            (x.proveedor === p.codigo ? ' checked' : '') + '><span><span class="fuerte">' + esc(x.nombre) + '</span> <span class="det">' + esc([x.codigo, x.marca, x.categoria].filter(Boolean).join(' · ')) +
+            (otro ? ' · hoy de ' + esc(x.proveedor) : '') + '</span></span></label>';
+        }).join('') + '</div>';
+      abrirModal({
+        titulo: 'Productos de ' + nombreDe(p), ancho: true, aceptar: 'Guardar productos', cuerpo: cuerpo,
+        alAceptar: function (f, id) {
+          var elegidos = Array.prototype.map.call(document.querySelectorAll('#pv-prod-lista input[type=checkbox]:checked'), function (x) { return x.value; });
+          return api('asignarProductosProveedor', { codigo: p.codigo, productos: elegidos }, id);
+        },
+      });
+    }).catch(fallo);
+  }
+
+  // ═════════════ Conexión con la app ═════════════
+  MB.vistas.proveedores = vProveedores;
+  var A = MB.acciones;
+  A['pv-nuevo'] = function () { modalProveedor(null); };
+  A['pv-editar'] = function (el) { modalProveedor(el.getAttribute('data-codigo')); };
+  A['pv-renovar'] = function (el) { modalRenovar(el.getAttribute('data-codigo')); };
+  A['pv-ficha'] = function (el) { modalFicha(el.getAttribute('data-codigo')); };
+  A['pv-productos'] = function (el) { modalProductos(el.getAttribute('data-codigo')); };
+  A['pv-revisar'] = function (el) {
+    conBoton(el, 'Revisando…', function () { return api('revisarAcuerdosAhora', {}, 'pvrev-' + uid()); }).then(MB.aplicar).catch(fallo);
+  };
+  MB.alEscribir['pv-buscar'] = function (el) { PV.q = el.value; var t = $('#pv-tabla'); if (t) t.innerHTML = tablaProveedores(); };
+  MB.alCambio['pv-filtro'] = function (el) { PV.filtro = el.value; var t = $('#pv-tabla'); if (t) t.innerHTML = tablaProveedores(); };
+  MB.alEscribir['pv-prod-filtro'] = function (el) {
+    var q = norm(el.value).trim();
+    Array.prototype.forEach.call(document.querySelectorAll('#pv-prod-lista label'), function (l) { l.hidden = !!q && l.getAttribute('data-texto').indexOf(q) < 0; });
+  };
+
+  // Resumen (administradoras): aviso de acuerdos por vencer o vencidos debajo del título (R2.3).
+  var renderPrevio = MB.alRender;
+  MB.alRender = function () {
+    if (renderPrevio) renderPrevio();
+    if (S.vista !== 'resumen' || !MB.esAdmin() || !hay() || !K().resumen.alertas.length || $('#pv-banner-resumen')) return;
+    var cab = document.querySelector('#contenido .vista-cab');
+    if (!cab) return;
+    var div = document.createElement('div');
+    div.innerHTML = bannerAlertas(K().resumen.alertas, true);
+    cab.parentNode.insertBefore(div.firstChild, cab.nextSibling);
+  };
+});
+</script>

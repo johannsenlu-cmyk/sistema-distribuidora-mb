@@ -1,0 +1,399 @@
+<!--
+  DISTRIBUIDORA MB · Sistema (v2.3 · Fase 1) — solo administradoras.
+  Salud (?page=health), Pendientes, Usuarias y roles, Configuración, Parámetros de crédito, Integraciones y Auditoría.
+  Se incluye en Index.html con <?!= incluir_('UI_Sistema') ?> y se conecta a la app por window.MB.
+  El servidor valida el rol en CADA función: esta pantalla solo ordena y muestra.
+  Otros módulos pueden sumar pestañas con MB.sistemaExtra.push([clave, etiqueta, función de vista]).
+-->
+<style>
+  /* ═════════════ Sistema (v2.3) ═════════════ */
+  .aviso-linea { margin-top: 10px; font-size: 13px; padding: 9px 12px; border-radius: var(--radio); border-left: 3px solid var(--alerta); background: var(--alerta-suave); color: #6B4A10; }
+  .aviso-linea.grave { border-left-color: var(--error); background: var(--error-suave); color: var(--error); }
+  .aviso-linea.bien { border-left-color: var(--ok); background: var(--ok-suave); color: var(--ok); }
+  .tareas { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .tarea { display: flex; justify-content: space-between; gap: 12px; align-items: center; border: 1px solid var(--linea); border-radius: 4px; padding: 12px 14px; background: var(--superficie); }
+  .tarea strong { font-weight: 600; }
+  .tarea p { font-size: 12px; color: var(--tenue); margin-top: 2px; }
+  .codigo-bloque { font: 12px/1.55 ui-monospace, Menlo, Consolas, monospace; background: var(--superficie-2); border: 1px solid var(--linea); border-radius: var(--radio); padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+  .integracion .segmentado { max-width: 440px; }
+  .pend-grupo { border: 1px solid var(--linea); border-radius: 4px; background: var(--superficie); margin-top: 10px; }
+  .pend-grupo summary { cursor: pointer; padding: 12px 14px; display: flex; justify-content: space-between; gap: 12px; align-items: center; list-style: none; }
+  .pend-grupo summary::-webkit-details-marker { display: none; }
+  .pend-grupo .pend-cuerpo { padding: 0 14px 12px; font-size: 13px; }
+  .pend-grupo ul { margin: 6px 0 0; padding-left: 18px; }
+  .pend-grupo li { margin: 2px 0; overflow-wrap: anywhere; }
+  .cfg-fila { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--linea); }
+  .cfg-fila p { font-size: 12px; color: var(--tenue); margin-top: 2px; }
+  @media (max-width: 900px) { .tareas { grid-template-columns: 1fr; } }
+  @media (max-width: 600px) { .cfg-fila { grid-template-columns: 1fr; } .tarea { flex-direction: column; align-items: flex-start; } }
+</style>
+<script>
+(window.MB_EXT = window.MB_EXT || []).push(function (MB) {
+  'use strict';
+  var S = MB.S, $ = MB.$, esc = MB.esc, miles = MB.miles, plural = MB.plural, badge = MB.badge, boton = MB.boton, attr = MB.attr,
+    tabla = MB.tabla, kpi = MB.kpi, cabecera = MB.cabecera, subtabs = MB.subtabs, campo = MB.campo, api = MB.api, toast = MB.toast,
+    fallo = MB.fallo, conBoton = MB.conBoton, abrirModal = MB.abrirModal, requerir = MB.requerir, norm = MB.norm, uid = MB.uid;
+
+  var X = S.sistema = { salud: null, auditoria: null, qAud: '', cargando: {} };
+  MB.sistemaExtra = MB.sistemaExtra || [];
+
+  function D() { return S.datos; }
+  function A() { return S.datos.admin || {}; }
+  function minus(t) { return String(t === null || t === undefined ? '' : t).toLowerCase(); }
+  function opcion(valor, texto, sel) { return '<option value="' + esc(valor) + '"' + (sel ? ' selected' : '') + '>' + esc(texto) + '</option>'; }
+  function aviso(txt, tono) { return '<p class="aviso-linea' + (tono ? ' ' + tono : '') + '">' + esc(txt) + '</p>'; }
+  function tono(res) { return res === 'OK' ? 'ok' : (res === 'AVISO' ? 'alerta' : (res === 'FALLO' || res === 'ERROR' ? 'error' : 'neutro')); }
+  function valorTexto(v, unidad) {
+    if (v === '' || v === null || v === undefined) return '';
+    if (typeof v === 'number') {
+      if (unidad === '%') return String(Math.round(v * 10000) / 100).replace('.', ',') + '%';
+      return Math.abs(v) >= 1000 ? miles(v) : String(v).replace('.', ',');
+    }
+    return String(v);
+  }
+
+  // ═════════════ Vista principal ═════════════
+  var TAREAS = [
+    ['instalar', 'Instalar o reparar', 'Respaldo previo, esquema, carpeta, permisos verificados, parámetros, paquetes, activadores y pruebas. Tarda de 1 a 4 minutos. No duplica nada.', true],
+    ['pruebas', 'Ejecutar pruebas', 'Cálculos en memoria y escenarios sobre una copia temporal del libro (que se borra sola).', false],
+    ['respaldo', 'Respaldo ahora', 'Copia del libro en «Distribuidora MB/Respaldos» (los diarios se guardan 14 días).', false],
+    ['compartir', 'Compartir y verificar', 'Libro y carpeta con edición para Mirian y Raquel, sin correo de invitación; relee los permisos reales.', true],
+    ['acceso', 'Revisar acceso a la hoja', 'Informa quién más tiene acceso (la hoja tiene costos). No quita nada sin confirmación.', false],
+    ['actualizaciones', 'Aplicar actualizaciones', 'Paquetes de la versión que todavía no se aplicaron (uno por fase).', false],
+    ['activadores', 'Reinstalar activadores', 'Respaldo diario 02:15 y las tareas de cada módulo instalado (zona America/Asuncion).', false],
+  ];
+  var TAREAS_MODULO = [
+    ['recalcular', 'cartera', 'Recalcular cartera', 'Reescribe saldos, cuotas y estados desde «Cobros».', false],
+    ['colaSifen', 'fiscal', 'Procesar facturación', 'Envía o reintenta los comprobantes pendientes o con error.', false],
+    ['alertas', 'whatsapp', 'Enviar recordatorios hoy', 'WhatsApp a clientas fuera de la gracia (respeta el modo y «uno por día»).', true],
+    ['sincronizarAgenda', 'agenda', 'Sincronizar agenda', 'Reintenta los turnos pendientes con Google Calendar.', false],
+  ];
+  function tareas() {
+    var mod = (D().config && D().config.modulos) || {};
+    return TAREAS.concat(TAREAS_MODULO.filter(function (t) { return mod[t[1]]; }).map(function (t) { return [t[0], t[2], t[3], t[4]]; }));
+  }
+
+  function vSistema() {
+    var html = cabecera('Sistema', 'Versión ' + (D().config.version || MB.version) + ' · solo administradoras');
+    var pestanas = [['salud', 'Salud'], ['pendientes', 'Pendientes'], ['usuarias', 'Usuarias'], ['configuracion', 'Configuración'], ['parametros', 'Parámetros'],
+      ['integraciones', 'Integraciones'], ['auditoria', 'Auditoría']].concat(MB.sistemaExtra.map(function (e) { return [e[0], e[1]]; }));
+    html += subtabs('sistema', pestanas);
+    var sub = S.sub.sistema;
+    var extra = MB.sistemaExtra.filter(function (e) { return e[0] === sub; })[0];
+    if (extra) return html + extra[2]();
+    if (sub === 'pendientes') return html + vPendientes();
+    if (sub === 'usuarias') return html + vUsuarias();
+    if (sub === 'configuracion') return html + vConfiguracion();
+    if (sub === 'parametros') return html + vParametros();
+    if (sub === 'integraciones') return html + vIntegraciones();
+    if (sub === 'auditoria') return html + vAuditoria();
+    return html + vSalud();
+  }
+
+  // ═════════════ Salud (?page=health) ═════════════
+  function cargarSalud() {
+    if (X.cargando.salud) return;
+    X.cargando.salud = true;
+    setTimeout(function () {
+      api('obtenerSalud', {}).then(function (r) { X.salud = r.salud; })
+        .catch(function (e) { X.salud = { error: e.message }; })
+        .finally(function () { X.cargando.salud = false; if (S.vista === 'sistema') MB.render(); });
+    }, 0);
+  }
+  function vSalud() {
+    var s = X.salud;
+    if (!s) { cargarSalud(); return '<div class="vacio">Revisando el estado del sistema…</div>'; }
+    if (s.error) return '<div class="vacio">' + esc(s.error) + '<br><br>' + boton('Reintentar', 'cargar-salud', '', 'btn btn-sec') + '</div>';
+    var trig = s.triggers.filter(function (t) { return t.modulo; });
+    var trigOk = trig.every(function (t) { return t.instalado === 1; });
+    var permOk = s.permisos.every(function (p) { return p.ok; });
+    var zonaOk = s.zonaScript === 'America/Asuncion' && s.zonaHoja === 'America/Asuncion';
+    var pr = s.ultimasPruebas || {};
+    var ing = s.ingreso || {};
+    var html = '<div class="kpis">' +
+      kpi('Ingreso con Google', ing.clientId && ing.enlaceAcceso ? 'Activo' : 'Pendiente', (ing.clientId ? 'Client ID registrado' : 'Falta Client ID') + ' · ' + (ing.enlaceAcceso ? 'enlace registrado' : 'falta el enlace') +
+        ' · registro ' + (ing.registroAbierto ? 'ABIERTO' : 'cerrado'), ing.clientId && ing.enlaceAcceso && !ing.registroAbierto ? '' : 'alerta') +
+      kpi('Permisos verificados', permOk ? 'En orden' : 'Revisar', permOk ? plural(s.permisos.length, 'permiso verificado', 'permisos verificados') + ' (libro, carpeta' + (s.permisos.some(function (p) { return /alendario/.test(p.recurso); }) ? ', calendario' : '') + ')'
+        : s.permisos.filter(function (p) { return !p.ok; }).map(function (p) { return p.recurso + ' · ' + p.correo + ': FALLO'; }).join(' · '), permOk ? '' : 'error') +
+      kpi('Activadores', trigOk ? 'En orden' : 'Revisar', trig.map(function (t) { return t.funcion + ': ' + (t.instalado === 1 ? 'OK' : (t.instalado ? 'duplicado' : 'falta')); }).join(' · ') || 'Sin módulos con tareas', trigOk ? '' : 'error') +
+      kpi('Pruebas', pr.resumen || 'Sin correr', pr.fecha ? 'última vez ' + pr.fecha : 'Use «Ejecutar pruebas»', pr.fallos ? 'error' : '') +
+      kpi('Último respaldo', s.ultimoRespaldo && s.ultimoRespaldo.fecha ? s.ultimoRespaldo.fecha : 'Nunca', s.ultimoRespaldo && s.ultimoRespaldo.nombre ? s.ultimoRespaldo.nombre : 'Respaldo diario a las 02:15', s.ultimoRespaldo && s.ultimoRespaldo.fecha ? '' : 'alerta') +
+      kpi('Integraciones', 'SIFEN ' + minus(s.integraciones.sifen) + ' · WhatsApp ' + minus(s.integraciones.whatsapp), 'Facturación ' + minus(s.integraciones.facturacion) + ' · correos restantes hoy: ' +
+        (s.correoRestanteHoy === null ? '—' : miles(s.correoRestanteHoy)) + ' · ' + plural(s.sesionesActivas, 'sesión abierta', 'sesiones abiertas') + (zonaOk ? '' : ' · zona: ' + s.zonaScript + ' / ' + s.zonaHoja), zonaOk ? '' : 'error') +
+      '</div>';
+    if (s.version !== s.versionHoja) html += aviso('La hoja figura con la versión «' + (s.versionHoja || '—') + '» y el código es ' + s.version + ': use «Instalar o reparar».', 'grave');
+    (s.avisosParametros || []).forEach(function (t) { html += aviso(t, /REVISAR/.test(t) ? 'grave' : ''); });
+    if ((s.parametrosFaltantes || []).length) html += aviso('Parámetros vacíos o inválidos: ' + s.parametrosFaltantes.join(', ') + '.', 'grave');
+    var acceso = s.acceso || [];
+    html += '<section class="panel mt"><div class="panel-cab"><h2>Acceso directo a la hoja de cálculo</h2>' + boton('Actualizar', 'cargar-salud', '', 'btn btn-sec') + '</div>' +
+      (acceso.length ? tabla(['Correo', 'Estado', ['Detalle', 'ocultar-movil'], ''], acceso.map(function (h) {
+        return '<tr><td>' + esc(h.correo) + '</td><td>' + badge(h.estado, tono(h.estado === 'QUITAR' ? 'AVISO' : h.estado)) + '</td><td class="det ocultar-movil">' + esc(h.detalle) + '</td><td class="acciones">' +
+          (h.estado === 'QUITAR' ? boton('Quitar acceso', 'quitar-acceso', attr('correo', h.correo), 'btn-link peligro') : '') + '</td></tr>';
+      }), '') : '<p class="ayuda">Solo la propietaria tiene acceso directo: bien.</p>') + '</section>';
+    html += '<section class="panel mt"><h2>Módulos y paquetes</h2>' + tabla(['Paquete', 'Estado', ['Fecha', 'ocultar-movil']], (s.paquetes || []).map(function (p) {
+      return '<tr><td class="cod">' + esc(p.id) + '</td><td>' + (p.aplicado ? badge('Aplicado', 'ok') : (p.disponible ? badge('Pendiente', 'alerta') : badge('Módulo no instalado', 'neutro'))) + '</td><td class="ocultar-movil">' + esc(p.fecha || '—') + '</td></tr>';
+    }), '') + (s.carpeta ? '<p class="ayuda mt">Carpeta del sistema: <a href="' + esc(s.carpeta) + '" target="_blank" rel="noopener">' + esc(s.carpeta) + '</a> · ' +
+      boton('Mover el libro a la carpeta', 'mover-libro', '', 'btn-link') + '</p>' : '') + '</section>';
+    html += '<section class="panel mt"><h2>Mantenimiento</h2><div class="tareas">' + tareas().map(function (t) {
+      return '<div class="tarea"><div><strong>' + esc(t[1]) + '</strong><p>' + esc(t[2]) + '</p></div>' + boton('Ejecutar', 'mantenimiento', attr('tarea', t[0]), 'btn btn-sec') + '</div>';
+    }).join('') + '</div></section>';
+    var inst = (s.instalacion || []).slice(0, 40);
+    html += '<section class="panel mt"><h2>Estado de instalación</h2>' + tabla(['Fecha', 'Paso', 'Resultado', ['Detalle / acción', 'ocultar-movil']], inst.map(function (f) {
+      return '<tr><td>' + esc(f.fecha) + '</td><td>' + esc(f.paso) + (f.recurso ? '<div class="det">' + esc(f.recurso) + '</div>' : '') + '</td><td>' + badge(f.resultado || '—', tono(f.resultado)) +
+        '</td><td class="det ocultar-movil">' + esc(String(f.detalle || '').slice(0, 300)) + (f.accion ? '<div><strong>Acción:</strong> ' + esc(String(f.accion).slice(0, 300)) + '</div>' : '') + '</td></tr>';
+    }), 'Sin registros.') + '</section>';
+    return html;
+  }
+  function ejecutarTarea(el) {
+    var t = tareas().filter(function (x) { return x[0] === el.getAttribute('data-tarea'); })[0];
+    if (!t) return;
+    var correr = function () {
+      conBoton(el, 'Ejecutando…', function () { return api('ejecutarMantenimiento', { accion: t[0] }); }).then(function (r) {
+        var mensaje = r.mensaje;
+        r.mensaje = '';
+        X.salud = null;
+        MB.aplicar(r);
+        toast(t[1] + ': ' + mensaje, /falla|fallo|error/i.test(mensaje) ? 'aviso' : 'ok', 12000);
+        if (Array.isArray(r.detalle) && r.detalle.length) mostrarDetalle(t[1], r.detalle);
+      }).catch(fallo);
+    };
+    if (t[3]) MB.confirmar({ titulo: t[1], mensaje: esc(t[2]) + ' ¿Continuar?', aceptar: 'Ejecutar' }).then(function (si) { if (si) correr(); });
+    else correr();
+  }
+  function mostrarDetalle(titulo, detalle) {
+    var filas = detalle.map(function (x) {
+      var res = x.resultado || x.estado || (x.ok === undefined ? '' : (x.ok ? 'OK' : 'FALLO'));
+      return '<tr><td>' + esc(x.paso || x.nombre || x.id || x.correo || '') + (x.recurso ? '<div class="det">' + esc(x.recurso) + '</div>' : '') + '</td><td>' + badge(res || '—', tono(res)) + '</td><td class="det">' +
+        esc(x.detalle || x.resumen || '') + (x.accion ? '<div><strong>Acción:</strong> ' + esc(x.accion) + '</div>' : '') + '</td></tr>';
+    });
+    abrirModal({ titulo: titulo, cuerpo: tabla(['Paso', 'Resultado', 'Detalle'], filas, ''), soloCerrar: true, ancho: true });
+  }
+
+  // ═════════════ Pendientes (lo que falta completar o confirmar) ═════════════
+  function vPendientes() {
+    var lista = D().pendientesPanel || [];
+    if (!lista.length) return '<div class="vacio">No hay pendientes: todo lo verificable está completo.</div>';
+    return '<p class="ayuda">Nada de esto se completa con supuestos: cada punto espera un dato real (de Mirian, del contador o de la carga).</p>' +
+      lista.map(function (p) {
+        return '<details class="pend-grupo"><summary><span class="fuerte">' + esc(p.titulo) + '</span>' + badge(miles(p.cantidad), 'alerta') + '</summary><div class="pend-cuerpo">' +
+          (p.accion ? '<p><strong>Qué hacer:</strong> ' + esc(p.accion) + '</p>' : '') +
+          (p.detalle && p.detalle.length ? '<ul>' + p.detalle.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>' +
+            (p.cantidad > p.detalle.length ? '<p class="det">… y ' + miles(p.cantidad - p.detalle.length) + ' más.</p>' : '') : '') + '</div></details>';
+      }).join('');
+  }
+
+  // ═════════════ Usuarias y roles ═════════════
+  function vUsuarias() {
+    var a = A(), abierto = !!D().config.registroAbierto;
+    var html = '<section class="panel"><div class="panel-cab"><h2>Registro de nuevos correos</h2>' + badge(abierto ? 'Abierto' : 'Cerrado', abierto ? 'alerta' : 'ok') + '</div>' +
+      '<p class="ayuda">' + (abierto ? 'Cualquier persona con cuenta de Google y el enlace puede ingresar y queda como OPERATIVA (ventas, cobros, agenda e inventario, sin costos). Se avisa por correo de cada alta.'
+        : 'Solo ingresan los correos habilitados abajo. Para sumar a alguien use «Habilitar correo».') + '</p>' +
+      '<div class="form-acciones">' + boton(abierto ? 'Cerrar el registro' : 'Abrir el registro', 'registro', attr('valor', abierto ? 'cerrar' : 'abrir'), abierto ? 'btn' : 'btn btn-sec') + '</div></section>';
+    var filas = (a.usuarios || []).map(function (u) {
+      return '<tr class="' + (u.activo ? '' : 'fila-anulada') + '"><td><div class="fuerte">' + esc(u.correo) + '</div><div class="det">' + esc([u.nombre, u.fijo ? 'fija' : '', u.notas].filter(String).join(' · ')) + '</div></td>' +
+        '<td>' + badge(u.rol === 'ADMINISTRADOR' ? 'Administradora' : 'Operativa', u.rol === 'ADMINISTRADOR' ? 'ok' : 'neutro') + (u.activo ? '' : ' ' + badge('Desactivada', 'error')) + '</td>' +
+        '<td class="ocultar-movil">' + esc(u.acceso || '—') + '</td><td class="ocultar-movil">' + esc(u.ultimo || 'Nunca') + '<div class="det">' + plural(Number(u.ingresos) || 0, 'ingreso', 'ingresos') +
+        (u.metodo ? ' · ' + esc(u.metodo) : '') + '</div></td>' +
+        '<td class="num">' + miles(u.sesiones || 0) + '</td><td class="acciones">' + boton('Editar', 'editar-usuaria', attr('correo', u.correo)) +
+        (u.sesiones ? boton('Cerrar sesiones', 'cerrar-sesiones', attr('correo', u.correo), 'btn-link peligro') : '') + '</td></tr>';
+    });
+    html += '<section class="panel mt"><div class="panel-cab"><h2>Usuarias</h2>' + boton('Habilitar correo', 'nueva-usuaria', '', 'btn btn-sec') + '</div>' +
+      tabla(['Correo', 'Rol', ['Hoja de cálculo', 'ocultar-movil'], ['Último ingreso', 'ocultar-movil'], ['Sesiones', 'num'], ''], filas, 'Sin usuarias.') + '</section>';
+    return html + '<p class="nota-pie">Las administradoras fijas (Mirian, Raquel y la cuenta propietaria) no se pueden desactivar. Al desactivar a alguien o cambiarle el rol se cierran sus sesiones. ' +
+      'Operativas: ventas, cobros, agenda e inventario, sin costos, márgenes, comisiones ni proveedores. La hoja de cálculo contiene costos: solo para administradoras.</p>';
+  }
+  function modalUsuaria(correo) {
+    var u = correo ? (A().usuarios || []).filter(function (x) { return x.correo === correo; })[0] : null;
+    var fija = !!(u && u.fijo);
+    var cuerpo = '<div class="form-grid">' +
+      campo('Correo *', '<input name="correo" type="email" maxlength="120" autocapitalize="off" spellcheck="false"' + (u ? ' readonly' : '') + ' value="' + esc(u ? u.correo : '') + '" placeholder="nombre@gmail.com">', 'c-12') +
+      campo('Nombre', '<input name="nombre" maxlength="80" value="' + esc(u ? u.nombre : '') + '">', 'c-6') +
+      campo('Rol *', '<select name="rol"' + (fija ? ' disabled' : '') + '>' + opcion('OPERATIVO', 'Operativa (sin costos)', !u || u.rol !== 'ADMINISTRADOR') +
+        opcion('ADMINISTRADOR', 'Administradora (todo)', !!u && u.rol === 'ADMINISTRADOR') + '</select>', 'c-6') +
+      campo('Notas', '<input name="notas" maxlength="200" value="' + esc(u ? u.notas : '') + '">', 'c-12') +
+      '<div class="c-12"><label class="check"><input type="checkbox" name="activo"' + (!u || u.activo ? ' checked' : '') + (fija ? ' disabled' : '') + '> Activa (puede ingresar)</label></div>' +
+      '<div class="c-12"><label class="check"><input type="checkbox" name="compartirHoja"> Darle acceso de edición a la hoja de cálculo (solo administradoras, sin correo de invitación)</label></div></div>';
+    abrirModal({
+      titulo: u ? 'Editar usuaria' : 'Habilitar correo', cuerpo: cuerpo, aceptar: u ? 'Guardar' : 'Habilitar',
+      alAceptar: function (f, id) {
+        var mail = String(f.correo || '').toLowerCase();
+        requerir(/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(mail), 'Ingrese un correo válido.');
+        var rol = fija ? 'ADMINISTRADOR' : f.rol;
+        requerir(!f.compartirHoja || rol === 'ADMINISTRADOR', 'La hoja solo se comparte con administradoras.');
+        return api('guardarUsuario', { correo: mail, nombre: f.nombre, rol: rol, activo: fija ? true : f.activo, notas: f.notas, compartirHoja: f.compartirHoja === true }, id);
+      },
+    });
+  }
+
+  // ═════════════ Configuración (filas editables de la hoja «Configuración») ═════════════
+  function vConfiguracion() {
+    var lista = A().configuracion || [];
+    var ing = A().ingreso || {};
+    var html = '<section class="panel"><div class="panel-cab"><h2>Ingreso con Google («MB Acceso»)</h2>' + badge(ing.clientId && ing.enlaceAcceso ? 'Activo' : 'Pendiente', ing.clientId && ing.enlaceAcceso ? 'ok' : 'alerta') + '</div>' +
+      '<p class="ayuda">' + (ing.clientId ? 'Client ID registrado. ' : 'Client ID pendiente: se registra solo en el primer ingreso de la cuenta propietaria por «MB Acceso». ') +
+      (ing.enlaceAcceso ? 'Enlace: ' + esc(ing.enlaceAcceso) : 'Enlace de MB Acceso pendiente.') + '</p></section>';
+    html += '<section class="panel mt"><h2>Configuración</h2><p class="ayuda" style="margin:-4px 0 6px">Cada cambio rige desde la próxima operación y queda en «Auditoría». Lo marcado PENDIENTE espera la confirmación de Mirian o del contador.</p>' +
+      lista.map(function (c) {
+        return '<div class="cfg-fila"><div><div class="fuerte">' + esc(c.etiqueta) + '</div><p>' + esc(c.descripcion || '') + '</p></div><div>' +
+          (c.valor === '' ? badge('Vacío', 'alerta') : '<span class="fuerte">' + esc(c.valor) + '</span>') + '</div><div>' + boton('Editar', 'editar-config', attr('etiqueta', c.etiqueta)) + '</div></div>';
+      }).join('') + '</section>';
+    return html;
+  }
+  function modalConfig(etiqueta) {
+    var c = (A().configuracion || []).filter(function (x) { return x.etiqueta === etiqueta; })[0];
+    if (!c) return;
+    var control = c.opciones ? '<select name="valor">' + c.opciones.map(function (o) { return opcion(o, o, o === c.valor); }).join('') + '</select>'
+      : '<input name="valor" maxlength="200" value="' + esc(c.valor) + '">';
+    abrirModal({
+      titulo: etiqueta, aceptar: 'Guardar',
+      cuerpo: '<p class="ficha">' + esc(c.descripcion || '') + '</p><div class="form-grid mt">' + campo('Valor', control, 'c-12') + '</div>',
+      alAceptar: function (f, id) { return api('guardarConfiguracion', { etiqueta: etiqueta, valor: f.valor }, id); },
+    });
+  }
+
+  // ═════════════ Parámetros de crédito ═════════════
+  function vParametros() {
+    var a = A();
+    var html = (a.avisosParametros || []).map(function (t) { return aviso(t, /REVISAR/.test(t) ? 'grave' : ''); }).join('');
+    var filas = (a.parametros || []).map(function (p) {
+      var vacio = p.valor === '' || p.valor === null || p.valor === undefined;
+      return '<tr><td><div class="fuerte">' + esc(p.nombre) + '</div><div class="det cod">' + esc(p.clave) + '</div></td><td class="num">' +
+        (vacio ? badge(p.falta ? 'Falta' : 'Pendiente', p.falta ? 'error' : 'alerta') : esc(valorTexto(p.valor, p.unidad)) + ' <span class="det">' + esc(p.unidad === '%' ? '' : p.unidad) + '</span>') +
+        '</td><td class="det ocultar-movil">' + esc(p.fuente) + '</td><td class="acciones">' + boton('Editar', 'editar-parametro', attr('clave', p.clave)) + '</td></tr>';
+    });
+    html += '<section class="panel"><h2>Parámetros de crédito</h2><p class="ayuda" style="margin:-4px 0 12px">Copia de la hoja PARAMETROS del xlsx (rangos P_*). Se guardan en la hoja «Parámetros de crédito»: ' +
+      'el código nunca usa cifras propias. Un cambio rige desde la próxima operación y queda en «Auditoría». Los porcentajes se escriben como número (24 = 24%).</p>' +
+      tabla(['Parámetro', ['Valor', 'num'], ['Fuente / nota', 'ocultar-movil'], ''], filas, 'Todavía no se sembraron los parámetros: use «Instalar o reparar».') + '</section>';
+    html += '<section class="panel mt"><h2>Categorías de crédito</h2>' + tabla(['Categoría', ['Límite de saldo', 'num'], ['Entrega mínima', 'num'], ['Cuotas', 'num'], 'Frecuencia', ['Quién entra', 'ocultar-movil']],
+      (a.categorias || []).map(function (c) {
+        return '<tr><td class="fuerte">' + esc(c.nombre) + '</td><td class="num">' + MB.gs(c.limite) + '</td><td class="num">' + valorTexto(c.entrega, '%') + '</td><td class="num">' + c.cuotas + '</td><td>' +
+          esc(c.frecuencia) + '</td><td class="det ocultar-movil">' + esc(c.criterio || '') + '</td></tr>';
+      }), 'Sin categorías.') + '<p class="ayuda mt">Se editan en la hoja «Categorías de crédito». La frecuencia MENSUAL siempre requiere autorización de la propietaria.</p></section>';
+    return html;
+  }
+  function modalParametro(clave) {
+    var p = (A().parametros || []).filter(function (x) { return x.clave === clave; })[0];
+    if (!p) return;
+    var valor = p.valor === null || p.valor === undefined ? '' : (typeof p.valor === 'number' ? (p.unidad === '%' ? String(Math.round(p.valor * 10000) / 100).replace('.', ',') : String(p.valor).replace('.', ',')) : p.valor);
+    abrirModal({
+      titulo: p.nombre, aceptar: 'Guardar',
+      cuerpo: '<p class="ficha">' + esc(p.fuente) + '</p><div class="form-grid mt">' +
+        campo('Valor (' + p.unidad + ')', '<input name="valor" maxlength="300" value="' + esc(valor) + '">', 'c-12', p.unidad === '%' ? 'Escriba el número del porcentaje: 24 = 24%.' : '') + '</div>',
+      alAceptar: function (f, id) { return api('guardarParametro', { clave: clave, valor: f.valor }, id); },
+    });
+  }
+
+  // ═════════════ Integraciones (SIFEN y WhatsApp) ═════════════
+  function vIntegraciones() {
+    var integ = A().integraciones || {};
+    if (!integ.sifen) return '<div class="vacio">Sin datos de integraciones.</div>';
+    return panelIntegracion('sifen', 'Facturación electrónica (SIFEN · e-Kuatia)', integ.sifen,
+      'En SIMULACIÓN el sistema arma y valida cada comprobante y lo deja en «SIFEN registro» sin enviarlo ni numerarlo. En PRODUCCIÓN lo envía al middleware configurado ' +
+      '(integrador con firma electrónica; puede tener costo) y reintenta solo. El timbrado, el establecimiento y el punto de expedición se cargan por unidad en «Entidades fiscales».') +
+      panelIntegracion('whatsapp', 'WhatsApp Cloud API (Meta)', integ.whatsapp,
+        'Alertas de mora (diarias), recordatorios de turnos (24 h antes) y envío del KuDE, siempre con plantillas aprobadas por Meta y nunca dos veces el mismo día. ' +
+        'En SIMULACIÓN solo se anota en «WhatsApp log» lo que se enviaría.');
+  }
+  function panelIntegracion(cual, titulo, x, texto) {
+    var modos = [['SIMULACIÓN', 'Simulación'], ['PRODUCCIÓN', 'Producción'], ['APAGADO', 'Apagado']];
+    return '<section class="panel mt integracion"><div class="panel-cab"><h2>' + esc(titulo) + '</h2>' +
+      badge(x.modo.charAt(0) + minus(x.modo).slice(1), x.modo === 'PRODUCCIÓN' ? 'ok' : (x.modo === 'APAGADO' ? 'neutro' : 'alerta')) + '</div>' +
+      '<p class="ayuda">' + esc(texto) + '</p>' +
+      '<div class="segmentado mt" role="group" aria-label="Modo de ' + esc(titulo) + '">' + modos.map(function (m) {
+        return '<button type="button" data-accion="modo-integracion"' + attr('cual', cual) + attr('modo', m[0]) + ' aria-pressed="' + (x.modo === m[0]) + '">' + m[1] + '</button>';
+      }).join('') + '</div>' +
+      (x.faltantes.length ? aviso('Falta completar: ' + x.faltantes.join(', ') + '.') : '') +
+      '<form id="form-integ-' + cual + '" class="mt" novalidate autocomplete="off"><div class="form-grid">' +
+      x.campos.map(function (c) {
+        return campo(c.etiqueta, c.secreto
+          ? '<input name="' + esc(c.clave) + '" type="password" autocomplete="new-password" placeholder="' + esc(c.configurado ? c.valor + ' (guardado: escriba para reemplazar)' : 'Sin cargar') + '">'
+          : '<input name="' + esc(c.clave) + '" value="' + esc(c.valor) + '" autocomplete="off" spellcheck="false">', 'c-6');
+      }).join('') + '</div><div class="form-acciones"><button type="submit" class="btn btn-sec">Guardar credenciales</button></div></form>' +
+      '<p class="nota-pie">Las credenciales se guardan en las propiedades del script (nunca en la hoja ni en el código) y se muestran enmascaradas. Cada cambio queda en «Auditoría» sin el valor secreto.</p></section>';
+  }
+  function guardarCredenciales(cual, form, btn) {
+    var x = A().integraciones[cual], cred = {}, n = 0;
+    x.campos.forEach(function (c) {
+      var v = String(form.elements[c.clave].value || '').trim();
+      if (c.secreto) { if (v) { cred[c.clave] = v; n++; } } else if (v !== c.valor) { cred[c.clave] = v; n++; }
+    });
+    if (!n) { toast('No hay cambios para guardar.', 'aviso'); return; }
+    conBoton(btn, 'Guardando…', function () { return api('guardarIntegracion', { cual: cual, credenciales: cred }, uid()); }).then(MB.aplicar).catch(fallo);
+  }
+  function cambiarModo(cual, modo) {
+    var nombre = cual === 'sifen' ? 'la facturación electrónica' : 'WhatsApp';
+    var efecto = modo === 'PRODUCCIÓN' ? (cual === 'sifen' ? 'Los comprobantes se enviarán a SIFEN por el middleware y tendrán validez fiscal.' : 'Se enviarán mensajes reales a las clientas.')
+      : (modo === 'APAGADO' ? 'Dejará de ' + (cual === 'sifen' ? 'generar comprobantes.' : 'enviar mensajes.') : 'Solo se registra lo que se haría, sin enviar nada.');
+    MB.confirmar({ titulo: 'Modo ' + minus(modo), mensaje: 'Cambiar ' + esc(nombre) + ' a <strong>' + esc(modo) + '</strong>. ' + esc(efecto), aceptar: 'Cambiar', peligro: modo === 'PRODUCCIÓN' })
+      .then(function (si) { if (si) api('guardarIntegracion', { cual: cual, modo: modo }, uid()).then(MB.aplicar).catch(fallo); });
+  }
+
+  // ═════════════ Auditoría ═════════════
+  function cargarAuditoria() {
+    if (X.cargando.auditoria) return;
+    X.cargando.auditoria = true;
+    setTimeout(function () {
+      api('obtenerAuditoria', {}).then(function (r) { X.auditoria = { filas: r.auditoria }; })
+        .catch(function (e) { X.auditoria = { error: e.message }; })
+        .finally(function () { X.cargando.auditoria = false; if (S.vista === 'sistema') MB.render(); });
+    }, 0);
+  }
+  function vAuditoria() {
+    if (!X.auditoria) { cargarAuditoria(); return '<div class="vacio">Cargando la auditoría…</div>'; }
+    if (X.auditoria.error) return '<div class="vacio">' + esc(X.auditoria.error) + '<br><br>' + boton('Reintentar', 'cargar-auditoria', '', 'btn btn-sec') + '</div>';
+    return '<div class="barra-herr"><input type="search" placeholder="Buscar por correo, función, hoja, registro o valor" value="' + esc(X.qAud) + '" data-al-escribir="aud-buscar" autocomplete="off">' +
+      boton('Actualizar', 'cargar-auditoria', '', 'btn btn-sec') + '</div><div id="aud-tabla">' + tablaAuditoria() + '</div>' +
+      '<p class="nota-pie">Últimos 300 registros. El historial completo está en la hoja «Auditoría».</p>';
+  }
+  function tablaAuditoria() {
+    var q = norm(X.qAud).trim();
+    var filas = X.auditoria.filas.filter(function (a) {
+      return !q || norm([a.usuario, a.operacion, a.hoja, a.referencia, a.campo, a.anterior, a.nuevo, a.detalle, a.unidad].join(' ')).indexOf(q) >= 0;
+    }).map(function (a) {
+      var cambio = a.campo ? esc(a.campo) + ': ' + esc(a.anterior || '∅') + ' → ' + esc(a.nuevo || '∅') : esc(a.detalle || '');
+      return '<tr><td>' + esc(a.fecha) + '</td><td><div>' + esc(a.usuario) + '</div><div class="det">' + esc(minus(a.rol)) + (a.metodo ? ' · ' + esc(minus(a.metodo)) : '') + '</div></td><td><div class="fuerte">' + esc(a.operacion) +
+        '</div><div class="det">' + esc(a.accion || '') + (a.unidad ? ' · ' + esc(a.unidad) : '') + '</div></td><td class="ocultar-movil">' + esc(a.hoja || '') + (a.referencia ? '<div class="det">' + esc(a.referencia) + '</div>' : '') +
+        '</td><td class="det">' + cambio + '</td></tr>';
+    });
+    return tabla(['Fecha', 'Correo', 'Función', ['Hoja', 'ocultar-movil'], 'Cambio'], filas, 'Sin registros.');
+  }
+
+  // ═════════════ Conexión con la app ═════════════
+  MB.vistas.sistema = vSistema;
+  var AC = MB.acciones;
+  AC['cargar-salud'] = function () { X.salud = null; MB.render(); };
+  AC['cargar-auditoria'] = function () { X.auditoria = null; MB.render(); };
+  AC.mantenimiento = function (el) { ejecutarTarea(el); };
+  AC['nueva-usuaria'] = function () { modalUsuaria(null); };
+  AC['editar-usuaria'] = function (el) { modalUsuaria(el.getAttribute('data-correo')); };
+  AC['editar-config'] = function (el) { modalConfig(el.getAttribute('data-etiqueta')); };
+  AC['editar-parametro'] = function (el) { modalParametro(el.getAttribute('data-clave')); };
+  AC['modo-integracion'] = function (el) { cambiarModo(el.getAttribute('data-cual'), el.getAttribute('data-modo')); };
+  AC['cerrar-sesiones'] = function (el) {
+    var correo = el.getAttribute('data-correo');
+    MB.confirmar({ titulo: 'Cerrar sesiones', mensaje: 'Se cerrarán todas las sesiones de <strong>' + esc(correo) + '</strong>: deberá ingresar de nuevo con Google.', aceptar: 'Cerrar sesiones', peligro: true })
+      .then(function (si) { if (si) api('revocarSesiones', { correo: correo }, uid()).then(MB.aplicar).catch(fallo); });
+  };
+  AC['quitar-acceso'] = function (el) {
+    var correo = el.getAttribute('data-correo');
+    MB.confirmar({ titulo: 'Quitar acceso a la hoja', mensaje: '<strong>' + esc(correo) + '</strong> dejará de ver la hoja de cálculo (con costos). Si es usuaria, sigue usando la aplicación según su rol. ¿Quitar el acceso?', aceptar: 'Quitar acceso', peligro: true })
+      .then(function (si) { if (si) api('quitarAccesoHoja', { correo: correo, confirmado: true }, uid()).then(function (r) { X.salud = null; MB.aplicar(r); }).catch(fallo); });
+  };
+  AC['mover-libro'] = function () {
+    MB.confirmar({ titulo: 'Mover el libro a la carpeta', mensaje: 'El libro pasa a la carpeta «Distribuidora MB». Su ID y su enlace no cambian (la app sigue funcionando igual). ¿Moverlo?', aceptar: 'Mover' })
+      .then(function (si) { if (si) api('moverLibroACarpeta', { confirmado: true }, uid()).then(function (r) { X.salud = null; MB.aplicar(r); }).catch(fallo); });
+  };
+  AC.registro = function (el) {
+    var abrir = el.getAttribute('data-valor') === 'abrir';
+    MB.confirmar({
+      titulo: abrir ? 'Abrir el registro' : 'Cerrar el registro', aceptar: abrir ? 'Abrir' : 'Cerrar', peligro: abrir,
+      mensaje: abrir ? 'Cualquier persona con cuenta de Google y el enlace podrá crearse un usuario OPERATIVO. ¿Abrir el registro?'
+        : 'Solo podrán ingresar los correos habilitados en «Usuarias». ¿Cerrar el registro?',
+    }).then(function (si) { if (si) api('guardarRegistro', { abierto: abrir }, uid()).then(MB.aplicar).catch(fallo); });
+  };
+  MB.alEscribir['aud-buscar'] = function (el) { X.qAud = el.value; $('#aud-tabla').innerHTML = tablaAuditoria(); };
+  MB.alEnviar['form-integ-sifen'] = function (f, btn) { guardarCredenciales('sifen', f, btn); };
+  MB.alEnviar['form-integ-whatsapp'] = function (f, btn) { guardarCredenciales('whatsapp', f, btn); };
+  MB.ext.badgeResultado = function (r) { return badge(r || '—', tono(r)); };
+});
+</script>

@@ -1,0 +1,591 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Proveedores y acuerdos (v2.3 · Fase 3 · R2)
+ * =====================================================================
+ *  R2.1 «Proveedores» (PR-001…) con el mismo flujo que la base de clientes: alta, edición, búsqueda y estado del
+ *       acuerdo automático (VIGENTE / POR VENCER / VENCIDO / SIN ACUERDO). No hay proveedores cargados: no se inventa ninguno.
+ *  R2.2 «Acuerdos de proveedores»: historial de vigencias. Renovar archiva el acuerdo anterior (ARCHIVADO); nunca se pisa.
+ *       Las condiciones vigentes solo cambian con «Renovar acuerdo» (o la renovación automática del contrato).
+ *  R2.3 Tarea diaria 08:05 (America/Asuncion): renovación automática si el acuerdo la prevé, estado y aviso por correo a las
+ *       administradoras a 60, 30, 15 y 7 días y el día del vencimiento, una sola vez por hito («Alertas enviadas»,
+ *       respetando la cuota de MailApp). WhatsApp solo si la integración de la Fase 6 está instalada y activa.
+ *       Banner y panel en el Resumen (UI_Proveedores.html y panel «Pendientes»).
+ *  R2.4 «Código proveedor» de cada producto (columna ya creada al final de «Productos»): se asigna desde el proveedor.
+ *  R2.5 Confidencial: solo administradoras (PERMISOS + lista blanca: nunca llega a una OPERATIVA).
+ * =====================================================================
+ */
+
+const PROVEEDORES_ = Object.freeze({
+  HITOS: Object.freeze([60, 30, 15, 7, 0]),
+  DIAS_AVISO: 30,
+  MAX_ARCHIVO_BYTES: 10 * 1024 * 1024,
+  TIPO_ALERTA: 'ACUERDO DE PROVEEDOR',
+  TIPO_RENOVADO: 'ACUERDO RENOVADO',
+  USUARIO_TAREA: 'Tarea automática (vencimiento de acuerdos)',
+});
+
+// ─────────────────────── 1. Estado, hitos y renovación (cálculos puros) ───────────────────────
+
+function esSiProveedor_(v) {
+  return v === true || /^s[ií]/i.test(String(v || '').trim());
+}
+
+/** ¿Hay algún dato de acuerdo? (fechas, condiciones o documento). Sin nada → SIN ACUERDO. */
+function hayAcuerdo_(p) {
+  if (!p) return false;
+  return !!(texto_(p.vencimiento) || texto_(p.inicio) || Number(p.descuento) > 0 || Number(p.plazo) > 0 ||
+    (p.compraMinima !== '' && p.compraMinima !== null && p.compraMinima !== undefined) || texto_(p.documento));
+}
+
+function diasAvisoDe_(p) {
+  const n = Number(p && p.diasAviso);
+  return n >= 1 && n <= 365 ? Math.round(n) : PROVEEDORES_.DIAS_AVISO;
+}
+
+/** Estado automático (R2.1): SIN ACUERDO · VIGENTE (sin vencimiento o lejos) · POR VENCER (≤ días de aviso) · VENCIDO. */
+function estadoAcuerdo_(p, hoy) {
+  if (!hayAcuerdo_(p)) return 'SIN ACUERDO';
+  if (!texto_(p.vencimiento)) return 'VIGENTE';
+  const dias = diasEntre_(hoy, p.vencimiento);
+  if (dias < 0) return 'VENCIDO';
+  if (dias <= diasAvisoDe_(p)) return 'POR VENCER';
+  return 'VIGENTE';
+}
+
+/**
+ * Hito de aviso para los días que faltan: el menor de 60, 30, 15, 7 y 0 que sea ≥ días (así se recupera un día sin
+ * tarea, nunca se repite un hito y un acuerdo cargado a 30 días genera UNA sola alerta, la de 30). Vencido → 'VENCIDO';
+ * más de 60 días → null.
+ */
+function hitoAviso_(dias) {
+  if (dias === null || dias === undefined || isNaN(dias)) return null;
+  if (dias < 0) return 'VENCIDO';
+  const h = PROVEEDORES_.HITOS.filter(function (x) { return x >= dias; });
+  return h.length ? String(Math.min.apply(null, h)) : null;
+}
+
+/** Período siguiente de una renovación automática: el mismo plazo, desde el día siguiente al vencimiento. */
+function renovacionSiguiente_(p) {
+  if (!texto_(p.inicio) || !texto_(p.vencimiento)) return null;
+  const duracion = diasEntre_(p.inicio, p.vencimiento);
+  if (!(duracion > 0)) return null;
+  const inicio = sumarDias_(p.vencimiento, 1);
+  return { inicio: inicio, vencimiento: sumarDias_(inicio, duracion) };
+}
+
+/** Fecha de un acuerdo (puede ser futura): AAAA-MM-DD real, entre 2000 y 2100. */
+function fechaAcuerdo_(valor, etiqueta) {
+  const s = String(valor || '').trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const f = m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])) : null;
+  if (!m || f.getUTCFullYear() !== +m[1] || f.getUTCMonth() !== +m[2] - 1 || f.getUTCDate() !== +m[3] || s < '2000-01-01' || s > '2100-12-31') {
+    throw errorUsuario_('Ingrese una fecha válida para ' + etiqueta + '.');
+  }
+  return s;
+}
+
+function textoDias_(dias) {
+  if (dias === 0) return 'vence HOY';
+  if (dias < 0) return 'venció hace ' + cantidadDias_(-dias);
+  return 'vence en ' + cantidadDias_(dias);
+}
+
+function cantidadDias_(n) {
+  return miles_(n) + (n === 1 ? ' día' : ' días');
+}
+
+// ─────────────────────── 2. Validación de datos y del acuerdo ───────────────────────
+
+function tieneDatosAcuerdo_(a) {
+  if (!a || typeof a !== 'object') return false;
+  return ['descuento', 'plazo', 'compraMinima', 'inicio', 'vencimiento', 'documento'].some(function (k) {
+    return a[k] !== '' && a[k] !== null && a[k] !== undefined && a[k] !== 0;
+  }) || !!(a.archivo && a.archivo.base64);
+}
+
+/**
+ * Condiciones de un acuerdo nuevo (alta o renovación). El documento es un enlace https (Drive) o un archivo que se
+ * guarda en «Distribuidora MB/Proveedores». Devuelve { descuento, plazo, compraMinima, inicio, vencimiento, renovacion, documento }.
+ */
+function validarAcuerdo_(ctx, a, codigo, nombre) {
+  const vacio = function (v) { return v === '' || v === null || v === undefined; };
+  const r = {
+    descuento: vacio(a.descuento) ? 0 : requerirPorcentaje_(a.descuento, 'Descuento %'),
+    plazo: enteroOpcional_(a.plazo, 'Plazo de pago (días)', 365),
+    compraMinima: vacio(a.compraMinima) ? '' : requerirEntero_(a.compraMinima, 'Compra mínima (Gs.)', 0, 100000000000),
+    inicio: vacio(a.inicio) ? '' : fechaAcuerdo_(a.inicio, 'el inicio del acuerdo'),
+    vencimiento: vacio(a.vencimiento) ? '' : fechaAcuerdo_(a.vencimiento, 'el vencimiento del acuerdo'),
+    renovacion: esSiProveedor_(a.renovacion) ? 'Sí' : 'No',
+    documento: '',
+  };
+  if (r.inicio && r.vencimiento && r.vencimiento < r.inicio) throw errorUsuario_('El vencimiento no puede ser anterior al inicio del acuerdo.');
+  if (r.renovacion === 'Sí' && !(r.inicio && r.vencimiento)) {
+    throw errorUsuario_('Para renovarse sola, el acuerdo necesita fecha de inicio y de vencimiento (se repite el mismo plazo).');
+  }
+  if (a.archivo && a.archivo.base64) {
+    const bytes = Utilities.base64Decode(String(a.archivo.base64));
+    if (bytes.length > PROVEEDORES_.MAX_ARCHIVO_BYTES) throw errorUsuario_('El archivo supera los 10 MB: súbalo a Drive y pegue el enlace.');
+    const nombreArchivo = codigo + ' ' + texto_(nombre, 60) + ' · acuerdo ' + (r.inicio || hoy_(ctx.tz)) + ' · ' + (texto_(a.archivo.nombre, 100) || 'documento');
+    const g = guardarArchivoSistema_(Utilities.newBlob(bytes, String(a.archivo.tipo || 'application/pdf'), nombreArchivo), 'Proveedores', nombreArchivo);
+    r.documento = g.url || g.nombre;
+  } else if (!vacio(a.documento)) {
+    const u = texto_(a.documento, 500);
+    if (!/^https:\/\/\S+$/i.test(u)) throw errorUsuario_('El documento del acuerdo debe ser un enlace (https://…) de Drive o subirse como archivo.');
+    r.documento = u;
+  }
+  return r;
+}
+
+function camposAcuerdo_(a) {
+  return { descuento: a.descuento, plazo: a.plazo, compraMinima: a.compraMinima, inicio: a.inicio, vencimiento: a.vencimiento, renovacion: a.renovacion, documento: a.documento };
+}
+
+function nombreProveedor_(p) {
+  return texto_(p.nombre) || texto_(p.razonSocial) || p.codigo;
+}
+
+// ─────────────────────── 3. API (solo administradoras: PERMISOS + función no listada = administradoras) ───────────────────────
+
+function obtenerProveedores(req) { return ejecutar_('obtenerProveedores', req, 'lectura', obtenerProveedores_); }
+function guardarProveedor(req) { return ejecutar_('guardarProveedor', req, 'escritura', guardarProveedor_); }
+function renovarAcuerdo(req) { return ejecutar_('renovarAcuerdo', req, 'escritura', renovarAcuerdo_); }
+function asignarProductosProveedor(req) { return ejecutar_('asignarProductosProveedor', req, 'escritura', asignarProductosProveedor_); }
+function revisarAcuerdosAhora(req) { return ejecutar_('revisarAcuerdosAhora', req, 'escritura', function (ctx) { return textoRevisionAcuerdos_(revisarAcuerdos_(ctx.ss, ctx.tz, {})); }); }
+
+/**
+ * Alta o edición de un proveedor. En el alta se puede cargar el primer acuerdo (queda VIGENTE en «Acuerdos de
+ * proveedores»). En la edición, las condiciones del acuerdo NO se cambian aquí: se usa «Renovar acuerdo», que archiva
+ * el anterior (R2.2). «Días de aviso» (30 por defecto) es una preferencia de alerta y sí se edita.
+ */
+function guardarProveedor_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tabla = leerTabla_(ctx.ss, 'proveedores', tz);
+  const original = clave_(d.codigoOriginal);
+  const actual = original ? buscarPorCodigo_(tabla.filas, original) : null;
+  if (original && !actual) throw errorUsuario_('El proveedor ' + original + ' no existe. Actualice los datos e intente nuevamente.');
+  if (actual && tieneDatosAcuerdo_(d.acuerdo)) {
+    throw errorUsuario_('Las condiciones del acuerdo se cambian con «Renovar acuerdo»: el acuerdo anterior queda archivado (nunca se pisa).');
+  }
+  const previo = actual || {};
+  const tiene = function (k) { return Object.prototype.hasOwnProperty.call(d, k); };
+  const val = function (k, max) { return tiene(k) ? texto_(d[k], max) : textoCampo_(previo[k]); };
+  const nuevo = {
+    razonSocial: val('razonSocial', 150),
+    nombre: val('nombre', 120),
+    ruc: tiene('ruc') ? validarRuc_(d.ruc, { validarDv: configSi_(ctx.ss, CFG.RUC_DV) }) : textoCampo_(previo.ruc),
+    contacto: val('contacto', 100),
+    telefono: val('telefono', 40),
+    correo: tiene('correo') ? correoCliente_(d.correo) : textoCampo_(previo.correo),
+    direccion: val('direccion', 150),
+    marcas: val('marcas', 300),
+    notas: val('notas', 600),
+    diasAviso: tiene('diasAviso') ? (d.diasAviso === '' || d.diasAviso === null ? PROVEEDORES_.DIAS_AVISO : requerirEntero_(d.diasAviso, 'Días de aviso', 1, 365)) :
+      (actual ? (previo.diasAviso || PROVEEDORES_.DIAS_AVISO) : PROVEEDORES_.DIAS_AVISO),
+    activo: tiene('activo') ? activoDe_(d.activo) : (actual ? (textoCampo_(previo.activo) || 'Sí') : 'Sí'),
+  };
+  if (!nuevo.razonSocial && !nuevo.nombre) throw errorUsuario_('Complete la razón social o el nombre comercial del proveedor.');
+  tabla.filas.forEach(function (p) {
+    if (actual && p._fila === actual._fila) return;
+    if (nuevo.ruc && clave_(p.ruc) === clave_(nuevo.ruc)) throw errorUsuario_('Ya existe un proveedor con el RUC ' + nuevo.ruc + ': ' + p.codigo + ' «' + nombreProveedor_(p) + '».');
+    const n = normalizar_(nuevo.nombre || nuevo.razonSocial);
+    if (n && (normalizar_(p.nombre) === n || normalizar_(p.razonSocial) === n)) throw errorUsuario_('Ya existe el proveedor «' + nombreProveedor_(p) + '» (' + p.codigo + ').');
+  });
+  const ahora = new Date();
+  const hoy = hoy_(tz);
+  if (actual) {
+    const cambios = {};
+    Object.keys(nuevo).forEach(function (k) { if (textoCampo_(nuevo[k]) !== textoCampo_(previo[k])) cambios[k] = nuevo[k]; });
+    const estado = estadoAcuerdo_(Object.assign({}, previo, nuevo), hoy);
+    if (estado !== previo.estado) cambios.estado = estado;
+    if (!Object.keys(cambios).length) return { mensaje: 'Sin cambios en «' + nombreProveedor_(previo) + '».', codigo: previo.codigo };
+    cambios.actualizado = ahora;
+    cambios.usuario = ctx.email;
+    actualizarCeldas_(tabla, actual._fila, cambios, tz);
+    return { mensaje: 'Datos de «' + nombreProveedor_(Object.assign({}, previo, nuevo)) + '» actualizados.', codigo: previo.codigo };
+  }
+  const codigo = siguienteCodigo_(tabla.filas.map(function (p) { return p.codigo; }), 'PR-', 3);
+  const acuerdo = tieneDatosAcuerdo_(d.acuerdo) ? validarAcuerdo_(ctx, d.acuerdo, codigo, nuevo.nombre || nuevo.razonSocial) : null;
+  const fila = Object.assign({ codigo: codigo }, nuevo, acuerdo ? camposAcuerdo_(acuerdo) : { renovacion: 'No' }, { actualizado: ahora, usuario: ctx.email });
+  fila.estado = estadoAcuerdo_(fila, hoy);
+  agregarFilas_(tabla, [fila], tz);
+  let idAcuerdo = '';
+  if (acuerdo) {
+    const acuerdos = leerTabla_(ctx.ss, 'acuerdos', tz);
+    idAcuerdo = siguienteCodigo_(acuerdos.filas.map(function (a) { return a.id; }), 'AC-', 5);
+    agregarFilas_(acuerdos, [Object.assign({ id: idAcuerdo, codigoProveedor: codigo, proveedor: nombreProveedor_(fila) }, camposAcuerdo_(acuerdo),
+      { estado: 'VIGENTE', archivado: '', motivo: 'Primer acuerdo (alta del proveedor)', usuario: ctx.email, registrado: ahora })], tz);
+  }
+  return {
+    mensaje: 'Se registró el proveedor «' + nombreProveedor_(fila) + '» con el código ' + codigo + (acuerdo ? ' y su acuerdo ' + idAcuerdo + ' (' + fila.estado + ').' : ' (SIN ACUERDO).'),
+    codigo: codigo, estado: fila.estado,
+  };
+}
+
+/**
+ * Registra un acuerdo nuevo VIGENTE y archiva el vigente anterior (motivo y fecha). Si el proveedor tenía condiciones
+ * cargadas a mano en «Proveedores» sin historial, primero se guardan como ARCHIVADO: nada se pierde.
+ */
+function registrarNuevoAcuerdo_(ss, tz, p, tablaProv, nuevo, motivo, usuario) {
+  const acuerdos = leerTabla_(ss, 'acuerdos', tz);
+  const ahora = new Date();
+  const codigo = clave_(p.codigo);
+  const vigentes = acuerdos.filas.filter(function (a) { return clave_(a.codigoProveedor) === codigo && a.estado === 'VIGENTE'; });
+  let sig = siguienteNumero_(acuerdos.filas.map(function (a) { return a.id; }), 'AC-');
+  const filas = [];
+  if (!vigentes.length && hayAcuerdo_(p)) {
+    filas.push(Object.assign({ id: formatoCodigo_('AC-', sig++, 5), codigoProveedor: p.codigo, proveedor: nombreProveedor_(p) }, camposAcuerdo_(p), {
+      estado: 'ARCHIVADO', archivado: ahora, motivo: 'Condiciones que estaban en «Proveedores» sin historial (se archivan al registrar el nuevo acuerdo).', usuario: usuario, registrado: ahora,
+    }));
+  }
+  const id = formatoCodigo_('AC-', sig++, 5);
+  actualizarFilas_(acuerdos, vigentes.map(function (a) {
+    return { fila: a._fila, valores: { estado: 'ARCHIVADO', archivado: ahora, motivo: 'Reemplazado por ' + id + ': ' + motivo } };
+  }), tz);
+  filas.push(Object.assign({ id: id, codigoProveedor: p.codigo, proveedor: nombreProveedor_(p) }, camposAcuerdo_(nuevo), {
+    estado: 'VIGENTE', archivado: '', motivo: motivo, usuario: usuario, registrado: ahora,
+  }));
+  agregarFilas_(acuerdos, filas, tz);
+  const campos = Object.assign(camposAcuerdo_(nuevo), { actualizado: ahora, usuario: usuario });
+  campos.estado = estadoAcuerdo_(Object.assign({}, p, campos), hoy_(tz));
+  actualizarCeldas_(tablaProv, p._fila, campos, tz);
+  return { id: id, estado: campos.estado, archivados: vigentes.length + (filas.length - 1) };
+}
+
+/** Renovar (o cargar el primero / corregir): el acuerdo vigente queda ARCHIVADO con motivo y el nuevo, VIGENTE. */
+function renovarAcuerdo_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tabla = leerTabla_(ctx.ss, 'proveedores', tz);
+  const p = buscarPorCodigo_(tabla.filas, d.codigo);
+  if (!p) throw errorUsuario_('No se encontró el proveedor ' + d.codigo + '.');
+  if (!tieneDatosAcuerdo_(d)) throw errorUsuario_('Complete al menos el vencimiento o una condición del nuevo acuerdo.');
+  const nuevo = validarAcuerdo_(ctx, d, p.codigo, nombreProveedor_(p));
+  const motivo = texto_(d.motivo, 300) || (hayAcuerdo_(p) ? 'Renovación' : 'Primer acuerdo');
+  const r = registrarNuevoAcuerdo_(ctx.ss, tz, p, tabla, nuevo, motivo, ctx.email);
+  return {
+    mensaje: 'Acuerdo ' + r.id + ' de «' + nombreProveedor_(p) + '» registrado (' + r.estado + (nuevo.vencimiento ? ', vence el ' + formatoFecha_(nuevo.vencimiento) : '') + ').' +
+      (r.archivados ? ' ' + (r.archivados === 1 ? 'El acuerdo anterior quedó ARCHIVADO' : r.archivados + ' acuerdos anteriores quedaron ARCHIVADOS') + ' en el historial.' : ''),
+    id: r.id, estado: r.estado,
+  };
+}
+
+/** R2.4: asigna el «Código proveedor» a los productos elegidos y lo quita de los que ya no son de este proveedor. */
+function asignarProductosProveedor_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const prov = buscarPorCodigo_(leerTabla_(ctx.ss, 'proveedores', tz).filas, d.codigo);
+  if (!prov) throw errorUsuario_('No se encontró el proveedor ' + d.codigo + '.');
+  const productos = leerTabla_(ctx.ss, 'productos', tz);
+  const elegidos = {};
+  (Array.isArray(d.productos) ? d.productos : []).forEach(function (c) {
+    const k = clave_(c);
+    if (!buscarPorCodigo_(productos.filas, k)) throw errorUsuario_('El producto ' + k + ' no existe.');
+    elegidos[k] = true;
+  });
+  const codigo = clave_(prov.codigo);
+  let asignados = 0;
+  let movidos = 0;
+  let quitados = 0;
+  const lote = [];
+  productos.filas.forEach(function (p) {
+    const k = clave_(p.codigo);
+    const actual = clave_(p.proveedor);
+    if (elegidos[k] && actual !== codigo) {
+      lote.push({ fila: p._fila, valores: { proveedor: prov.codigo } });
+      if (actual) movidos++; else asignados++;
+    } else if (!elegidos[k] && actual === codigo) {
+      lote.push({ fila: p._fila, valores: { proveedor: '' } });
+      quitados++;
+    }
+  });
+  actualizarFilas_(productos, lote, tz);
+  if (!lote.length) return 'Sin cambios en los productos de «' + nombreProveedor_(prov) + '».';
+  return 'Productos de «' + nombreProveedor_(prov) + '»: ' + cuentaPv_(asignados, 'asignado', 'asignados') +
+    (movidos ? ', ' + cuentaPv_(movidos, 'pasó desde otro proveedor', 'pasaron desde otro proveedor') : '') +
+    (quitados ? ', ' + cuentaPv_(quitados, 'quitado', 'quitados') : '') + '.';
+}
+
+/** «1 vencido» / «2 vencidos» (textos para las administradoras, sin «(s)»). */
+function cuentaPv_(n, uno, varios) { return n + ' ' + (n === 1 ? uno : varios); }
+
+// ─────────────────────── 4. Tarea diaria: renovación automática, estado y avisos (R2.3) ───────────────────────
+
+/** ACTIVADOR diario 08:05 (America/Asuncion). También desde el editor. */
+function revisarAcuerdosProveedores(e) {
+  exigirEditorOTrigger_(e);
+  return ejecutarTarea_('Vencimiento de acuerdos de proveedores', function () {
+    reiniciarMemoriaEjecucion_();
+    const ss = abrirHoja_();
+    const tz = zonaHoraria_(ss);
+    return conBloqueo_(function () {
+      iniciarAuditoria_({ email: PROVEEDORES_.USUARIO_TAREA, rol: ROLES.ADMIN, metodo: 'ACTIVADOR' }, 'revisarAcuerdosProveedores', '', 'DISTRIBUIDORA');
+      let r;
+      try {
+        r = revisarAcuerdos_(ss, tz, {});
+      } catch (err) {
+        volcarAuditoria_(ss, tz, 'Revisión de acuerdos incompleta: ' + (err && err.message ? err.message : err));
+        throw err;
+      }
+      volcarAuditoria_(ss, tz, '');
+      const texto = textoRevisionAcuerdos_(r);
+      console.log(texto);
+      return texto;
+    });
+  });
+}
+
+/**
+ * Revisa todos los proveedores (dentro del bloqueo): 1) renovación automática de los acuerdos vencidos que la prevén
+ * (mismo plazo, archiva el anterior), 2) estado automático en la hoja, 3) avisos por correo una sola vez por hito
+ * (60/30/15/7/0 días y VENCIDO), si «Proveedores: avisos de vencimiento por correo» = Sí. op.sinAvisos: no avisa.
+ */
+function revisarAcuerdos_(ss, tz, op) {
+  op = op || {};
+  const r = { revisados: 0, porVencer: [], vencidos: [], renovados: [], avisos: [], cambiosEstado: 0, sinCorreo: false };
+  if (!ss.getSheetByName(ESQUEMA.proveedores.hoja)) return r;
+  const hoy = hoy_(tz);
+  const tabla = leerTabla_(ss, 'proveedores', tz);
+  tabla.filas.forEach(function (p) {
+    if (!clave_(p.codigo) || !esActivo_(p.activo) || !esSiProveedor_(p.renovacion) || !texto_(p.vencimiento) || p.vencimiento >= hoy) return;
+    let vueltas = 0;
+    const desde = p.vencimiento;
+    while (p.vencimiento < hoy && vueltas < 20) {
+      const s = renovacionSiguiente_(p);
+      if (!s) break;
+      registrarNuevoAcuerdo_(ss, tz, p, tabla, Object.assign(camposAcuerdo_(p), { inicio: s.inicio, vencimiento: s.vencimiento, renovacion: 'Sí' }),
+        'Renovación automática (vencía el ' + formatoFecha_(p.vencimiento) + ')', PROVEEDORES_.USUARIO_TAREA);
+      vueltas++;
+    }
+    if (vueltas) r.renovados.push({ codigo: p.codigo, nombre: nombreProveedor_(p), desde: desde, hasta: p.vencimiento, veces: vueltas });
+  });
+  const lote = [];
+  tabla.filas.forEach(function (p) {
+    if (!clave_(p.codigo)) return;
+    r.revisados++;
+    const e = estadoAcuerdo_(p, hoy);
+    if (e !== p.estado) lote.push({ fila: p._fila, valores: { estado: e } });
+    if (!esActivo_(p.activo)) return;
+    const o = { codigo: p.codigo, nombre: nombreProveedor_(p), vencimiento: p.vencimiento, dias: texto_(p.vencimiento) ? diasEntre_(hoy, p.vencimiento) : null, estado: e };
+    if (e === 'POR VENCER') r.porVencer.push(o);
+    if (e === 'VENCIDO') r.vencidos.push(o);
+  });
+  r.cambiosEstado = actualizarFilas_(tabla, lote, tz);
+  if (op.sinAvisos) return r;
+  if (!configSi_(ss, CFG.AVISOS_ACUERDOS)) { r.sinCorreo = true; return r; }
+  const admins = correosAdministradoras_();
+  r.renovados.forEach(function (x) {
+    const estado = avisarUnaVez_(ss, tz, PROVEEDORES_.TIPO_RENOVADO, clave_(x.codigo) + ' · ' + x.hasta, 'RENOVADO', admins,
+      'Distribuidora MB · Acuerdo con ' + x.nombre + ' renovado automáticamente',
+      'El acuerdo con ' + x.nombre + ' (' + x.codigo + ') vencía el ' + formatoFecha_(x.desde) + ' y tenía renovación automática: se renovó con las mismas condiciones hasta el ' +
+      formatoFecha_(x.hasta) + '. El acuerdo anterior quedó ARCHIVADO en «Acuerdos de proveedores».\n\nSi las condiciones cambiaron, use «Renovar acuerdo» en Proveedores.\n\n' + CONFIG.URL_APP);
+    r.avisos.push({ codigo: x.codigo, hito: 'RENOVADO', estado: estado });
+  });
+  tabla.filas.forEach(function (p) {
+    if (!clave_(p.codigo) || !esActivo_(p.activo) || !texto_(p.vencimiento)) return;
+    const dias = diasEntre_(hoy, p.vencimiento);
+    const hito = hitoAviso_(dias);
+    if (hito === null) return;
+    const nombre = nombreProveedor_(p);
+    const asunto = 'Distribuidora MB · Acuerdo con ' + nombre + ': ' + textoDias_(dias) + ' (' + formatoFecha_(p.vencimiento) + ')';
+    const cuerpo = 'Proveedor: ' + nombre + (p.razonSocial && p.razonSocial !== nombre ? ' (' + p.razonSocial + ')' : '') + ' · ' + p.codigo + '\n' +
+      'Vencimiento del acuerdo: ' + formatoFecha_(p.vencimiento) + ' — ' + textoDias_(dias) + '.\n' +
+      'Condiciones vigentes: descuento ' + numeroTexto_(Number(p.descuento) || 0) + '%, plazo de pago ' + cantidadDias_(Number(p.plazo) || 0) +
+      (p.compraMinima !== '' && p.compraMinima !== null ? ', compra mínima Gs. ' + miles_(p.compraMinima) : '') + '.\n' +
+      'Renovación automática: ' + (esSiProveedor_(p.renovacion) ? 'Sí (se renovará sola con el mismo plazo).' : 'No.') + '\n' +
+      (p.documento ? 'Documento: ' + p.documento + '\n' : '') +
+      '\nQué hacer: renegociar y registrar el nuevo acuerdo en la app › Proveedores › «Renovar acuerdo» (el anterior queda archivado).\n\n' + CONFIG.URL_APP +
+      '\n\nAviso automático (una sola vez por hito: 60, 30, 15 y 7 días y el día del vencimiento). Confidencial: solo administradoras.';
+    const estado = avisarUnaVez_(ss, tz, PROVEEDORES_.TIPO_ALERTA, clave_(p.codigo) + ' · ' + p.vencimiento, hito, admins, asunto, cuerpo);
+    r.avisos.push({ codigo: p.codigo, hito: hito, estado: estado });
+    if ((estado === 'ENVIADO' || estado === 'SIMULADO') && typeof avisarWhatsappAdministradoras_ === 'function' && modoIntegracion_(ss, 'whatsapp') !== 'APAGADO') {
+      try { avisarWhatsappAdministradoras_(ss, tz, 'ACUERDO PROVEEDOR', p.codigo + ' · ' + p.vencimiento + ' · ' + hito, asunto); } catch (e) { console.warn('WhatsApp del acuerdo ' + p.codigo + ': ' + e); }
+    }
+  });
+  return r;
+}
+
+function textoRevisionAcuerdos_(r) {
+  const enviados = r.avisos.filter(function (a) { return a.estado === 'ENVIADO' || a.estado === 'SIMULADO'; }).length;
+  return 'Acuerdos de proveedores: ' + cuentaPv_(r.revisados, 'revisado', 'revisados') + '; ' + r.porVencer.length + ' por vencer, ' + cuentaPv_(r.vencidos.length, 'vencido', 'vencidos') +
+    (r.renovados.length ? ', ' + cuentaPv_(r.renovados.length, 'renovado', 'renovados') + ' automáticamente' : '') + '; ' +
+    (r.sinCorreo ? 'avisos por correo desactivados en «Configuración».' : cuentaPv_(enviados, 'aviso nuevo', 'avisos nuevos') + ' por correo' +
+      (r.avisos.some(function (a) { return a.estado === 'SIN CUOTA'; }) ? ' (cuota de correo agotada: se reintenta mañana)' : '') + '.');
+}
+
+// ─────────────────────── 5. Datos para la app (solo administradoras) y pendientes ───────────────────────
+
+function proveedorParaApp_(p, hoy, porProveedor) {
+  const estado = estadoAcuerdo_(p, hoy);
+  return {
+    codigo: p.codigo, razonSocial: p.razonSocial, nombre: p.nombre, ruc: p.ruc, contacto: p.contacto, telefono: p.telefono, whatsapp: normalizarCelular_(p.telefono),
+    correo: p.correo, direccion: p.direccion, marcas: p.marcas, descuento: p.descuento, plazo: p.plazo, compraMinima: p.compraMinima, inicio: p.inicio,
+    vencimiento: p.vencimiento, renovacion: esSiProveedor_(p.renovacion) ? 'Sí' : 'No', diasAviso: diasAvisoDe_(p), documento: p.documento, estado: estado,
+    dias: texto_(p.vencimiento) ? diasEntre_(hoy, p.vencimiento) : null, activo: esActivo_(p.activo), notas: p.notas, actualizado: p.actualizado, usuario: p.usuario,
+    productos: porProveedor ? (porProveedor[clave_(p.codigo)] || 0) : 0,
+  };
+}
+
+/** Proveedores para la app (construirDatos_ lo llama SOLO en la sección de administradoras: R2.5). */
+function datosProveedores_(ss, tz, usuario, contexto) {
+  if (!esAdministradora_(usuario) || !ss.getSheetByName(ESQUEMA.proveedores.hoja)) return null;
+  const hoy = hoy_(tz);
+  const productos = contexto && contexto.productos ? contexto.productos : leerTabla_(ss, 'productos', tz).filas;
+  const porProveedor = {};
+  productos.forEach(function (p) { const k = clave_(p.proveedor); if (k) porProveedor[k] = (porProveedor[k] || 0) + 1; });
+  const lista = leerTabla_(ss, 'proveedores', tz).filas.filter(function (p) { return clave_(p.codigo); }).map(function (p) { return proveedorParaApp_(p, hoy, porProveedor); })
+    .sort(ordenarPor_(['nombre', 'razonSocial']));
+  const activos = lista.filter(function (p) { return p.activo; });
+  const cuenta = function (e) { return activos.filter(function (p) { return p.estado === e; }).length; };
+  return {
+    hoy: hoy, lista: lista,
+    resumen: {
+      total: lista.length, activos: activos.length, vigentes: cuenta('VIGENTE'), porVencer: cuenta('POR VENCER'), vencidos: cuenta('VENCIDO'), sinAcuerdo: cuenta('SIN ACUERDO'),
+      alertas: activos.filter(function (p) { return p.estado === 'POR VENCER' || p.estado === 'VENCIDO'; }).sort(function (a, b) { return a.dias - b.dias; })
+        .map(function (p) { return { codigo: p.codigo, nombre: p.nombre || p.razonSocial, vencimiento: p.vencimiento, dias: p.dias, estado: p.estado }; }),
+    },
+  };
+}
+
+/** Ficha del proveedor con el historial de acuerdos y los productos (para asignar el «Código proveedor»). */
+function obtenerProveedores_(ctx) {
+  const d = ctx.datos;
+  if (!clave_(d.codigo)) return { ok: true, proveedores: datosProveedores_(ctx.ss, ctx.tz, ctx.usuario, null) };
+  const hoy = hoy_(ctx.tz);
+  const p = buscarPorCodigo_(leerTabla_(ctx.ss, 'proveedores', ctx.tz).filas, d.codigo);
+  if (!p) throw errorUsuario_('No se encontró el proveedor ' + d.codigo + '.');
+  const k = clave_(p.codigo);
+  const acuerdos = leerTabla_(ctx.ss, 'acuerdos', ctx.tz).filas.filter(function (a) { return clave_(a.codigoProveedor) === k; })
+    .sort(function (a, b) { return String(a.id) < String(b.id) ? 1 : -1; }).map(function (a) {
+      return { id: a.id, descuento: a.descuento, plazo: a.plazo, compraMinima: a.compraMinima, inicio: a.inicio, vencimiento: a.vencimiento, renovacion: a.renovacion,
+        documento: a.documento, estado: a.estado, archivado: a.archivado, motivo: a.motivo, usuario: a.usuario, registrado: a.registrado };
+    });
+  const productos = leerTabla_(ctx.ss, 'productos', ctx.tz).filas.filter(function (x) { return clave_(x.codigo); }).map(function (x) {
+    return { codigo: x.codigo, nombre: x.nombre, marca: x.marca, categoria: x.categoria, activo: esActivo_(x.activo), proveedor: x.proveedor };
+  }).sort(ordenarPor_(['marca', 'nombre']));
+  return { ok: true, proveedor: proveedorParaApp_(p, hoy, null), acuerdos: acuerdos, productos: productos };
+}
+
+/** Panel «Pendientes» (administradoras): acuerdos por vencer o vencidos y proveedores activos sin acuerdo cargado. */
+function pendientesProveedores_(ss, tz, c) {
+  const lista = [];
+  if (!ss.getSheetByName(ESQUEMA.proveedores.hoja)) return lista;
+  const hoy = hoy_(tz);
+  const activos = leerTabla_(ss, 'proveedores', tz).filas.filter(function (p) { return clave_(p.codigo) && esActivo_(p.activo); });
+  const alertas = activos.map(function (p) { return { p: p, e: estadoAcuerdo_(p, hoy) }; }).filter(function (x) { return x.e === 'POR VENCER' || x.e === 'VENCIDO'; })
+    .sort(function (a, b) { return a.p.vencimiento < b.p.vencimiento ? -1 : 1; });
+  if (alertas.length) {
+    lista.push({ clave: 'acuerdos', titulo: 'Acuerdos de proveedores por vencer o vencidos', cantidad: alertas.length,
+      detalle: alertas.slice(0, 30).map(function (x) { return x.p.codigo + ' ' + nombreProveedor_(x.p) + ': ' + textoDias_(diasEntre_(hoy, x.p.vencimiento)) + ' (' + formatoFecha_(x.p.vencimiento) + ')'; }),
+      accion: 'Proveedores › «Renovar acuerdo» (el anterior queda archivado).' });
+  }
+  const sin = activos.filter(function (p) { return !hayAcuerdo_(p); });
+  if (sin.length) {
+    lista.push({ clave: 'sinAcuerdo', titulo: 'Proveedores activos sin acuerdo cargado', cantidad: sin.length,
+      detalle: sin.slice(0, 30).map(function (p) { return p.codigo + ' ' + nombreProveedor_(p); }), accion: 'Proveedores › «Renovar acuerdo» para cargar el primero (si lo hay).' });
+  }
+  return lista;
+}
+
+// ─────────────────────── 6. Pruebas (testSistema · Pruebas.gs) ───────────────────────
+
+/** Pruebas EN MEMORIA: estado automático, hitos de aviso (una sola alerta a 30 días) y período de la renovación automática. */
+function pruebasProveedores_(t) {
+  const hoy = '2026-10-11';
+  const p = function (venc, extra) { return Object.assign({ codigo: 'PR-001', descuento: 10, plazo: 30, vencimiento: venc, diasAviso: 30 }, extra || {}); };
+  t.igual('Proveedores: estado automático', [
+    estadoAcuerdo_({ codigo: 'PR-001' }, hoy), estadoAcuerdo_(p(''), hoy), estadoAcuerdo_(p('2026-12-31'), hoy), estadoAcuerdo_(p('2026-11-10'), hoy),
+    estadoAcuerdo_(p('2026-11-11'), hoy), estadoAcuerdo_(p('2026-10-11'), hoy), estadoAcuerdo_(p('2026-10-10'), hoy),
+  ], ['SIN ACUERDO', 'VIGENTE', 'VIGENTE', 'POR VENCER', 'VIGENTE', 'POR VENCER', 'VENCIDO']);
+  t.igual('Proveedores: «Días de aviso» propios (15) y por defecto (30)', [estadoAcuerdo_(p('2026-11-10', { diasAviso: 15 }), hoy), estadoAcuerdo_(p('2026-11-10', { diasAviso: '' }), hoy)],
+    ['VIGENTE', 'POR VENCER']);
+  t.igual('Proveedores: hitos de aviso (60, 30, 15, 7 y el día; vencido; más de 60 = ninguno)',
+    [75, 60, 45, 30, 29, 15, 10, 7, 3, 0, -1].map(hitoAviso_), [null, '60', '60', '30', '30', '15', '15', '7', '7', '0', 'VENCIDO']);
+  t.igual('Proveedores: acuerdo cargado a 30 días = un solo hito (30), nunca el de 60', hitoAviso_(diasEntre_(hoy, '2026-11-10')), '30');
+  t.igual('Proveedores: renovación automática = mismo plazo desde el día siguiente', renovacionSiguiente_({ inicio: '2025-10-11', vencimiento: '2026-10-10' }),
+    { inicio: '2026-10-11', vencimiento: '2027-10-10' });
+  t.igual('Proveedores: sin fecha de inicio no se renueva solo', renovacionSiguiente_({ inicio: '', vencimiento: '2026-10-10' }), null);
+  t.lanza('Proveedores: fecha de acuerdo inválida', function () { fechaAcuerdo_('2026-02-30', 'el vencimiento'); }, /fecha válida/);
+  t.ok('Proveedores: hay acuerdo si hay vencimiento, condiciones o documento', !hayAcuerdo_({ descuento: 0, plazo: 0, compraMinima: '' }) && hayAcuerdo_({ compraMinima: 0 }) && hayAcuerdo_({ documento: 'https://x' }));
+  t.ok('Proveedores: las condiciones son campos sensibles (nunca llegan a una operativa)',
+    ['proveedor', 'proveedores', 'acuerdos', 'compraMinima'].every(function (k) { return CAMPOS_SENSIBLES_.indexOf(k) >= 0; }) && PERMISOS.obtenerProveedores.indexOf(ROLES.OPERATIVO) < 0 &&
+    ['guardarProveedor', 'renovarAcuerdo', 'asignarProductosProveedor', 'revisarAcuerdosAhora'].every(function (f) { return !PERMISOS[f] || PERMISOS[f].indexOf(ROLES.OPERATIVO) < 0; }));
+}
+
+/**
+ * Escenarios en la COPIA: acuerdo a 30 días → POR VENCER con UNA sola alerta, renovar archiva el anterior, renovación
+ * automática, vencido sin renovación, avisos desactivados, productos del proveedor y confidencialidad ante una operativa.
+ */
+function escenariosProveedores_(t, c) {
+  const ss = c.ss;
+  const tz = c.tz;
+  reiniciarMemoriaEjecucion_();
+  const hoy = hoy_(tz);
+  const sufijo = Utilities.getUuid().replace(/-/g, '').slice(0, 6).toUpperCase();
+  const admin = { email: CONFIG.CORREO_ADMIN, rol: ROLES.ADMIN, nombre: 'Administradora (prueba)', metodo: 'PRUEBA' };
+  const ctx = function (datos) { return { ss: ss, tz: tz, usuario: admin, email: admin.email, datos: datos || {}, mes: hoy.slice(0, 7), unidad: '', idSolicitud: '' }; };
+  const error = function (fn) { try { fn(); return ''; } catch (e) { return String(e && e.message ? e.message : e); } };
+  const prov = function (codigo) { reiniciarMemoriaEjecucion_(); return buscarPorCodigo_(leerTabla_(ss, 'proveedores', tz).filas, codigo); };
+  const acuerdosDe = function (codigo) { return leerTabla_(ss, 'acuerdos', tz).filas.filter(function (a) { return a.codigoProveedor === codigo; }); };
+  const alertasDe = function (codigo) { return leerTabla_(ss, 'alertas', tz).filas.filter(function (a) { return String(a.referencia).indexOf(codigo + ' ·') === 0; }); };
+  if (tiempoRestante_() < 30000) { t.ok('Proveedores: escenarios omitidos por tiempo (se prueban en la próxima corrida)', true); return; }
+  const correosAntes = MODO_PRUEBA_ ? MODO_PRUEBA_.correos.length : 0;
+  const cfgAvisos = leerConfig_(ss, CFG.AVISOS_ACUERDOS);
+  escribirConfig_(ss, CFG.AVISOS_ACUERDOS, 'Sí');
+
+  const a = guardarProveedor_(ctx({ razonSocial: 'PRUEBA Proveedor ' + sufijo + ' S.A.', nombre: 'PRUEBA Prov ' + sufijo, contacto: 'Contacto', telefono: '0981 000 000',
+    marcas: 'Prueba', acuerdo: { descuento: '12,5', plazo: 30, compraMinima: '1.000.000', inicio: sumarDias_(hoy, -335), vencimiento: sumarDias_(hoy, 30), renovacion: 'No',
+      documento: 'https://drive.google.com/prueba' } }));
+  t.igual('Alta con primer acuerdo a 30 días: POR VENCER y acuerdo VIGENTE en el historial', [prov(a.codigo).estado, acuerdosDe(a.codigo).map(function (x) { return x.estado; })], ['POR VENCER', ['VIGENTE']]);
+  t.ok('Las condiciones se cambian solo con «Renovar acuerdo»', /Renovar acuerdo/.test(error(function () { guardarProveedor_(ctx({ codigoOriginal: a.codigo, acuerdo: { descuento: 20 } })); })));
+  const r1 = revisarAcuerdos_(ss, tz, {});
+  const r2 = revisarAcuerdos_(ss, tz, {});
+  t.igual('Acuerdo a 30 días: UNA sola alerta (hito 30), aunque la tarea corra dos veces', [alertasDe(a.codigo).map(function (x) { return x.hito; }), r1.avisos.filter(function (x) { return x.codigo === a.codigo; })[0].estado,
+    r2.avisos.filter(function (x) { return x.codigo === a.codigo; })[0].estado], [['30'], MODO_PRUEBA_ ? 'SIMULADO' : 'ENVIADO', 'YA ENVIADO']);
+  if (MODO_PRUEBA_) t.ok('La alerta va por correo a las administradoras (simulado en la copia)', MODO_PRUEBA_.correos.slice(correosAntes).some(function (m) { return /PRUEBA Prov/.test(m.subject) && m.to.indexOf(CONFIG.ADMINS_FIJOS[0]) >= 0; }));
+  const ren = renovarAcuerdo_(ctx({ codigo: a.codigo, descuento: 15, plazo: 45, inicio: sumarDias_(hoy, 31), vencimiento: sumarDias_(hoy, 31 + 364), renovacion: 'Sí', motivo: 'Renegociado (prueba)' }));
+  const hist = acuerdosDe(a.codigo);
+  t.ok('Renovar: el anterior queda ARCHIVADO (con motivo y fecha) y el nuevo VIGENTE; el proveedor pasa a VIGENTE', hist.length === 2 && hist.filter(function (x) { return x.estado === 'ARCHIVADO'; }).length === 1 &&
+    /Reemplazado por/.test(hist.filter(function (x) { return x.estado === 'ARCHIVADO'; })[0].motivo) && !!hist.filter(function (x) { return x.estado === 'ARCHIVADO'; })[0].archivado &&
+    prov(a.codigo).estado === 'VIGENTE' && prov(a.codigo).descuento === 15 && ren.estado === 'VIGENTE');
+  // Renovación automática (vencido ayer, con inicio y vencimiento)
+  const b = guardarProveedor_(ctx({ razonSocial: 'PRUEBA Auto ' + sufijo, acuerdo: { descuento: 5, inicio: sumarDias_(hoy, -366), vencimiento: sumarDias_(hoy, -1), renovacion: 'Sí' } }));
+  t.igual('Sin renovar todavía: VENCIDO', prov(b.codigo).estado, 'VENCIDO');
+  revisarAcuerdos_(ss, tz, {});
+  const pb = prov(b.codigo);
+  t.ok('Renovación automática: mismo plazo desde el día siguiente, anterior ARCHIVADO, aviso de renovación (sin aviso de VENCIDO)',
+    pb.inicio === hoy && pb.vencimiento === sumarDias_(hoy, 365) && pb.estado === 'VIGENTE' && acuerdosDe(b.codigo).length === 2 &&
+    alertasDe(b.codigo).length === 1 && alertasDe(b.codigo)[0].hito === 'RENOVADO');
+  // Vencido sin renovación automática: un solo aviso de VENCIDO
+  const v = guardarProveedor_(ctx({ nombre: 'PRUEBA Vencido ' + sufijo, acuerdo: { plazo: 15, vencimiento: sumarDias_(hoy, -3) } }));
+  revisarAcuerdos_(ss, tz, {});
+  revisarAcuerdos_(ss, tz, {});
+  t.igual('Vencido sin renovación: VENCIDO y un solo aviso', [prov(v.codigo).estado, alertasDe(v.codigo).map(function (x) { return x.hito; })], ['VENCIDO', ['VENCIDO']]);
+  // Avisos desactivados: el estado se actualiza igual, sin correo
+  escribirConfig_(ss, CFG.AVISOS_ACUERDOS, 'No');
+  const x = guardarProveedor_(ctx({ nombre: 'PRUEBA Sin avisos ' + sufijo, acuerdo: { vencimiento: sumarDias_(hoy, 7) } }));
+  const r3 = revisarAcuerdos_(ss, tz, {});
+  t.ok('Con avisos desactivados en «Configuración»: estado POR VENCER y ningún correo', prov(x.codigo).estado === 'POR VENCER' && r3.sinCorreo && alertasDe(x.codigo).length === 0);
+  escribirConfig_(ss, CFG.AVISOS_ACUERDOS, cfgAvisos || 'Sí');
+  // R2.4 · productos del proveedor
+  const productos = leerTabla_(ss, 'productos', tz).filas.filter(function (p2) { return esActivo_(p2.activo); }).slice(0, 2).map(function (p2) { return p2.codigo; });
+  if (productos.length) {
+    asignarProductosProveedor_(ctx({ codigo: a.codigo, productos: productos }));
+    t.igual('R2.4: «Código proveedor» asignado a los productos elegidos', leerTabla_(ss, 'productos', tz).filas.filter(function (p2) { return p2.proveedor === a.codigo; }).length, productos.length);
+    asignarProductosProveedor_(ctx({ codigo: a.codigo, productos: productos.slice(0, 1) }));
+    t.igual('R2.4: quitar un producto del proveedor', leerTabla_(ss, 'productos', tz).filas.filter(function (p2) { return p2.proveedor === a.codigo; }).length, 1);
+  }
+  // R2.5 · confidencialidad
+  const tokOper = sesionPrueba_(c, CORREO_OPERATIVA_PRUEBA);
+  [['obtenerProveedores', obtenerProveedores], ['guardarProveedor', guardarProveedor], ['renovarAcuerdo', renovarAcuerdo],
+    ['asignarProductosProveedor', asignarProductosProveedor], ['revisarAcuerdosAhora', revisarAcuerdosAhora]].forEach(function (par) {
+    t.ok('Operativa sin acceso a ' + par[0], /solo para administradoras/.test(error(function () { llamarPrueba_(par[1], tokOper, { codigo: a.codigo }); })));
+  });
+  const d = llamarPrueba_(obtenerDatos, tokOper).datos;
+  const json = JSON.stringify(d);
+  t.ok('Operativa: ni proveedores ni condiciones en los datos que recibe (inspección del JSON)', d.proveedores === undefined && json.indexOf(a.codigo) < 0 && json.indexOf('PRUEBA Prov ' + sufijo) < 0 &&
+    !/"compraMinima"|"acuerdos"|"proveedor"/.test(json));
+  const dAdmin = datosProveedores_(ss, tz, admin, null);
+  t.ok('Administradora: proveedores con estado y banner de alertas', !!dAdmin && dAdmin.lista.some(function (p2) { return p2.codigo === a.codigo; }) && dAdmin.resumen.alertas.some(function (p2) { return p2.codigo === x.codigo; }));
+  t.ok('Panel «Pendientes»: acuerdos por vencer o vencidos', pendientesProveedores_(ss, tz, {}).some(function (p2) { return p2.clave === 'acuerdos' && p2.detalle.some(function (l) { return l.indexOf(v.codigo) === 0; }); }));
+}

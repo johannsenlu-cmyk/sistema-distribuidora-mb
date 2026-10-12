@@ -1,0 +1,882 @@
+<!--
+  DISTRIBUIDORA MB · Base de datos de clientes (v2.3 · Fase 3 · R1)
+  Clientes (alta, edición, búsqueda, filtros y completitud), «Pendientes de completar» con edición rápida en línea,
+  historial por cliente (ventas, servicios e importados), «Unificar y vincular» (variantes de una misma clienta y servicios
+  sin cliente) e «Importación» del historial (bandeja → revisión → aprobación en lote), con exportación CSV.
+  Se incluye en Index.html con <?!= incluir_('UI_Clientes') ?> y se conecta a la app por window.MB.
+  Lo que decide (obligatorios, RUC, duplicados, completitud, estados de la importación) lo valida el SERVIDOR: aquí solo
+  se muestra una estimación para orientar mientras se escribe.
+-->
+<style>
+  /* ═════════════ Base de datos (v2.3) ═════════════ */
+  .bd-faltan { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .bd-faltan .badge { font-size: 10.5px; }
+  .bd-tarjetas { margin: 14px -22px 0; border-top: 1px solid var(--linea); }
+  .bd-tarjeta { display: grid; grid-template-columns: minmax(190px, 250px) 1fr auto; gap: 12px 22px; align-items: start; padding: 14px 22px; border-bottom: 1px solid var(--linea); }
+  .bd-tarjeta-acc { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; padding-top: 18px; white-space: nowrap; }
+  .bd-campos { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px 12px; }
+  .bd-campos .campo > label { font-size: 11px; }
+  .bd-campos input, .bd-campos select { min-height: 34px; padding: 6px 9px; font-size: 13px; }
+  .bd-grupo { border: 1px solid var(--linea); border-radius: 4px; background: var(--superficie); padding: 14px 16px; margin-top: 12px; }
+  .bd-grupo-cab { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+  .bd-miembro { display: grid; grid-template-columns: auto auto 1fr auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--linea); font-size: 13px; }
+  .bd-miembro:first-of-type { border-top: 0; }
+  .bd-miembro input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--tinta); }
+  .bd-archivo { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .bd-pasos { counter-reset: paso; list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; color: var(--tinta-2); }
+  .bd-pasos li { counter-increment: paso; padding-left: 26px; position: relative; }
+  .bd-pasos li::before { content: counter(paso); position: absolute; left: 0; top: 1px; width: 18px; height: 18px; border-radius: 50%; background: var(--acento-suave); color: var(--acento); font-size: 11px; font-weight: 600; display: grid; place-items: center; }
+  .bd-original { font-size: 11.5px; color: var(--tenue); max-width: 420px; overflow-wrap: anywhere; margin-top: 2px; }
+  .bd-original summary { cursor: pointer; width: max-content; text-decoration: underline; text-underline-offset: 2px; }
+  .bd-original[open] summary { margin-bottom: 2px; }
+  .bd-sel { width: 34px; }
+  .bd-sel input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--tinta); }
+  .bd-enlace { margin-bottom: 14px; }
+  .bd-prev { font-size: 12px; margin-top: 6px; }
+  .bd-kpis-modal .kpi { padding: 14px 16px; }
+  .bd-kpis-modal .kpi-val { font-size: 19px; overflow-wrap: anywhere; }
+  textarea.bd-pegar { min-height: 120px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  @media (max-width: 720px) {
+    .bd-miembro { grid-template-columns: auto auto 1fr; } .bd-miembro .acciones { grid-column: 1 / -1; text-align: left; }
+    .bd-tarjetas { margin: 12px -16px 0; }
+    .bd-tarjeta { grid-template-columns: 1fr; padding: 14px 16px; }
+    .bd-tarjeta-acc { flex-direction: row; align-items: center; padding-top: 0; }
+  }
+</style>
+<script>
+(window.MB_EXT = window.MB_EXT || []).push(function (MB) {
+  'use strict';
+  var S = MB.S, $ = MB.$, esc = MB.esc, gs = MB.gs, miles = MB.miles, fecha = MB.fecha, plural = MB.plural,
+    badge = MB.badge, boton = MB.boton, attr = MB.attr, tabla = MB.tabla, kpi = MB.kpi, cabecera = MB.cabecera,
+    subtabs = MB.subtabs, campo = MB.campo, inputGs = MB.inputGs, api = MB.api, toast = MB.toast, fallo = MB.fallo,
+    conBoton = MB.conBoton, abrirModal = MB.abrirModal, requerir = MB.requerir, enteroDe = MB.enteroDe, norm = MB.norm, uid = MB.uid;
+
+  var TIPOS = ['PELUQUERÍA', 'CLIENTA DEL SALÓN', 'OTRO'];
+  var REQ = {
+    EMPRESA: [['nombre', 'Nombre comercial'], ['razonSocial', 'Razón social'], ['ruc', 'RUC'], ['contacto', 'Contacto principal'], ['direccion', 'Dirección'], ['celular', 'Celular'], ['ciudad', 'Ciudad']],
+    SALON: [['nombre', 'Nombre'], ['celular', 'Celular']],
+  };
+  // Etiqueta de «Campos faltantes» → campo que la completa (edición rápida).
+  var CAMPO_DE = { 'Tipo de cliente': 'tipo', 'Nombre comercial': 'nombre', 'Nombre': 'nombre', 'Razón social': 'razonSocial', 'RUC': 'ruc', 'RUC válido': 'ruc',
+    'Contacto principal': 'contacto', 'Dirección': 'direccion', 'Celular': 'celular', 'Celular válido': 'celular', 'Ciudad': 'ciudad', 'CI válida': 'ci' };
+  var ETQ = { tipo: 'Tipo de cliente', nombre: 'Nombre', razonSocial: 'Razón social', ruc: 'RUC (1234567-8)', contacto: 'Contacto principal', direccion: 'Dirección',
+    celular: 'Celular', ciudad: 'Ciudad', ci: 'CI (solo números)' };
+  var ESTADOS_IMP = { LISTO: 'ok', REVISAR: 'alerta', DUPLICADO: 'neutro', APROBADO: 'ok', RECHAZADO: 'neutro', 'YA EN LA BANDEJA': 'neutro' };
+
+  // Estado de las pantallas (filtros, borradores de la edición rápida, importación y selección).
+  var B = S.base = {
+    q: '', tipo: 'todos', comp: 'todas', inactivos: false, pq: '', borrador: {}, verMas: 0, archivo: null,
+    imp: { texto: '', fuente: '', referencia: '', total: '', archivo: null, nombreArchivo: '', vista: null, lote: '', estado: '', filas: null, nFilas: 0, resumen: null, sel: {}, descontar: false, motivoStock: '' },
+    vinc: { sel: {}, cliente: '' },
+  };
+
+  // ═════════════ Utilidades ═════════════
+  function D() { return S.datos; }
+  function hayBase() { return !!(S.datos && S.datos.clientes); }
+  function K() { return S.datos.clientes; }
+  function esAdmin() { return MB.esAdmin(); }
+  function render() { MB.render(); }
+  function opcion(valor, texto, sel) { return '<option value="' + esc(valor) + '"' + (sel ? ' selected' : '') + '>' + esc(texto) + '</option>'; }
+  function aviso(txt, tono) { return '<p class="aviso-linea' + (tono ? ' ' + tono : '') + '">' + esc(txt) + '</p>'; }
+  function cliente(codigo) { return hayBase() ? MB.buscar(K().lista, codigo) : null; }
+  function minus(t) { return String(t === null || t === undefined ? '' : t).toLowerCase(); }
+  function tipoCorto(t) { return { 'PELUQUERÍA': 'Peluquería', 'CLIENTA DEL SALÓN': 'Clienta del salón', 'OTRO': 'Otro' }[t] || 'Sin tipo'; }
+  function badgeCompletitud(c) { return c.completitud === 'COMPLETA' ? badge('Completa', 'ok') : badge('Incompleta', 'alerta'); }
+  function chipsFaltan(lista) {
+    return lista && lista.length ? '<div class="bd-faltan">' + lista.map(function (f) { return badge(f, /válid/.test(f) ? 'error' : 'neutro'); }).join('') + '</div>' : '';
+  }
+  function hayCartera() { return !!(S.datos && S.datos.cartera); }
+
+  // Estimación en el navegador (orienta; el servidor decide): dígito verificador del RUC (módulo 11 de la SET).
+  function dvRuc(base) {
+    var s = String(base).toUpperCase().split('').map(function (ch) { return /\d/.test(ch) ? ch : String(ch.charCodeAt(0)); }).join('');
+    var k = 2, total = 0;
+    for (var i = s.length - 1; i >= 0; i--) { total += Number(s.charAt(i)) * k; k = k >= 11 ? 2 : k + 1; }
+    var resto = total % 11;
+    return resto > 1 ? 11 - resto : 0;
+  }
+  function rucValido(v) {
+    var s = String(v || '').toUpperCase().replace(/\s+/g, '').replace(/\./g, '');
+    var m = s.match(/^(\d{3,9})-(\d)$/);
+    if (!m) return false;
+    return !hayBase() || K().validarDv === false || dvRuc(m[1]) === Number(m[2]);
+  }
+  function faltantesUI(d, hoja) {
+    var tipo = d.tipo || (hoja === 'clientasSalon' ? 'CLIENTA DEL SALÓN' : 'PELUQUERÍA');
+    var lista = [];
+    if (!d.tipo) lista.push('Tipo de cliente');
+    (tipo === 'CLIENTA DEL SALÓN' ? REQ.SALON : REQ.EMPRESA).forEach(function (r) {
+      var v = String(d[r[0]] || '').trim();
+      if (r[0] === 'ruc') { if (!v) lista.push('RUC'); else if (!rucValido(v)) lista.push('RUC válido'); return; }
+      if (r[0] === 'celular') {
+        var cel = v ? MB.whatsappDe(v) : MB.whatsappDe(d.telefono);
+        if (!cel) lista.push(v ? 'Celular válido' : 'Celular');
+        return;
+      }
+      if (!v) lista.push(r[1]);
+    });
+    if (tipo === 'CLIENTA DEL SALÓN' && String(d.ruc || '').trim() && !rucValido(d.ruc)) lista.push('RUC válido');
+    if (String(d.ci || '').trim() && !/^\d{3,10}$/.test(String(d.ci).replace(/[.\s]/g, ''))) lista.push('CI válida');
+    return lista;
+  }
+  function mostrarEnlace(r) {
+    if (!r || !r.url) return;
+    B.archivo = { nombre: r.nombre, url: r.url };
+    render();
+  }
+  function enlaceArchivo() {
+    if (!B.archivo) return '';
+    return '<p class="aviso-linea bien bd-enlace">Archivo listo: <a href="' + esc(B.archivo.url) + '" target="_blank" rel="noopener">' + esc(B.archivo.nombre) + '</a> ' +
+      '(en «Distribuidora MB»). ' + boton('Ocultar', 'bd-ocultar-enlace') + '</p>';
+  }
+
+  // ═════════════ Vista: Base de datos ═════════════
+  function vClientes() {
+    if (!hayBase()) return cabecera('Base de datos', 'Clientes') + '<div class="vacio">La base de clientes todavía no está instalada en el servidor (Fase 3).</div>';
+    var k = K(), admin = esAdmin(), r = k.resumen;
+    var opciones = [['lista', 'Clientes'], ['pendientes', 'Pendientes de completar', r.incompletas || '']];
+    if (admin) {
+      var nU = (k.unificaciones || []).length + ((k.serviciosSinCliente || {}).conNombre ? 1 : 0);
+      var imp = k.importacion || { porEstado: {} };
+      opciones.push(['unificar', 'Unificar y vincular', nU || ''], ['importacion', 'Importación', (imp.porEstado.REVISAR || 0) + (imp.porEstado.LISTO || 0) || '']);
+    }
+    if (!admin && (S.sub.clientes === 'unificar' || S.sub.clientes === 'importacion')) S.sub.clientes = 'lista';
+    var html = cabecera('Base de datos', 'Clientes · peluquerías, clientas del salón y otros',
+      boton('Nuevo cliente', 'bd-nuevo', '', 'btn') + (admin ? ' ' + boton('Exportar CSV', 'bd-exportar', attr('tipo', 'base'), 'btn btn-sec') : ''));
+    html += enlaceArchivo() + subtabs('clientes', opciones);
+    var sub = S.sub.clientes;
+    if (sub === 'pendientes') return html + vPendientes();
+    if (sub === 'unificar') return html + vUnificar();
+    if (sub === 'importacion') return html + vImportacion();
+    return html + vLista();
+  }
+
+  function vLista() {
+    var k = K(), r = k.resumen;
+    var pt = r.porTipo || {};
+    var html = '<div class="kpis kpis-4">' +
+      kpi('Clientes activos', miles(r.activos), plural(r.total, 'ficha en total', 'fichas en total') + ' (C- peluquerías y otros · CS- clientas del salón)') +
+      kpi('Completas', miles(r.completas), 'con todos los datos obligatorios de su tipo') +
+      kpi('Incompletas', miles(r.incompletas), 'no compran a crédito hasta completarlas', r.incompletas ? 'alerta' : '') +
+      kpi('Por tipo', miles(pt['PELUQUERÍA'] || 0) + ' · ' + miles(pt['CLIENTA DEL SALÓN'] || 0) + ' · ' + miles(pt.OTRO || 0),
+        'peluquerías · clientas del salón · otros' + (pt['SIN TIPO'] ? ' · ' + plural(pt['SIN TIPO'], 'sin tipo', 'sin tipo') : '')) + '</div>';
+    html += '<div class="barra-herr mt-l"><input type="search" placeholder="Buscar nombre, código, RUC, CI, celular, alias o código legado" value="' + esc(B.q) +
+      '" data-al-escribir="bd-buscar" autocomplete="off">' +
+      '<div style="min-width:170px"><select data-al-cambiar="bd-tipo" aria-label="Filtrar por tipo">' +
+      [['todos', 'Todos los tipos'], ['PELUQUERÍA', 'Peluquerías'], ['CLIENTA DEL SALÓN', 'Clientas del salón'], ['OTRO', 'Otros'], ['', 'Sin tipo']]
+        .map(function (o) { return opcion(o[0], o[1], B.tipo === o[0]); }).join('') + '</select></div>' +
+      '<div style="min-width:160px"><select data-al-cambiar="bd-comp" aria-label="Filtrar por completitud">' +
+      [['todas', 'Completas e incompletas'], ['INCOMPLETA', 'Solo incompletas'], ['COMPLETA', 'Solo completas']].map(function (o) { return opcion(o[0], o[1], B.comp === o[0]); }).join('') +
+      '</select></div><label class="check"><input type="checkbox" data-al-cambiar="bd-inactivos"' + (B.inactivos ? ' checked' : '') + '> Ver inactivos</label></div>';
+    return html + '<div id="bd-tabla">' + tablaClientes() + '</div>' +
+      '<p class="nota-pie">Obligatorios: peluquería u otro → nombre comercial, razón social, RUC (con dígito verificador), contacto principal, dirección, celular y ciudad; ' +
+      'clienta del salón → nombre y celular (RUC o CI solo si pide factura). Un alta incompleta se rechaza; lo cargado antes o importado queda INCOMPLETA con la lista exacta de faltantes ' +
+      'y no compra a crédito hasta completarse. RUC y CI no se repiten en ninguna de las dos hojas.</p>';
+  }
+  function filtrarClientes() {
+    var q = norm(B.q).trim();
+    return K().lista.filter(function (c) {
+      if (!B.inactivos && !c.activo) return false;
+      if (B.tipo !== 'todos' && (c.tipo || '') !== B.tipo) return false;
+      if (B.comp !== 'todas' && c.completitud !== B.comp) return false;
+      if (!q) return true;
+      return norm([c.codigo, c.nombre, c.razonSocial, c.contacto, c.ruc, c.ci, c.celular, c.telefono, c.alias, c.legado, c.ciudad, c.correo].join(' ')).indexOf(q) >= 0;
+    });
+  }
+  function tablaClientes() {
+    var lista = filtrarClientes(), cart = hayCartera();
+    var filas = lista.slice(0, 400).map(function (c) {
+      var wa = c.whatsapp ? '<a class="btn-link" href="https://wa.me/' + esc(c.whatsapp) + '" target="_blank" rel="noopener">+' + esc(c.whatsapp) + '</a>' : '<span class="det">sin celular</span>';
+      return '<tr class="' + (c.activo ? '' : 'fila-anulada') + '"><td><div class="fuerte">' + esc(c.nombre) + '</div><div class="det">' +
+        esc([c.codigo, tipoCorto(c.tipo), c.legado ? 'legado ' + c.legado : '', c.razonSocial && c.razonSocial !== c.nombre ? c.razonSocial : '', c.unificadaEn ? 'unificada en ' + c.unificadaEn : ''].filter(String).join(' · ')) +
+        '</div><div class="solo-movil">' + badgeCompletitud(c) + '</div></td>' +
+        '<td class="ocultar-movil"><div>' + esc(c.contacto || '—') + '</div><div class="det">' + wa + '</div></td>' +
+        '<td class="ocultar-movil"><div class="cod">' + esc(c.ruc || '—') + '</div>' + (c.ci ? '<div class="det">CI ' + esc(c.ci) + '</div>' : '') + '</td>' +
+        '<td class="ocultar-movil">' + badgeCompletitud(c) + chipsFaltan(c.faltantes) + (c.revisar ? '<div class="mt">' + badge('Revisar unificación', 'alerta') + '</div>' : '') + '</td>' +
+        '<td class="ocultar-movil">' + (c.categoria ? esc(c.categoria) : '<span class="det">sin categoría</span>') +
+        (c.estadoCredito ? '<div class="det">' + esc(minus(c.estadoCredito)) + (c.saldo ? ' · saldo ' + gs(c.saldo) : '') + '</div>' : '') + '</td>' +
+        '<td class="acciones">' + boton('Editar', 'bd-editar', attr('codigo', c.codigo)) + boton('Historial', 'bd-historial', attr('codigo', c.codigo)) +
+        (cart ? boton('Estado de cuenta', 'ficha', attr('codigo', c.codigo)) : '') + '</td></tr>';
+    });
+    var pie = lista.length > 400 ? '<tfoot><tr><td colspan="6">Se muestran 400 de ' + miles(lista.length) + ': afine la búsqueda.</td></tr></tfoot>' :
+      (lista.length ? '<tfoot><tr><td colspan="6">' + plural(lista.length, 'cliente', 'clientes') + '</td></tr></tfoot>' : '');
+    return '<div class="tabla-plegable">' + tabla(['Cliente', ['Contacto y celular', 'ocultar-movil'], ['RUC / CI', 'ocultar-movil'], ['Datos', 'ocultar-movil'], ['Crédito', 'ocultar-movil'], ''],
+      filas, 'Ningún cliente coincide con el filtro.', pie) + '</div>';
+  }
+
+  // ═════════════ Pendientes de completar (R1.4: edición rápida en línea) ═════════════
+  function vPendientes() {
+    var admin = esAdmin();
+    var q = norm(B.pq).trim();
+    var lista = K().lista.filter(function (c) { return c.activo && c.completitud === 'INCOMPLETA'; }).filter(function (c) {
+      return !q || norm([c.codigo, c.nombre, c.contacto, c.legado, c.alias, c.faltantes.join(' ')].join(' ')).indexOf(q) >= 0;
+    });
+    var tope = 60 + B.verMas;
+    var html = '<section class="panel"><div class="panel-cab"><h2>Pendientes de completar</h2>' +
+      (admin ? boton('Exportar faltantes (CSV)', 'bd-exportar', attr('tipo', 'faltantes'), 'btn btn-sec') : '') + '</div>' +
+      '<p class="ayuda">Complete solo lo que falta y pulse «Guardar» en esa fila: se guarda aunque siga incompleta (nunca se pierde lo ya cargado). ' +
+      'Mientras una ficha esté INCOMPLETA no se le vende a crédito (ni factura electrónica ni WhatsApp cuando estén activos).</p>' +
+      '<div class="barra-herr mt"><input type="search" placeholder="Buscar en los pendientes" value="' + esc(B.pq) + '" data-al-escribir="bd-pend-buscar" autocomplete="off"></div>';
+    if (!lista.length) return html + '<div class="vacio">' + (q ? 'Ningún pendiente coincide con la búsqueda.' : 'No hay fichas incompletas.') + '</div></section>';
+    html += '<div class="bd-tarjetas">' + lista.slice(0, tope).map(filaRapida).join('') + '</div>';
+    if (lista.length > tope) html += '<div class="mt">' + boton('Ver ' + Math.min(60, lista.length - tope) + ' más (de ' + miles(lista.length - tope) + ')', 'bd-ver-mas', '', 'btn btn-sec') + '</div>';
+    return html + '</section>';
+  }
+  function filaRapida(c) {
+    var b = B.borrador[c.codigo] || {};
+    var campos = [];
+    c.faltantes.forEach(function (f) { var k = CAMPO_DE[f]; if (k && campos.indexOf(k) < 0) campos.push(k); });
+    var controles = campos.map(function (k) {
+      var actual = b[k] !== undefined ? b[k] : (k === 'tipo' ? c.tipo : (c[k] || ''));
+      var ctrl;
+      if (k === 'tipo') {
+        ctrl = '<select name="tipo" data-al-cambiar="bd-borrador" data-codigo="' + esc(c.codigo) + '">' + opcion('', 'Elegir…', !actual) +
+          TIPOS.map(function (t) { return opcion(t, tipoCorto(t), actual === t); }).join('') + '</select>';
+      } else {
+        ctrl = '<input name="' + k + '" value="' + esc(actual) + '" data-al-escribir="bd-borrador" data-codigo="' + esc(c.codigo) + '"' +
+          (k === 'celular' ? ' inputmode="tel" placeholder="0981 123 456"' : (k === 'ruc' ? ' placeholder="1234567-8"' : (k === 'ci' ? ' inputmode="numeric"' : ''))) + '>';
+      }
+      return '<div class="campo"><label>' + esc(ETQ[k] || k) + '</label>' + ctrl + '</div>';
+    }).join('');
+    return '<article class="bd-tarjeta" data-fila-codigo="' + esc(c.codigo) + '"><div><div class="fuerte">' + esc(c.nombre) + '</div><div class="det">' +
+      esc([c.codigo, tipoCorto(c.tipo), c.legado ? 'legado ' + c.legado : ''].filter(String).join(' · ')) + '</div>' + chipsFaltan(c.faltantes) + '</div>' +
+      '<div class="bd-campos">' + (controles || '<span class="det">Revise la ficha completa.</span>') + '</div>' +
+      '<div class="bd-tarjeta-acc">' + boton('Guardar', 'bd-rapida-guardar', attr('codigo', c.codigo), 'btn btn-sec') + boton('Ficha completa', 'bd-editar', attr('codigo', c.codigo)) + '</div></article>';
+  }
+  function guardarRapida(el) {
+    var codigo = el.getAttribute('data-codigo');
+    var fila = document.querySelector('.bd-tarjeta[data-fila-codigo="' + codigo + '"]');
+    if (!fila) return;
+    var datos = { codigoOriginal: codigo };
+    var hay = false;
+    Array.prototype.forEach.call(fila.querySelectorAll('input[name], select[name]'), function (x) {
+      var v = String(x.value || '').trim();
+      if (v) { datos[x.name] = v; hay = true; }
+    });
+    if (!hay) { toast('Escriba al menos un dato para guardar.', 'aviso'); return; }
+    conBoton(el, 'Guardando…', function () { return api('guardarCliente', datos, 'rapida-' + codigo + '-' + uid()); }).then(function (r) {
+      delete B.borrador[codigo];
+      MB.aplicar(r);
+    }).catch(fallo);
+  }
+
+  // ═════════════ Alta y edición (reemplaza «Nueva peluquería» / «Editar» de la v2.1) ═════════════
+  function fld(nombre, etiqueta, control, cls, ayuda) {
+    return '<div class="campo ' + (cls || 'c-6') + '"><label for="bd-f-' + nombre + '" id="bd-l-' + nombre + '" data-etq="' + esc(etiqueta) + '">' + esc(etiqueta) + '</label>' + control +
+      '<span class="ayuda" id="bd-a-' + nombre + '">' + esc(ayuda || '') + '</span></div>';
+  }
+  function inp(nombre, valor, extra) {
+    return '<input id="bd-f-' + nombre + '" name="' + nombre + '" value="' + esc(valor === null || valor === undefined ? '' : valor) + '"' + (extra || '') + '>';
+  }
+  /**
+   * Ficha del cliente. origen 'venta': alta desde el formulario de venta (la nueva ficha queda elegida).
+   * tipoInicial y previo (datos sugeridos) para altas desde otras pantallas (por ejemplo, «Crear ficha» de un servicio).
+   */
+  function modalCliente(codigo, origen, tipoInicial, previo) {
+    if (!hayBase()) { toast('La base de clientes todavía no está instalada en el servidor.', 'error'); return; }
+    var c = codigo ? cliente(codigo) : null;
+    if (codigo && !c) { toast('No se encontró el cliente ' + codigo + '.', 'error'); return; }
+    var admin = esAdmin();
+    var p = previo || {};
+    var tipo = c ? (c.tipo || '') : (tipoInicial || 'PELUQUERÍA');
+    var hoja = c ? c.hoja : '';
+    function v(k) { return c ? (c[k] === null || c[k] === undefined ? '' : c[k]) : (p[k] || ''); }
+    var tipos = origen === 'venta' ? ['PELUQUERÍA', 'OTRO'] : TIPOS;
+    var cats = ((S.datos.cartera && S.datos.cartera.categorias) || []).map(function (x) { return x.nombre; });
+    var catActual = c ? (c.categoria || 'SIN CATEGORÍA') : 'SIN CATEGORÍA';
+    var cuerpo = '<div class="form-grid">' +
+      fld('tipo', 'Tipo de cliente *', '<select id="bd-f-tipo" name="tipo">' + (c && !c.tipo ? opcion('', 'Sin tipo: elegir', true) : '') +
+        tipos.map(function (t) { return opcion(t, tipoCorto(t), tipo === t); }).join('') + '</select>', 'c-4',
+        c ? (hoja === 'clientasSalon' ? 'Ficha de «Clientas salón» (' + c.codigo + ').' : 'Ficha de «Peluquerías» (' + c.codigo + ').') : 'Clienta del salón → «Clientas salón» (CS-); el resto → «Peluquerías» (C-).') +
+      fld('nombre', 'Nombre comercial *', inp('nombre', v('nombre'), ' maxlength="100"'), 'c-8') +
+      fld('razonSocial', 'Razón social', inp('razonSocial', v('razonSocial'), ' maxlength="150"'), 'c-6') +
+      fld('contacto', 'Contacto principal', inp('contacto', v('contacto'), ' maxlength="80" placeholder="Nombre de la propietaria o encargada"'), 'c-6') +
+      fld('ruc', 'RUC', inp('ruc', v('ruc'), ' maxlength="20" placeholder="1234567-8"'), 'c-4', 'Con dígito verificador, sin puntos.') +
+      fld('ci', 'CI', inp('ci', v('ci'), ' maxlength="15" inputmode="numeric"'), 'c-4', 'Solo números (si no tiene RUC).') +
+      fld('celular', 'Celular', inp('celular', v('celular'), ' maxlength="40" inputmode="tel" placeholder="0981 123 456"'), 'c-4') +
+      fld('telefono', 'Teléfono (otro)', inp('telefono', v('telefono'), ' maxlength="40" inputmode="tel"'), 'c-4') +
+      fld('correo', 'Correo', inp('correo', v('correo'), ' maxlength="120" inputmode="email" type="email"'), 'c-4', 'Para enviarle el KuDE (factura electrónica).') +
+      fld('ciudad', 'Ciudad', inp('ciudad', v('ciudad'), ' maxlength="60"'), 'c-4') +
+      fld('direccion', 'Dirección', inp('direccion', v('direccion'), ' maxlength="150"'), 'c-8') +
+      fld('zona', 'Zona', '<select id="bd-f-zona" name="zona">' + opcion('', '—', !v('zona')) + (((D().listas && D().listas.zonas) || ['ASUNCIÓN', 'GRAN ASUNCIÓN', 'INTERIOR']).map(function (z) { return opcion(z, z, v('zona') === z); }).join('')) + '</select>', 'c-4') +
+      (admin ? fld('categoria', 'Categoría de crédito', '<select id="bd-f-categoria" name="categoria">' + cats.concat(['SIN CATEGORÍA']).map(function (n) { return opcion(n, n, n === catActual); }).join('') + '</select>', 'c-4',
+        'Define límite, entrega mínima, cuotas y frecuencia.')
+        : fld('categoria-ver', 'Categoría de crédito', '<input readonly value="' + esc(catActual) + '">', 'c-4', 'La asigna una administradora.')) +
+      fld('alias', 'Alias (otros nombres con los que figura)', inp('alias', v('alias'), ' maxlength="300" placeholder="Separados por punto y coma"'), 'c-8') +
+      '<div class="campo c-12"><label for="bd-f-observacion">Observación</label><textarea id="bd-f-observacion" name="observacion" maxlength="600">' + esc(v('observacion')) + '</textarea></div>' +
+      (c ? '<div class="c-12"><label class="check"><input type="checkbox" name="activo"' + (c.activo ? ' checked' : '') + '> Activa (desmarque para ocultarla sin borrar su historial)</label></div>' : '') +
+      '<div class="c-12"><p class="ficha" id="bd-prev" aria-live="polite"></p></div></div>';
+    abrirModal({
+      titulo: c ? 'Editar · ' + c.nombre : (origen === 'venta' ? 'Nuevo cliente para la venta' : 'Nuevo cliente'), cuerpo: cuerpo, ancho: true,
+      aceptar: c ? 'Guardar cambios' : 'Registrar cliente',
+      alCambiar: function (form) { refrescarFicha(form, c); },
+      alAceptar: function (f, id) {
+        requerir(f.nombre, 'Complete el nombre.');
+        var datos = { codigoOriginal: c ? c.codigo : '', tipo: f.tipo, nombre: f.nombre, razonSocial: f.razonSocial, contacto: f.contacto, ruc: f.ruc, ci: f.ci,
+          celular: f.celular, telefono: f.telefono, correo: f.correo, ciudad: f.ciudad, direccion: f.direccion, zona: f.zona, alias: f.alias, observacion: f.observacion };
+        if (c) datos.activo = f.activo;
+        if (admin) datos.categoria = f.categoria;
+        if (!c) {
+          var falt = faltantesUI(datos, '');
+          requerir(!falt.length, 'Faltan datos obligatorios: ' + falt.join(', ') + '.');
+        }
+        return api('guardarCliente', datos, id).then(function (r) {
+          if (origen === 'venta' && r.codigo && S.venta) S.venta.cliente = r.codigo;
+          return r;
+        });
+      },
+    });
+  }
+  function refrescarFicha(form, c) {
+    var e = form.elements;
+    var tipo = e.tipo.value;
+    var hoja = c ? c.hoja : (tipo === 'CLIENTA DEL SALÓN' ? 'clientasSalon' : 'peluquerias');
+    var efectivo = tipo || (hoja === 'clientasSalon' ? 'CLIENTA DEL SALÓN' : 'PELUQUERÍA');
+    var req = (efectivo === 'CLIENTA DEL SALÓN' ? REQ.SALON : REQ.EMPRESA).map(function (r) { return r[0]; });
+    ['nombre', 'razonSocial', 'contacto', 'ruc', 'celular', 'ciudad', 'direccion'].forEach(function (k) {
+      var l = $('#bd-l-' + k);
+      if (!l) return;
+      var base = k === 'nombre' ? (efectivo === 'CLIENTA DEL SALÓN' ? 'Nombre' : 'Nombre comercial') : l.getAttribute('data-etq').replace(/ \*$/, '');
+      l.textContent = base + (req.indexOf(k) >= 0 ? ' *' : '');
+    });
+    var cel = e.celular.value.trim();
+    var wa = MB.whatsappDe(cel || e.telefono.value);
+    $('#bd-a-celular').textContent = !cel && !wa ? 'Celular para WhatsApp (595…).' : (wa ? 'WhatsApp: +' + wa : 'No es un celular válido (ej.: 0981 123 456).');
+    var ruc = e.ruc.value.trim();
+    $('#bd-a-ruc').textContent = !ruc ? (efectivo === 'CLIENTA DEL SALÓN' ? 'Solo si pide factura.' : 'Con dígito verificador, sin puntos.') :
+      (rucValido(ruc) ? 'RUC válido.' : 'Revise el formato (1234567-8) y el dígito verificador.');
+    var d = {};
+    ['tipo', 'nombre', 'razonSocial', 'contacto', 'ruc', 'ci', 'celular', 'telefono', 'ciudad', 'direccion'].forEach(function (k) { d[k] = e[k] ? e[k].value : ''; });
+    var falt = faltantesUI(d, hoja);
+    var prev = $('#bd-prev');
+    if (!falt.length) { prev.textContent = 'Con estos datos la ficha queda COMPLETA.'; return; }
+    prev.textContent = c ? 'Se puede guardar, pero quedará INCOMPLETA (no compra a crédito): falta ' + falt.join(', ') + '.' :
+      'Para registrarla falta: ' + falt.join(', ') + '.';
+  }
+
+  // ═════════════ Historial del cliente (R1.1 / R1.6) ═════════════
+  function modalHistorial(codigo) {
+    api('obtenerClientes', { codigo: codigo }).then(function (r) {
+      var c = r.cliente, t = r.totales, admin = esAdmin();
+      var dl = '<dl class="dl">' +
+        '<dt>Código</dt><dd>' + esc(c.codigo) + (c.legado ? ' · legado ' + esc(c.legado) : '') + ' · ' + esc(tipoCorto(c.tipo)) + '</dd>' +
+        '<dt>Datos</dt><dd>' + badgeCompletitud(c) + chipsFaltan(c.faltantes) + '</dd>' +
+        (c.razonSocial ? '<dt>Razón social</dt><dd>' + esc(c.razonSocial) + '</dd>' : '') +
+        '<dt>RUC / CI</dt><dd>' + esc(c.ruc || '—') + (c.ci ? ' · CI ' + esc(c.ci) : '') + '</dd>' +
+        '<dt>Contacto</dt><dd>' + esc(c.contacto || '—') + (c.whatsapp ? ' · <a href="https://wa.me/' + esc(c.whatsapp) + '" target="_blank" rel="noopener">+' + esc(c.whatsapp) + '</a>' : '') +
+        (c.correo ? ' · ' + esc(c.correo) : '') + '</dd>' +
+        '<dt>Dirección</dt><dd>' + esc([c.direccion, c.ciudad, c.zona].filter(Boolean).join(' · ') || '—') + '</dd>' +
+        '<dt>Crédito</dt><dd>' + esc(c.categoria || 'Sin categoría') + (c.estadoCredito ? ' · ' + esc(minus(c.estadoCredito)) : '') + (c.saldo ? ' · saldo ' + gs(c.saldo) : '') + '</dd>' +
+        (c.alias ? '<dt>Alias</dt><dd>' + esc(c.alias) + '</dd>' : '') +
+        (c.observacion ? '<dt>Observación</dt><dd>' + esc(c.observacion) + '</dd>' : '') + '</dl>';
+      var kp = '<div class="kpis kpis-4 bd-kpis-modal">' + kpi('Compras', gs(t.ventas), plural(t.nVentas, 'venta', 'ventas') + (t.historicas ? ' (' + t.historicas + ' históricas)' : '')) +
+        kpi('Última compra', t.ultimaCompra ? fecha(t.ultimaCompra) : '—', '') + kpi('Servicios del salón', gs(t.servicios), plural(t.nServicios, 'servicio', 'servicios')) +
+        kpi('Último servicio', t.ultimoServicio ? fecha(t.ultimoServicio) : '—', '') + '</div>';
+      var ventas = tabla(['N° venta', 'Fecha', 'Condición', ['Total', 'num'], 'Estado'], r.ventas.slice(0, 150).map(function (v) {
+        return '<tr class="' + (v.estado === 'Anulada' ? 'fila-anulada' : '') + '"><td class="cod">' + esc(v.id) + (v.origen === 'HISTÓRICO' ? ' ' + badge('Histórica', 'neutro') : '') + '</td><td>' + fecha(v.fecha) +
+          '</td><td>' + esc(v.condicion) + (v.nroCredito ? '<div class="det">' + esc(v.nroCredito) + '</div>' : '') + '<div class="det">' +
+          esc(v.items.map(function (i) { return i.cantidad + ' × ' + i.producto; }).join(' · ')) + '</div></td><td class="num">' + gs(v.total) + '</td><td>' + MB.estadoVenta(v.estado) + '</td></tr>';
+      }), 'Sin compras registradas.');
+      var servicios = tabla(['N°', 'Fecha', 'Servicio', ['Precio', 'num'], 'Profesional'], r.servicios.slice(0, 150).map(function (s) {
+        return '<tr class="' + (s.estado === 'Anulado' ? 'fila-anulada' : '') + '"><td class="cod">' + esc(s.id) + (s.origen === 'HISTÓRICO' ? ' ' + badge('Histórico', 'neutro') : '') + '</td><td>' + fecha(s.fecha) +
+          '</td><td>' + esc(s.servicio) + (s.textoCliente && s.textoCliente !== c.nombre ? '<div class="det">cargado como «' + esc(s.textoCliente) + '»</div>' : '') + '</td><td class="num">' + gs(s.precio) +
+          (admin && s.comision !== undefined ? '<div class="det">comisión ' + gs(s.comision) + '</div>' : '') + '</td><td>' + esc(s.profesional || '—') + '</td></tr>';
+      }), 'Sin servicios vinculados.');
+      var importados = admin && r.importados.length ? '<p class="eyebrow mt-l">En la bandeja de importación (sin aprobar)</p>' + tabla(['Fila', 'Fecha', 'Ítem', ['Monto', 'num'], 'Estado'], r.importados.map(function (x) {
+        return '<tr><td class="cod">' + esc(x.id) + '<div class="det">' + esc(x.lote) + '</div></td><td>' + fecha(x.fecha) + '</td><td>' + esc(x.item) + '</td><td class="num">' + (x.monto === '' ? '—' : gs(x.monto)) +
+          '</td><td>' + badge(x.estado, ESTADOS_IMP[x.estado] || 'neutro') + '</td></tr>';
+      }), '') : '';
+      abrirModal({
+        titulo: c.nombre, ancho: true, soloCerrar: true,
+        cuerpo: dl + kp + '<div class="chips">' + boton('Editar la ficha', 'bd-editar', attr('codigo', c.codigo), 'btn btn-sec') +
+          (hayCartera() ? boton('Estado de cuenta', 'ficha', attr('codigo', c.codigo), 'btn btn-sec') : '') + '</div>' +
+          '<p class="eyebrow mt-l">Compras</p><div class="mt">' + ventas + '</div><p class="eyebrow mt-l">Servicios del salón</p><div class="mt">' + servicios + '</div>' + importados,
+      });
+    }).catch(fallo);
+  }
+
+  // ═════════════ Unificar variantes y vincular servicios (R1.5, solo administradoras) ═════════════
+  function vUnificar() {
+    var k = K(), grupos = k.unificaciones || [], sc = k.serviciosSinCliente || { porTexto: [], exactos: 0, conNombre: 0, sinNombre: 0 };
+    var html = '<section class="panel"><div class="panel-cab"><h2>Posibles variantes de una misma clienta</h2></div>' +
+      '<p class="ayuda">Propuestas por nombre parecido (mayúsculas, tildes, una letra de diferencia o un nombre que es el comienzo de otro). Nada se fusiona solo: ' +
+      'elija la ficha principal (●), deje marcadas (☑) las que son la misma persona y pulse «Unificar». Las otras pasan a inactivas con la marca de unificación, sus servicios ' +
+      'pasan a la principal y su nombre queda como alias. Si no son la misma persona, «Son personas distintas» y no se vuelven a proponer.</p>';
+    if (!grupos.length) html += '<div class="vacio">No hay propuestas pendientes.</div>';
+    grupos.forEach(function (g, i) {
+      html += '<div class="bd-grupo"><div class="bd-grupo-cab"><p class="fuerte">' + esc(g.miembros.map(function (m) { return m.nombre; }).join(' / ')) + '</p><p class="det">' +
+        esc(g.motivo) + ' · ' + (g.hoja === 'clientasSalon' ? 'Clientas salón' : 'Peluquerías') + '</p></div>' +
+        g.miembros.map(function (m) {
+          return '<div class="bd-miembro"><input type="radio" name="bd-principal-' + i + '" value="' + esc(m.codigo) + '"' + (m.codigo === g.principal ? ' checked' : '') + ' aria-label="Ficha principal de ' + esc(m.nombre) + '">' +
+            '<input type="checkbox" data-incluir-grupo="' + i + '" value="' + esc(m.codigo) + '" checked aria-label="Incluir ' + esc(m.nombre) + '">' +
+            '<div><span class="fuerte">' + esc(m.nombre) + '</span> <span class="det">' + esc(m.codigo) + ' · ' + plural(m.servicios || 0, 'servicio', 'servicios') + (m.legado ? ' · legado ' + esc(m.legado) : '') +
+            '</span></div><div class="acciones">' + boton('Historial', 'bd-historial', attr('codigo', m.codigo)) + '</div></div>';
+        }).join('') +
+        '<div class="chips">' + boton('Unificar en la principal', 'bd-unificar', attr('grupo', i), 'btn') + boton('Son personas distintas', 'bd-distintas', attr('grupo', i), 'btn btn-sec') + '</div></div>';
+    });
+    html += '</section>';
+    html += '<section class="panel mt"><div class="panel-cab"><h2>Servicios realizados sin cliente vinculado</h2>' +
+      (sc.exactos ? boton('Vincular coincidencias exactas (' + miles(sc.exactos) + ')', 'bd-vincular-exactos', '', 'btn') : '') + '</div>' +
+      '<p class="ayuda">«Código cliente» se completa solo si el nombre escrito coincide exactamente con una ficha (o un alias), o si una administradora lo aprueba aquí. ' +
+      'Los nombres que no tienen ficha se pasan a la base con Sistema › Migración (quedan INCOMPLETA) o con «Crear ficha».</p>';
+    if (!sc.porTexto.length && !sc.sinNombre) html += '<div class="vacio">Todos los servicios con nombre tienen su cliente vinculado.</div>';
+    if (sc.porTexto.length) {
+      html += tabla(['Cliente escrito', ['Servicios', 'num'], 'Ficha', ''], sc.porTexto.map(function (p) {
+        return '<tr><td class="fuerte">' + esc(p.texto) + '</td><td class="num">' + miles(p.n) + '</td><td>' +
+          (p.destino ? esc(p.destino) + ' <span class="det">' + esc(p.nombreDestino) + ' (coincide exacto)</span>' : (p.ambiguo ? '<span class="det">nombre repetido en la base: vincular a mano</span>' : '<span class="det">sin ficha</span>')) +
+          '</td><td class="acciones">' + (!p.destino && !p.ambiguo ? boton('Crear ficha', 'bd-crear-desde', attr('texto', p.texto)) : '') + '</td></tr>';
+      }), '');
+    }
+    var sueltos = k.serviciosSueltos || [];
+    if (sueltos.length) {
+      var opciones = K().lista.filter(function (c) { return c.activo; }).map(function (c) { return c.codigo + ' · ' + c.nombre; });
+      html += '<p class="eyebrow mt-l">Vincular a mano (aprobado por una administradora)</p>' +
+        '<div class="barra-herr mt"><input list="bd-dl-clientes" placeholder="Cliente: escriba el nombre o el código" value="' + esc(B.vinc.cliente) + '" data-al-escribir="bd-vinc-cliente" autocomplete="off">' +
+        MB.datalist('bd-dl-clientes', opciones) + boton('Vincular los marcados', 'bd-vincular', '', 'btn btn-sec') + boton('Quitar el vínculo', 'bd-desvincular', '', 'btn-link') + '</div>' +
+        '<div class="tabla-cont mt"><table><thead><tr><th class="bd-sel"></th><th>Servicio</th><th>Fecha</th><th>Cliente escrito</th><th class="ocultar-movil">Profesional</th></tr></thead><tbody>' +
+        sueltos.map(function (s) {
+          return '<tr class="' + (s.estado === 'Anulado' ? 'fila-anulada' : '') + '"><td class="bd-sel"><input type="checkbox" data-al-cambiar="bd-vinc-sel" data-id="' + esc(s.id) + '"' + (B.vinc.sel[s.id] ? ' checked' : '') +
+            ' aria-label="Elegir ' + esc(s.id) + '"></td><td><span class="cod">' + esc(s.id) + '</span> ' + esc(s.servicio) + '</td><td>' + fecha(s.fecha) + '</td><td>' + esc(s.cliente || '(vacío)') +
+            '</td><td class="ocultar-movil">' + esc(s.profesional || '—') + '</td></tr>';
+        }).join('') + '</tbody></table></div>';
+    }
+    return html + '</section>';
+  }
+  function resolverGrupo(el, accion) {
+    var i = el.getAttribute('data-grupo');
+    var g = (K().unificaciones || [])[Number(i)];
+    if (!g) return;
+    var incluidos = Array.prototype.map.call(document.querySelectorAll('input[data-incluir-grupo="' + i + '"]:checked'), function (x) { return x.value; });
+    if (accion === 'distintas') {
+      if (incluidos.length < 2) { toast('Marque al menos dos fichas.', 'aviso'); return; }
+      conBoton(el, 'Guardando…', function () { return api('resolverUnificacion', { accion: 'distintas', miembros: incluidos }, 'dist-' + g.clave); }).then(MB.aplicar).catch(fallo);
+      return;
+    }
+    var radio = document.querySelector('input[name="bd-principal-' + i + '"]:checked');
+    var principal = radio ? radio.value : g.principal;
+    var variantes = incluidos.filter(function (c) { return c !== principal; });
+    if (!variantes.length) { toast('Marque al menos una ficha además de la principal.', 'aviso'); return; }
+    var pm = g.miembros.filter(function (m) { return m.codigo === principal; })[0];
+    MB.confirmar({
+      titulo: 'Unificar fichas', aceptar: 'Unificar',
+      mensaje: 'Se conserva ' + esc(principal) + ' «' + esc(pm ? pm.nombre : '') + '». ' + esc(variantes.join(', ')) + ' quedan inactivas (no se borran), sus servicios pasan a la principal y su nombre queda como alias.',
+    }).then(function (si) {
+      if (!si) return;
+      api('resolverUnificacion', { accion: 'unificar', principal: principal, variantes: variantes }, 'unif-' + g.clave + '-' + principal).then(MB.aplicar).catch(fallo);
+    });
+  }
+  function vincularMarcados(el, quitar) {
+    var ids = Object.keys(B.vinc.sel).filter(function (k) { return B.vinc.sel[k]; });
+    if (!ids.length) { toast('Marque los servicios.', 'aviso'); return; }
+    var codigo = '';
+    if (!quitar) {
+      codigo = String(B.vinc.cliente || '').split(' · ')[0].trim().toUpperCase();
+      if (!cliente(codigo)) { toast('Elija el cliente de la lista (código · nombre).', 'aviso'); return; }
+    }
+    conBoton(el, 'Guardando…', function () { return api('vincularClienteServicio', { ids: ids, codigo: codigo }, 'vinc-' + uid()); }).then(function (r) {
+      B.vinc.sel = {};
+      MB.aplicar(r);
+    }).catch(fallo);
+  }
+
+  // ═════════════ Importación del historial (R1.6, solo administradoras) ═════════════
+  var TITULOS_PLANTILLA = ['Fecha', 'Cliente', 'Código cliente', 'Tipo (PRODUCTO / SERVICIO)', 'Código ítem', 'Ítem', 'Cantidad', 'Monto (Gs.)',
+    'Condición (CONTADO / CRÉDITO)', 'Ubicación en la fuente', 'Confianza (ALTA / MEDIA / BAJA)'];
+  function nEstado(pe, k) { return pe && pe[k] ? (typeof pe[k] === 'object' ? pe[k].n : pe[k]) : 0; }
+  function mEstado(pe, k) { return pe && pe[k] && typeof pe[k] === 'object' ? pe[k].monto : 0; }
+  function vImportacion() {
+    var I = B.imp, res = K().importacion || { lotes: [], porEstado: {} };
+    var html = '<section class="panel"><div class="panel-cab"><h2>1 · Cargar la fuente</h2>' + boton('Plantilla vacía (CSV)', 'bd-plantilla', '', 'btn btn-sec') + '</div>' +
+      '<ol class="bd-pasos"><li>Use la plantilla o pegue las filas copiadas de la planilla, con su fila de títulos (' + esc(TITULOS_PLANTILLA.slice(0, 9).join(' · ')) + '). ' +
+      'Las columnas que el sistema no reconoce (Profesional, Nota…) se guardan en «Dato original».</li>' +
+      '<li>Genere la vista previa: no se escribe nada. Lo ya cargado en Ventas o Servicios realizados aparece como DUPLICADO; lo ilegible o sin coincidencia, como REVISAR.</li>' +
+      '<li>Confirme la carga: las filas entran a la bandeja. Nada pasa a Ventas sin su aprobación (paso 2). Reimportar el mismo archivo no duplica nada.</li></ol>' +
+      '<div class="form-grid mt">' +
+      '<div class="campo c-6"><label for="bd-imp-fuente">Fuente *</label><input id="bd-imp-fuente" maxlength="150" placeholder="Ej.: planilla de ventas de la asistente (hasta 25/09)" value="' + esc(I.fuente) +
+      '" data-al-escribir="bd-imp-campo" data-k="fuente"></div>' +
+      '<div class="campo c-3"><label for="bd-imp-ref">Referencia</label><input id="bd-imp-ref" maxlength="300" placeholder="Archivo, hoja o página" value="' + esc(I.referencia) +
+      '" data-al-escribir="bd-imp-campo" data-k="referencia"></div>' +
+      '<div class="campo c-3"><label for="bd-imp-total">Total según la fuente (Gs.)</label><input id="bd-imp-total" data-tipo="gs" inputmode="numeric" value="' + esc(I.total) +
+      '" data-al-escribir="bd-imp-campo" data-k="total"><span class="ayuda">Para conciliar los totales.</span></div>' +
+      '<div class="campo c-6"><label for="bd-imp-csv">Archivo .csv (opcional)</label><input id="bd-imp-csv" type="file" accept=".csv,.txt,text/csv,text/plain" data-al-cambiar="bd-imp-csv">' +
+      '<span class="ayuda">' + (I.nombreArchivo ? 'Leído: ' + esc(I.nombreArchivo) : 'Desde Excel o Google Sheets: Archivo › Descargar › CSV.') + '</span></div>' +
+      '<div class="campo c-6"><label for="bd-imp-img">Imagen o PDF de la fuente (opcional)</label><input id="bd-imp-img" type="file" accept="image/*,.pdf,application/pdf" data-al-cambiar="bd-imp-img">' +
+      '<span class="ayuda">' + (I.archivo && !/csv|text/.test(I.archivo.tipo) ? 'Se guardará: ' + esc(I.archivo.nombre) : 'Se guarda en «Distribuidora MB/Importaciones» como referencia (máx. 10 MB).') + '</span></div>' +
+      '<div class="campo c-12"><label for="bd-imp-texto">Filas (pegue aquí, con la fila de títulos)</label><textarea id="bd-imp-texto" class="bd-pegar" data-al-escribir="bd-imp-texto" spellcheck="false">' +
+      esc(I.texto) + '</textarea></div></div>' +
+      '<div class="chips">' + boton('Vista previa', 'bd-imp-vista', '', 'btn') + (I.vista ? boton('Descartar la vista previa', 'bd-imp-limpiar', '', 'btn btn-sec') : '') + '</div>';
+    if (I.vista) html += vistaFuente(I.vista);
+    html += '</section>';
+    html += '<section class="panel mt"><div class="panel-cab"><h2>2 · Bandeja «Importación · Historial»</h2>' + boton('Actualizar', 'bd-imp-ver', attr('lote', I.lote || ''), 'btn-link') + '</div>';
+    if (!res.lotes.length) return html + '<div class="vacio">Todavía no se cargó ningún lote. La planilla de la asistente y las imágenes de los registros manuales se cargan aquí cuando estén disponibles.</div></section>';
+    html += tabla(['Lote', 'Fuente', ['Filas', 'num'], 'Estados', ['Total leído', 'num'], ['Fuente', 'num ocultar-movil'], ''], res.lotes.map(function (l) {
+      var pe = l.porEstado;
+      var dif = l.diferencia === null || l.diferencia === undefined ? '' : (l.diferencia === 0 ? badge('Cuadra', 'ok') : '<span class="negativo">dif. ' + gs(l.diferencia) + '</span>');
+      return '<tr><td class="cod">' + esc(l.lote) + '<div class="det">' + esc(String(l.fecha || '').slice(0, 10).split('-').reverse().join('/')) + '</div></td><td>' + esc(l.fuente || '—') +
+        (l.referencia ? '<div class="det">' + (/^https:/.test(l.referencia) ? '<a href="' + esc(l.referencia) + '" target="_blank" rel="noopener">Ver referencia</a>' : esc(l.referencia)) + '</div>' : '') +
+        '</td><td class="num">' + miles(l.filas) + '</td><td>' + ['LISTO', 'REVISAR', 'DUPLICADO', 'APROBADO', 'RECHAZADO'].filter(function (k) { return nEstado(pe, k); }).map(function (k) {
+          return badge(k.charAt(0) + k.slice(1).toLowerCase() + ' ' + nEstado(pe, k), ESTADOS_IMP[k]);
+        }).join(' ') + '</td><td class="num">' + gs(l.monto) + '</td><td class="num ocultar-movil">' + (l.totalFuente === null || l.totalFuente === undefined ? '—' : gs(l.totalFuente)) +
+        '<div class="det">' + dif + '</div></td><td class="acciones">' + boton('Ver filas', 'bd-imp-ver', attr('lote', l.lote)) +
+        (nEstado(pe, 'LISTO') ? boton('Aprobar LISTO', 'bd-imp-aprobar', attr('lote', l.lote)) : '') + '</td></tr>';
+    }), '');
+    if (I.filas) html += bandejaFilas();
+    return html + '</section>';
+  }
+  function vistaFuente(v) {
+    var r = v.resumen, pe = r.porEstado;
+    var html = '<div class="separador"></div><p class="eyebrow">Vista previa (no se escribió nada)</p>' +
+      '<div class="kpis kpis-4 mt">' + kpi('Filas nuevas', miles(r.nuevas), plural(r.leidas, 'fila leída', 'filas leídas') + (r.yaEnBandeja ? ' · ' + r.yaEnBandeja + ' ya estaban en la bandeja' : '')) +
+      kpi('Listas', miles(nEstado(pe, 'LISTO')), gs(mEstado(pe, 'LISTO'))) + kpi('A revisar', miles(nEstado(pe, 'REVISAR')), gs(mEstado(pe, 'REVISAR')), nEstado(pe, 'REVISAR') ? 'alerta' : '') +
+      kpi('Duplicadas', miles(nEstado(pe, 'DUPLICADO')), 'ya cargadas en Ventas o Servicios realizados') + '</div>' +
+      '<p class="ficha mt">Total leído ' + gs(r.montoLeido) + (r.totalFuente !== null && r.totalFuente !== undefined ? ' · total de la fuente ' + gs(r.totalFuente) + ' · diferencia ' + gs(r.diferencia) +
+        (r.diferencia ? ' (revise filas faltantes o montos ilegibles antes de confirmar)' : ' (cuadra)') : ' · sin total de la fuente para conciliar') + '. Columnas reconocidas: ' + esc(v.reconocidas.join(', ')) + '.</p>';
+    html += '<div class="mt">' + tabla(['Ubicación', 'Fecha', 'Cliente', 'Ítem', ['Cant.', 'num'], ['Monto', 'num'], 'Estado'], v.filas.map(function (f) {
+      return '<tr><td class="cod">' + esc(f.ubicacion) + '</td><td>' + (f.fecha ? fecha(f.fecha) : '—') + '</td><td>' + esc(f.cliente || '—') + (f.codigoCliente ? '<div class="det">' + esc(f.codigoCliente) + '</div>' : '') +
+        '</td><td>' + esc(f.item || '—') + (f.codigoItem ? '<div class="det">' + esc(f.codigoItem) + ' · ' + esc(minus(f.tipoItem)) + '</div>' : '') + '</td><td class="num">' + esc(f.cantidad === '' || f.cantidad === undefined ? '—' : f.cantidad) +
+        '</td><td class="num">' + (f.monto === '' || f.monto === undefined ? '—' : gs(f.monto)) + '</td><td>' + badge(f.estado, ESTADOS_IMP[f.estado] || 'neutro') +
+        (f.motivo ? '<div class="det">' + esc(f.motivo) + '</div>' : '') + '</td></tr>';
+    }), 'Sin filas.') + (v.filas.length < r.leidas ? '<p class="det mt">Se muestran las primeras ' + v.filas.length + ' de ' + miles(r.leidas) + '.</p>' : '') + '</div>';
+    return html + '<div class="form-acciones">' + boton('Confirmar la carga (' + plural(r.nuevas, 'fila nueva', 'filas nuevas') + ')', 'bd-imp-confirmar', r.nuevas ? '' : ' disabled', 'btn') + '</div>';
+  }
+  function bandejaFilas() {
+    var I = B.imp;
+    var datosLista = K().lista.filter(function (c) { return c.activo; }).map(function (c) { return c.codigo + ' · ' + c.nombre; });
+    var html = '<div class="separador"></div><div class="barra-herr"><p class="eyebrow">Filas ' + (I.lote ? 'del lote ' + esc(I.lote) : 'de todos los lotes') + ' (' + miles(I.nFilas || 0) + ')</p>' +
+      '<div style="min-width:170px"><select data-al-cambiar="bd-imp-filtro" data-k="estado" aria-label="Filtrar por estado">' +
+      [['', 'Todos los estados'], ['REVISAR', 'A revisar'], ['LISTO', 'Listas'], ['DUPLICADO', 'Duplicadas'], ['APROBADO', 'Aprobadas'], ['RECHAZADO', 'Rechazadas']]
+        .map(function (o) { return opcion(o[0], o[1], I.estado === o[0]); }).join('') + '</select></div></div>' +
+      '<div class="barra-herr"><input list="bd-dl-clientes-imp" placeholder="Cliente para los marcados (código · nombre)" data-al-escribir="bd-imp-campo" data-k="clienteSel" value="' + esc(I.clienteSel || '') + '">' +
+      MB.datalist('bd-dl-clientes-imp', datosLista) +
+      '<div style="min-width:150px"><select data-al-cambiar="bd-imp-filtro" data-k="condicionSel" aria-label="Condición para los marcados">' +
+      [['', 'Condición…'], ['CONTADO', 'Contado'], ['CRÉDITO', 'Crédito']].map(function (o) { return opcion(o[0], o[1], (I.condicionSel || '') === o[0]); }).join('') + '</select></div>' +
+      boton('Aplicar a los marcados', 'bd-imp-aplicar-sel', '', 'btn btn-sec') + boton('Rechazar los marcados', 'bd-imp-rechazar-sel', '', 'btn-link') + '</div>';
+    html += '<div class="tabla-cont"><table><thead><tr><th class="bd-sel"></th><th>Fila</th><th>Fecha</th><th>Cliente</th><th>Ítem</th><th class="num">Monto</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      (I.filas.length ? I.filas.map(function (x) {
+        var editable = x.estado !== 'APROBADO';
+        return '<tr class="' + (x.estado === 'RECHAZADO' ? 'fila-anulada' : '') + '"><td class="bd-sel">' + (editable ? '<input type="checkbox" data-al-cambiar="bd-imp-sel" data-id="' + esc(x.id) + '"' +
+          (I.sel[x.id] ? ' checked' : '') + ' aria-label="Marcar ' + esc(x.id) + '">' : '') + '</td><td class="cod">' + esc(x.id) + '<div class="det">' + esc(x.ubicacion || '') + '</div></td><td>' +
+          (x.fecha ? fecha(x.fecha) : '—') + '</td><td>' + esc(x.cliente || '—') + (x.codigoCliente ? '<div class="det">' + esc(x.codigoCliente) + '</div>' : '') + '</td><td>' + esc(x.item || '—') +
+          '<div class="det">' + esc([x.codigoItem, minus(x.tipoItem), x.cantidad ? '× ' + x.cantidad : '', minus(x.condicion)].filter(String).join(' · ')) + '</div>' + (x.original ? '<details class="bd-original"><summary>Dato original</summary>' + esc(x.original) + '</details>' : '') +
+          '</td><td class="num">' + (x.monto === '' ? '—' : gs(x.monto)) + '</td><td>' + badge(x.estado, ESTADOS_IMP[x.estado] || 'neutro') + ' <span class="det">' + esc(minus(x.confianza)) + '</span>' +
+          (x.motivo ? '<div class="det">' + esc(x.motivo) + '</div>' : '') + (x.ventaHistorica ? '<div class="det">→ ' + esc(x.ventaHistorica) + '</div>' : '') + '</td><td class="acciones">' +
+          (editable && x.estado !== 'RECHAZADO' ? boton('Corregir', 'bd-imp-editar', attr('id', x.id)) : '') +
+          (x.estado === 'REVISAR' && /dudoso en la fuente/i.test(x.motivo) ? boton('Confirmar lectura', 'bd-imp-confirmar-lectura', attr('id', x.id)) : '') +
+          (editable && x.estado !== 'RECHAZADO' ? boton('Rechazar', 'bd-imp-rechazar', attr('id', x.id)) : '') +
+          (x.estado === 'RECHAZADO' ? boton('Reabrir', 'bd-imp-reabrir', attr('id', x.id)) : '') + '</td></tr>';
+      }).join('') : '<tr><td colspan="8"><div class="vacio">Sin filas con ese filtro.</div></td></tr>') + '</tbody></table></div>' +
+      (I.nFilas > I.filas.length ? '<p class="det mt">Se muestran ' + I.filas.length + ' de ' + miles(I.nFilas) + ': filtre por estado.</p>' : '');
+    return html;
+  }
+  function cargarBandeja(lote) {
+    var I = B.imp;
+    if (lote !== undefined) I.lote = lote;
+    return api('obtenerImportacion', { lote: I.lote, estado: I.estado }).then(function (r) {
+      I.filas = r.filas;
+      I.nFilas = r.total;
+      I.sel = {};
+      if (S.datos && S.datos.clientes) S.datos.clientes.importacion = r.resumen;
+      render();
+    }).catch(fallo);
+  }
+  function leerArchivo(file, comoTexto, codificacion) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(new Error('No se pudo leer el archivo.')); };
+      if (comoTexto) fr.readAsText(file, codificacion || 'UTF-8'); else fr.readAsDataURL(file);
+    });
+  }
+  function leerCsv(el) {
+    var file = el.files && el.files[0];
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) { toast('El archivo supera los 10 MB: divídalo en partes.', 'error'); return; }
+    var I = B.imp;
+    leerArchivo(file, true, 'UTF-8').then(function (texto) {
+      // Excel en español suele guardar el CSV en Windows-1252: si hay caracteres rotos, se vuelve a leer así.
+      return /\uFFFD/.test(texto) ? leerArchivo(file, true, 'windows-1252') : texto;
+    }).then(function (texto) {
+      I.texto = texto;
+      I.nombreArchivo = file.name;
+      I.vista = null;
+      if (!I.referencia) I.referencia = file.name;
+      return leerArchivo(file, false).then(function (url) {
+        if (!I.archivo || /csv|text/.test(I.archivo.tipo)) I.archivo = { nombre: file.name, tipo: 'text/csv', base64: String(url).split(',')[1] || '' };
+        render();
+      });
+    }).catch(fallo);
+  }
+  function leerReferencia(el) {
+    var file = el.files && el.files[0];
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) { toast('El archivo supera los 10 MB: súbalo a Drive y pegue el enlace en «Referencia».', 'error'); return; }
+    leerArchivo(file, false).then(function (url) {
+      B.imp.archivo = { nombre: file.name, tipo: file.type || 'application/octet-stream', base64: String(url).split(',')[1] || '' };
+      if (!B.imp.referencia) B.imp.referencia = file.name;
+      render();
+    }).catch(fallo);
+  }
+  function totalFuente() { var n = enteroDe(B.imp.total); return isNaN(n) ? '' : n; }
+  function vistaImportacion(el) {
+    var I = B.imp;
+    if (!String(I.texto || '').trim()) { toast('Pegue las filas o elija un archivo .csv.', 'aviso'); return; }
+    conBoton(el, 'Leyendo…', function () { return api('vistaPreviaImportacion', { texto: I.texto, totalFuente: totalFuente() }); }).then(function (r) {
+      I.vista = r.vista;
+      render();
+    }).catch(fallo);
+  }
+  function confirmarImportacion(el) {
+    var I = B.imp;
+    if (!I.vista) return;
+    if (!String(I.fuente || '').trim()) { toast('Complete «Fuente» (de dónde salen estas filas).', 'aviso'); return; }
+    conBoton(el, 'Cargando…', function () {
+      return api('cargarImportacion', { texto: I.texto, fuente: I.fuente, referencia: I.referencia, totalFuente: totalFuente(), archivo: I.archivo || null, confirmado: true, huella: I.vista.huella },
+        'imp-' + I.vista.huella);
+    }).then(function (r) {
+      var lote = r.lote;
+      I.vista = null; I.texto = ''; I.archivo = null; I.nombreArchivo = ''; I.total = ''; I.referencia = ''; I.fuente = '';
+      MB.aplicar(r);
+      if (lote) cargarBandeja(lote);
+    }).catch(function (e) {
+      fallo(e);
+      if (/cambiaron desde la vista previa/.test(e.message)) { I.vista = null; render(); }
+    });
+  }
+  function filaImp(id) { return (B.imp.filas || []).filter(function (x) { return x.id === id; })[0] || null; }
+  function modalFilaImp(id) {
+    var x = filaImp(id);
+    if (!x) return;
+    var clientes = K().lista.filter(function (c) { return c.activo; }).map(function (c) { return c.codigo + ' · ' + c.nombre; });
+    var items = (D().productos || []).map(function (p) { return p.codigo + ' · ' + p.nombre; }).concat((D().servicios || []).map(function (s) { return s.codigo + ' · ' + s.nombre; }));
+    var cuerpo = '<p class="ficha">Dato original: ' + esc(x.original) + '</p>' + (x.motivo ? aviso(x.motivo, x.estado === 'REVISAR' ? '' : 'bien') : '') +
+      '<div class="form-grid mt">' +
+      campo('Fecha', '<input type="date" name="fecha" value="' + esc(x.fecha || '') + '">', 'c-4') +
+      campo('Cliente (código · nombre)', '<input name="codigoCliente" list="bd-dl-cli-f" value="' + esc(x.codigoCliente ? x.codigoCliente + ' · ' + x.cliente : '') + '">' + MB.datalist('bd-dl-cli-f', clientes), 'c-8',
+        x.codigoCliente ? '' : 'Escrito en la fuente: «' + (x.cliente || '—') + '»') +
+      campo('Tipo', '<select name="tipoItem">' + [['', '—'], ['PRODUCTO', 'Producto'], ['SERVICIO', 'Servicio']].map(function (o) { return opcion(o[0], o[1], (x.tipoItem || '') === o[0]); }).join('') + '</select>', 'c-4') +
+      campo('Ítem (código · nombre)', '<input name="codigoItem" list="bd-dl-item-f" value="' + esc(x.codigoItem ? x.codigoItem + ' · ' + x.item : '') + '">' + MB.datalist('bd-dl-item-f', items), 'c-8',
+        x.codigoItem ? '' : 'Escrito en la fuente: «' + (x.item || '—') + '»') +
+      campo('Cantidad', '<input name="cantidad" data-tipo="entero" inputmode="numeric" value="' + esc(x.cantidad || '') + '">', 'c-4') +
+      campo('Monto de la línea (Gs.)', inputGs('monto', x.monto), 'c-4') +
+      campo('Condición', '<select name="condicion">' + [['', '—'], ['CONTADO', 'Contado'], ['CRÉDITO', 'Crédito']].map(function (o) { return opcion(o[0], o[1], (x.condicion || '') === o[0]); }).join('') + '</select>', 'c-4') +
+      '</div><p class="ayuda mt">Al guardar se vuelve a evaluar (LISTO, REVISAR o DUPLICADO). El dato original y la huella no cambian.</p>';
+    abrirModal({
+      titulo: 'Corregir la fila ' + x.id, cuerpo: cuerpo, ancho: true, aceptar: 'Guardar y evaluar',
+      alAceptar: function (f, idSol) {
+        var cambios = {};
+        var cod = String(f.codigoCliente || '').split(' · ')[0].trim().toUpperCase();
+        var item = String(f.codigoItem || '').split(' · ')[0].trim().toUpperCase();
+        if ((f.fecha || '') !== (x.fecha || '')) cambios.fecha = f.fecha;
+        if (cod !== (x.codigoCliente || '')) cambios.codigoCliente = cod;
+        if ((f.tipoItem || '') !== (x.tipoItem || '')) cambios.tipoItem = f.tipoItem;
+        if (item !== (x.codigoItem || '')) cambios.codigoItem = item;
+        if (String(f.cantidad || '') !== String(x.cantidad || '')) cambios.cantidad = f.cantidad;
+        var monto = enteroDe(f.monto);
+        if (!isNaN(monto) && monto !== x.monto) cambios.monto = monto;
+        if ((f.condicion || '') !== (x.condicion || '')) cambios.condicion = f.condicion;
+        requerir(Object.keys(cambios).length, 'No hay cambios para guardar.');
+        return api('editarImportacion', { ids: [x.id], accion: 'editar', cambios: cambios }, idSol).then(function (r) { cargarBandeja(); return r; });
+      },
+    });
+  }
+  function accionFilas(ids, accion, extra) {
+    if (!ids.length) { toast('Marque las filas.', 'aviso'); return Promise.resolve(); }
+    return api('editarImportacion', Object.assign({ ids: ids, accion: accion }, extra || {}), 'impa-' + uid()).then(function (r) { MB.aplicar(r); return cargarBandeja(); }).catch(fallo);
+  }
+  function rechazarFilas(ids) {
+    if (!ids.length) { toast('Marque las filas.', 'aviso'); return; }
+    abrirModal({
+      titulo: ids.length === 1 ? 'Rechazar la fila ' + ids[0] : 'Rechazar ' + ids.length + ' filas', aceptar: 'Rechazar', peligro: true,
+      cuerpo: '<p class="ayuda">Las filas rechazadas no pasan a Ventas (se pueden reabrir).</p>' + campo('Motivo *', '<input name="motivo" maxlength="300">', 'c-12 mt'),
+      alAceptar: function (f, idSol) {
+        requerir(String(f.motivo || '').length >= 3, 'Escriba el motivo del rechazo.');
+        return api('editarImportacion', { ids: ids, accion: 'rechazar', motivo: f.motivo }, idSol).then(function (r) { cargarBandeja(); return r; });
+      },
+    });
+  }
+  function seleccionadas() { return Object.keys(B.imp.sel).filter(function (k) { return B.imp.sel[k]; }); }
+  function aplicarSeleccion() {
+    var I = B.imp, cambios = {};
+    var cod = String(I.clienteSel || '').split(' · ')[0].trim().toUpperCase();
+    if (cod) { if (!cliente(cod)) { toast('Elija el cliente de la lista (código · nombre).', 'aviso'); return; } cambios.codigoCliente = cod; }
+    if (I.condicionSel) cambios.condicion = I.condicionSel;
+    if (!Object.keys(cambios).length) { toast('Elija el cliente o la condición para las filas marcadas.', 'aviso'); return; }
+    accionFilas(seleccionadas(), 'editar', { cambios: cambios });
+  }
+  function htmlPlan(v) {
+    if (!v.ventas.length && !v.servicios.length) return aviso('No hay filas LISTO para aprobar en este lote.' + (v.cambian.length ? ' ' + v.cambian.length + ' cambiaron de estado al evaluarlas de nuevo.' : ''), 'grave');
+    return '<p class="ficha">Se crearán ' + plural(v.ventas.length, 'venta histórica', 'ventas históricas') + ' y ' + plural(v.servicios.length, 'servicio histórico', 'servicios históricos') + ' por ' + gs(v.total) +
+      ', Origen HISTÓRICO' + (v.descontarStock ? ', descontando stock' : ', sin movimiento de stock') + '.' + (v.resto ? ' Quedan ' + v.resto + ' filas para una próxima aprobación (hasta 300 por vez).' : '') + '</p>' +
+      (v.cambian.length ? aviso(plural(v.cambian.length, 'fila cambió', 'filas cambiaron') + ' de estado al evaluarlas con los datos de hoy: no se aprueban.') : '') +
+      '<div class="mt">' + tabla(['N°', 'Fecha', 'Cliente', 'Condición', ['Total', 'num']], v.ventas.map(function (x) {
+        return '<tr><td class="cod">' + esc(x.id) + '</td><td>' + fecha(x.fecha) + '</td><td>' + esc(x.cliente) + '<div class="det">' + esc(x.codigoCliente) + '</div></td><td>' + esc(minus(x.condicion)) +
+          (x.credito ? '<div class="det">concilia con ' + esc(x.credito) + ' (no suma deuda)</div>' : '') + '<div class="det">' + esc(x.lineas.map(function (l) { return l.cantidad + ' × ' + l.item; }).join(' · ')) +
+          '</div></td><td class="num">' + gs(x.total) + '</td></tr>';
+      }).concat(v.servicios.map(function (s) {
+        return '<tr><td class="cod">' + esc(s.id) + '</td><td>' + fecha(s.fecha) + '</td><td>' + esc(s.cliente) + '</td><td>servicio<div class="det">' + esc(s.item) + '</div></td><td class="num">' + gs(s.monto) + '</td></tr>';
+      })), '') + '</div>';
+  }
+  function modalAprobar(lote) {
+    var est = { huella: '', descontar: null };
+    abrirModal({
+      titulo: 'Aprobar el lote ' + lote, ancho: true, aceptar: 'Aprobar y pasar a Ventas',
+      cuerpo: '<p class="ayuda">Solo las filas LISTO. Las ventas aprobadas llevan N° «H-» y Origen HISTÓRICO; una venta a crédito se concilia con el saldo HISTÓRICO de la clienta ' +
+        '(9001–9020) y no se suma aparte. Los servicios quedan sin profesional ni comisión (se pagaron fuera del sistema).</p>' +
+        '<div class="mt"><label class="check"><input type="checkbox" name="descontar"> Descontar stock (decisión explícita de una administradora)</label>' +
+        '<p class="ayuda">Lo habitual es NO: el stock inicial cargado ya refleja estas ventas.</p></div>' +
+        '<div class="campo mt" id="bd-ap-motivo" hidden><label>Motivo para descontar stock *</label><input name="motivoStock" maxlength="200"></div>' +
+        '<div id="bd-ap-plan" class="mt"><p class="ayuda">Calculando el plan de aprobación…</p></div>',
+      alCambiar: function (form) {
+        var d = !!form.elements.descontar.checked;
+        var m = $('#bd-ap-motivo');
+        if (m) m.hidden = !d;
+        if (d === est.descontar) return;
+        est.descontar = d;
+        est.huella = '';
+        var b = $('#modal-aceptar');
+        if (b) b.disabled = true;
+        api('vistaPreviaAprobacion', { lote: lote, descontarStock: d }).then(function (r) {
+          if (est.descontar !== d) return;
+          est.huella = r.vista.huella;
+          var cont = $('#bd-ap-plan');
+          if (cont) cont.innerHTML = htmlPlan(r.vista);
+          var b2 = $('#modal-aceptar');
+          if (b2) b2.disabled = !(r.vista.ventas.length || r.vista.servicios.length);
+        }).catch(function (e) { var cont = $('#bd-ap-plan'); if (cont) cont.innerHTML = aviso(e.message, 'grave'); });
+      },
+      alAceptar: function (f, idSol) {
+        requerir(est.huella, 'Espere el plan de aprobación.');
+        if (f.descontar) requerir(String(f.motivoStock || '').length >= 3, 'Escriba el motivo para descontar stock.');
+        return api('aprobarImportacion', { lote: lote, descontarStock: !!f.descontar, motivoStock: f.motivoStock || '', confirmado: true, huella: est.huella }, idSol).then(function (r) {
+          cargarBandeja(lote);
+          return r;
+        });
+      },
+    });
+  }
+
+  // ═════════════ Avisos en otras pantallas ═════════════
+  /** Venta a crédito: aviso si la clienta elegida está INCOMPLETA (el servidor igual la rechaza). */
+  function avisoVentaIncompleta() {
+    var viejo = $('#bd-v-incompleta');
+    if (viejo) viejo.remove();
+    if (S.vista !== 'ventas' || !S.venta || S.venta.condicion !== 'Crédito' || !hayBase()) return;
+    var sel = $('#v-cliente');
+    if (sel) {
+      Array.prototype.forEach.call(sel.options, function (o) {
+        var c = cliente(o.value);
+        if (c && c.completitud === 'INCOMPLETA' && o.textContent.indexOf('· INCOMPLETA') < 0) o.textContent += ' · INCOMPLETA';
+      });
+    }
+    var c = cliente(S.venta.cliente);
+    var ancla = $('#v-plan-estimado');
+    if (!c || c.completitud !== 'INCOMPLETA' || !ancla) return;
+    var div = document.createElement('div');
+    div.id = 'bd-v-incompleta';
+    div.innerHTML = '<p class="aviso-linea grave">CLIENTA INCOMPLETA: falta ' + esc(c.faltantes.join(', ')) + '. No se le vende a crédito hasta completar sus datos. ' +
+      boton('Completar ahora', 'bd-editar', attr('codigo', c.codigo)) + '</p>';
+    ancla.parentNode.insertBefore(div, ancla);
+  }
+  /** Sistema › Migración: qué agrega la Fase 3. */
+  function notaMigracion() {
+    if (S.vista !== 'sistema' || S.sub.sistema !== 'migracion' || $('#bd-nota-mig')) return;
+    var ayuda = document.querySelector('#contenido .panel .ayuda');
+    if (!ayuda) return;
+    var p = document.createElement('p');
+    p.id = 'bd-nota-mig';
+    p.className = 'ayuda mt';
+    p.textContent = 'Base de clientes (Fase 3): la migración también pasa las clientas de «Servicios realizados» a «Clientas salón» (una ficha INCOMPLETA por nombre distinto, ' +
+      'sin «Sin nombre» ni vacíos), vincula sus servicios solo por nombre exacto y propone las variantes de una misma persona para revisar en Base de datos (nunca las fusiona).';
+    ayuda.parentNode.insertBefore(p, ayuda.nextSibling);
+  }
+
+  // ═════════════ Conexión con la app ═════════════
+  MB.vistas.clientes = vClientes;
+  MB.ext.modalCliente = modalCliente;
+  MB.ext.modalHistorial = modalHistorial;
+  MB.ext.faltantesCliente = faltantesUI;
+
+  var A = MB.acciones;
+  // La ficha de la v2.1 («Nueva peluquería» / «Editar») pasa a ser la ficha completa de la base de clientes.
+  A['nueva-peluqueria'] = function (el) { modalCliente(null, el.getAttribute('data-origen'), 'PELUQUERÍA'); };
+  A['editar-peluqueria'] = function (el) { modalCliente(el.getAttribute('data-codigo')); };
+  A['bd-nuevo'] = function () { modalCliente(null, null, 'PELUQUERÍA'); };
+  A['bd-editar'] = function (el) { modalCliente(el.getAttribute('data-codigo')); };
+  A['bd-historial'] = function (el) { modalHistorial(el.getAttribute('data-codigo')); };
+  A['bd-exportar'] = function (el) {
+    conBoton(el, 'Exportando…', function () { return api('exportarClientesCsv', { tipo: el.getAttribute('data-tipo') }, 'exp-' + uid()); }).then(function (r) {
+      if (r.url) B.archivo = { nombre: r.nombre, url: r.url };
+      MB.aplicar(r);
+    }).catch(fallo);
+  };
+  A['bd-ocultar-enlace'] = function () { B.archivo = null; render(); };
+  A['bd-ver-mas'] = function () { B.verMas += 60; render(); };
+  A['bd-rapida-guardar'] = guardarRapida;
+  A['bd-unificar'] = function (el) { resolverGrupo(el, 'unificar'); };
+  A['bd-distintas'] = function (el) { resolverGrupo(el, 'distintas'); };
+  A['bd-vincular-exactos'] = function (el) {
+    conBoton(el, 'Vinculando…', function () { return api('vincularClienteServicio', { accion: 'exactos' }, 'vexact-' + uid()); }).then(MB.aplicar).catch(fallo);
+  };
+  A['bd-vincular'] = function (el) { vincularMarcados(el, false); };
+  A['bd-desvincular'] = function (el) { vincularMarcados(el, true); };
+  A['bd-crear-desde'] = function (el) { modalCliente(null, null, 'CLIENTA DEL SALÓN', { nombre: el.getAttribute('data-texto') }); };
+  A['bd-plantilla'] = function (el) {
+    conBoton(el, 'Preparando…', function () { return api('plantillaImportacion', {}, 'plantilla-' + uid()); }).then(function (r) {
+      if (r.url) B.archivo = { nombre: r.nombre, url: r.url };
+      MB.aplicar(r);
+    }).catch(fallo);
+  };
+  A['bd-imp-vista'] = vistaImportacion;
+  A['bd-imp-confirmar'] = confirmarImportacion;
+  A['bd-imp-limpiar'] = function () { B.imp.vista = null; render(); };
+  A['bd-imp-ver'] = function (el) { cargarBandeja(el.getAttribute('data-lote') || B.imp.lote || ''); };
+  A['bd-imp-aprobar'] = function (el) { modalAprobar(el.getAttribute('data-lote')); };
+  A['bd-imp-editar'] = function (el) { modalFilaImp(el.getAttribute('data-id')); };
+  A['bd-imp-confirmar-lectura'] = function (el) { accionFilas([el.getAttribute('data-id')], 'confirmar'); };
+  A['bd-imp-rechazar'] = function (el) { rechazarFilas([el.getAttribute('data-id')]); };
+  A['bd-imp-reabrir'] = function (el) { accionFilas([el.getAttribute('data-id')], 'reabrir'); };
+  A['bd-imp-aplicar-sel'] = aplicarSeleccion;
+  A['bd-imp-rechazar-sel'] = function () { rechazarFilas(seleccionadas()); };
+
+  MB.alEscribir['bd-buscar'] = function (el) { B.q = el.value; $('#bd-tabla').innerHTML = tablaClientes(); };
+  MB.alEscribir['bd-pend-buscar'] = function (el) {
+    B.pq = el.value;
+    clearTimeout(B.tPend);
+    B.tPend = setTimeout(function () {
+      render();
+      var x = document.querySelector('[data-al-escribir="bd-pend-buscar"]');
+      if (x) { x.focus(); x.setSelectionRange(x.value.length, x.value.length); }
+    }, 350);
+  };
+  MB.alEscribir['bd-borrador'] = function (el) { var c = el.getAttribute('data-codigo'); (B.borrador[c] = B.borrador[c] || {})[el.name] = el.value; };
+  MB.alEscribir['bd-vinc-cliente'] = function (el) { B.vinc.cliente = el.value; };
+  MB.alEscribir['bd-imp-campo'] = function (el) { B.imp[el.getAttribute('data-k')] = el.value; };
+  MB.alEscribir['bd-imp-texto'] = function (el) { B.imp.texto = el.value; };
+  MB.alCambio['bd-tipo'] = function (el) { B.tipo = el.value; $('#bd-tabla').innerHTML = tablaClientes(); };
+  MB.alCambio['bd-comp'] = function (el) { B.comp = el.value; $('#bd-tabla').innerHTML = tablaClientes(); };
+  MB.alCambio['bd-inactivos'] = function (el) { B.inactivos = el.checked; $('#bd-tabla').innerHTML = tablaClientes(); };
+  MB.alCambio['bd-borrador'] = function (el) { var c = el.getAttribute('data-codigo'); (B.borrador[c] = B.borrador[c] || {})[el.name] = el.value; };
+  MB.alCambio['bd-vinc-sel'] = function (el) { B.vinc.sel[el.getAttribute('data-id')] = el.checked; };
+  MB.alCambio['bd-imp-csv'] = leerCsv;
+  MB.alCambio['bd-imp-img'] = leerReferencia;
+  MB.alCambio['bd-imp-filtro'] = function (el) {
+    var k = el.getAttribute('data-k');
+    B.imp[k] = el.value;
+    if (k === 'estado') cargarBandeja();
+  };
+  MB.alCambio['bd-imp-sel'] = function (el) { B.imp.sel[el.getAttribute('data-id')] = el.checked; };
+
+  // Acceso directo «?page=clientes» (menú opcional «MB Sistema» de la hoja): abre Base de datos una sola vez, al ingresar.
+  var abrirBasePendiente = document.body.getAttribute('data-pagina') === 'clientes';
+  var renderPrevio = MB.alRender;
+  MB.alRender = function () {
+    if (renderPrevio) renderPrevio();
+    if (abrirBasePendiente && S.datos && hayBase()) {
+      abrirBasePendiente = false;
+      if (S.vista !== 'clientes') { S.vista = 'clientes'; render(); return; }
+    }
+    avisoVentaIncompleta();
+    notaMigracion();
+  };
+});
+</script>

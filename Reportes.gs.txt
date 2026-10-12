@@ -1,0 +1,464 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Reportes de cartera y cierre mensual (v2.3 · Fase 2 · R0.6 · R0.7)
+ * =====================================================================
+ *  - Estado de cuenta por clienta: el MISMO documento en pantalla, impreso en A4 y exportado a PDF
+ *    (Drive › Distribuidora MB › Exportaciones). HTML → PDF con Blob.getAs('application/pdf') (documentación
+ *    oficial de Apps Script, «Blob.getAs»: para la mayoría de los blobs 'application/pdf' es la única conversión
+ *    válida y tiene cuota diaria de conversiones).
+ *  - Cierre mensual (solo administradoras): réplica de TABLERO (A resultado y punto de equilibrio, B cartera,
+ *    C top 10 por vencido, D margen por línea, E últimos 12 meses) y CONCILIACION (1 ventas y facturación,
+ *    2 ingresos por medio de pago, 3 cuadre de la cartera, 4 asiento resumen Debe = Haber, 5 registro de cierres).
+ *    El costo histórico no cambia: cada línea de venta guarda su costo al registrarse.
+ *  Diferencias declaradas con el xlsx: (1) la cartera del cierre se calcula a la fecha de corte del mes (último día
+ *  o hoy), no siempre «hoy»; (2) la antigüedad suma el tramo «PLAN A CONFIRMAR»; (3) el margen por línea suma una fila
+ *  «REVISAR / sin línea» para que el total cuadre; (4) las ventas anuladas no cuentan como operación; (5) el consolidado
+ *  por unidad y el resultado de gestión con costos fijos prorrateados son los reportes financieros de la Fase 6 (RT.9):
+ *  aquí el salón aparece solo como dato informativo.
+ * =====================================================================
+ */
+
+const LINEA_SERVICIOS_ = 'SERVICIOS Y CAPACITACIÓN'; // texto de LISTAS (xlsx): ventas de servicios en el asiento
+const SIN_MEDIO_REGISTRADO_ = 'SIN MEDIO REGISTRADO';
+
+function obtenerCierreMensual(req) {
+  return ejecutar_('obtenerCierreMensual', req, 'lectura', function (ctx) {
+    return { ok: true, cierre: cierreMensual_(ctx.ss, ctx.tz, normalizarMes_(ctx.datos.mes || ctx.mes), ctx.datos.manual) };
+  });
+}
+function registrarCierreMensual(req) { return ejecutar_('registrarCierreMensual', req, 'escritura', registrarCierreMensual_); }
+function exportarEstadoCuenta(req) { return ejecutar_('exportarEstadoCuenta', req, 'lectura', exportarEstadoCuenta_); }
+
+// ─────────────────────── Utilidades de fechas de mes ───────────────────────
+
+function finDeMes_(mes) {
+  const p = String(mes).split('-').map(Number);
+  const f = new Date(Date.UTC(p[0], p[1], 0));
+  return f.getUTCFullYear() + '-' + ('0' + (f.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + f.getUTCDate()).slice(-2);
+}
+
+function mesDesplazado_(mes, n) {
+  const p = String(mes).split('-').map(Number);
+  const f = new Date(Date.UTC(p[0], p[1] - 1 + n, 1));
+  return f.getUTCFullYear() + '-' + ('0' + (f.getUTCMonth() + 1)).slice(-2);
+}
+
+// ─────────────────────── Líneas de venta para reportes ───────────────────────
+
+/**
+ * Líneas de «Ventas» vigentes (no anuladas) con IVA, neto, costo, línea y tipo como VENTAS!W:AC del xlsx.
+ * Filas anteriores a la v2.3 (sin «Tasa IVA» guardada): tasa del producto o, si falta, la general (P_IVA).
+ * Costo = el guardado en la línea al registrarse (costo histórico). Tipo: FINANCIERO (REC-FIN o línea P_LINEA_FIN),
+ * SERVICIO (línea SERVICIOS Y CAPACITACIÓN) o MERCADERÍA.
+ */
+function lineasVentaReporte_(ss, tz, P) {
+  const porCodigo = {};
+  leerTabla_(ss, 'productos', tz).filas.forEach(function (p) { porCodigo[clave_(p.codigo)] = p; });
+  const codRec = clave_(P.P_COD_REC || '');
+  const lineaFin = String(P.P_LINEA_FIN || '');
+  const general = ivaGeneral_(P);
+  return leerTabla_(ss, 'ventas', tz).filas.filter(function (v) { return clave_(v.id) && v.estado !== 'Anulada'; }).map(function (v) {
+    const p = porCodigo[clave_(v.codigo)] || null;
+    let tasa = general;
+    try { tasa = String(v.iva) !== '' ? tasaIva_(v.iva, P) : (p && String(p.iva) !== '' ? tasaIva_(p.iva, P) : general); } catch (e) { tasa = general; }
+    const iva = String(v.iva) !== '' ? (Number(v.ivaMonto) || 0) : ivaIncluido_(v.subtotal, tasa);
+    const esRecargo = !!codRec && clave_(v.codigo) === codRec;
+    const linea = esRecargo ? lineaFin : String(v.linea || (p && p.linea) || (p ? lineaPropuesta_(p.categoria, false) : 'REVISAR'));
+    const tipo = esRecargo || (lineaFin && normalizar_(linea) === normalizar_(lineaFin)) ? 'FINANCIERO' : (normalizar_(linea) === normalizar_(LINEA_SERVICIOS_) ? 'SERVICIO' : 'MERCADERÍA');
+    const costoU = Number(v.costoUnitario) || 0;
+    const costo = esRecargo ? 0 : Math.round(v.cantidad * (P.P_COSTO_CON_IVA === true ? costoU / (1 + tasa / 100) : costoU));
+    return {
+      id: v.id, fecha: v.fecha, codigoCliente: v.codigoCliente, cliente: v.cliente, codigo: v.codigo, producto: v.producto, cantidad: v.cantidad,
+      precio: v.precio, precioLista: v.precioLista, total: v.subtotal, tasa: tasa, iva: iva, neto: v.subtotal - iva, costo: costo,
+      sinCosto: !esRecargo && !(costoU > 0), linea: linea, tipo: tipo, condicion: v.condicion, ticket: v.ticket, nroCredito: v.nroCredito,
+      unidad: v.unidad || 'DISTRIBUIDORA', esRecargo: esRecargo,
+    };
+  });
+}
+
+/** Bloque A del TABLERO para un conjunto de líneas (también se usa en los últimos 12 meses). */
+function resultadoMes_(lineas, P, varPct, cf) {
+  const ventasIva = suma_(lineas, 'total');
+  const neta = suma_(lineas, 'neto');
+  const costo = suma_(lineas, 'costo');
+  const margen = neta - costo;
+  const margenPct = neta ? margen / neta : null;
+  const costosVariables = neta * varPct;
+  const contribucion = margen - costosVariables;
+  const resultado = contribucion - cf;
+  let pe = null;
+  if (margenPct === null) pe = param_(P, 'P_MARGEN_OBJ') - varPct <= 0 ? null : cf / (param_(P, 'P_MARGEN_OBJ') - varPct);
+  else pe = margenPct - varPct <= 0 ? null : cf / (margenPct - varPct);
+  const peIva = pe === null ? null : pe * (1 + param_(P, 'P_IVA'));
+  return {
+    ventasIva: ventasIva, neta: neta, costo: costo, margen: margen, margenPct: margenPct, costosVariables: Math.round(costosVariables),
+    contribucion: Math.round(contribucion), costosFijos: cf, resultado: Math.round(resultado), cobertura: cf ? contribucion / cf : null,
+    peNeto: pe === null ? null : Math.round(pe), peIva: peIva === null ? null : Math.round(peIva),
+    pePorDia: peIva === null ? null : Math.round(peIva / param_(P, 'P_DIAS_VENTA')), avance: pe ? neta / pe : null,
+    margenNecesario: neta ? cf / neta + varPct : null,
+    diagnostico: !neta ? 'Sin ventas cargadas en el mes' : (resultado >= 0 ? 'El mes cubre los costos fijos' : 'El mes NO cubre los costos fijos: faltan Gs. ' + miles_(-Math.round(resultado)) + ' de contribución'),
+  };
+}
+
+/** Controles de una línea de venta como VENTAS!S del xlsx (los que el sistema puede verificar). */
+function controlesLineaVenta_(l, P, conComprobante, creditoConPlan) {
+  const c = [];
+  if (l.sinCosto) c.push('ÍTEM SIN COSTO EN CATALOGO');
+  if (!l.esRecargo && l.precioLista > 0 && l.precio < l.precioLista) {
+    const desc = 1 - l.precio / l.precioLista;
+    if (desc > param_(P, 'P_DESC_MAX') + 1e-9) c.push('DESCUENTO FUERA DE POLÍTICA');
+    else if (desc > param_(P, 'P_DESC_VEND') + 1e-9) c.push('DESCUENTO REQUIERE AUTORIZACIÓN');
+  }
+  if (l.tipo === 'MERCADERÍA' && l.costo > 0 && l.neto > 0 && (l.neto - l.costo) / l.neto < param_(P, 'P_MARGEN_MIN') - 1e-9) c.push('MARGEN BAJO MÍNIMO');
+  if (!conComprobante) c.push('SIN COMPROBANTE');
+  if (l.condicion === 'Crédito' && !creditoConPlan) c.push('CRÉDITO SIN PLAN EN CREDITOS');
+  return c;
+}
+
+// ─────────────────────── Cierre mensual (R0.7) ───────────────────────
+
+/**
+ * Réplica de TABLERO + CONCILIACION para el mes 'AAAA-MM'. manual = { marangatu: Gs. | '', extractos: { MEDIO: Gs. } }
+ * (lo que en el xlsx se carga a mano). Solo lectura.
+ */
+function cierreMensual_(ss, tz, mes, manual) {
+  manual = manual && typeof manual === 'object' ? manual : {};
+  const P = leerParametros_(ss, tz);
+  const desde = mes + '-01';
+  const hasta = finDeMes_(mes);
+  const hoy = hoy_(tz);
+  const corte = hasta < hoy ? hasta : hoy;
+  const enMes = function (f) { return !!f && f >= desde && f <= hasta; };
+  const varPct = param_(P, 'P_PROV_INCOB') + param_(P, 'P_COMIS_VENTA') + param_(P, 'P_COSTO_COBROS');
+  const cf = param_(P, 'P_CF');
+  const lineas = lineasVentaReporte_(ss, tz, P);
+  const delMes = lineas.filter(function (l) { return enMes(l.fecha); });
+
+  // Tickets con comprobante (Fase 4) para el libro de ventas y los controles «SIN COMPROBANTE».
+  let tickets = [];
+  try { tickets = leerTabla_(ss, 'tickets', tz).filas; } catch (e) { tickets = []; }
+  const ticketPorId = {};
+  tickets.forEach(function (t) { ticketPorId[clave_(t.id)] = t; });
+  const conComprobante = function (l) { const t = ticketPorId[clave_(l.ticket)]; return !!(t && clave_(t.nroComprobante)); };
+
+  // ── A. Resultado del mes y punto de equilibrio ──
+  const A = resultadoMes_(delMes, P, varPct, cf);
+  const operaciones = unicos_(delMes.map(function (l) { return l.id; })).length;
+  A.operaciones = operaciones;
+  A.ticketPromedio = operaciones ? Math.round(A.ventasIva / operaciones) : null;
+  const ventasCredito = suma_(delMes.filter(function (l) { return l.condicion === 'Crédito'; }), 'total');
+  const ventasContado = suma_(delMes.filter(function (l) { return l.condicion !== 'Crédito'; }), 'total');
+  A.pctCredito = A.ventasIva ? ventasCredito / A.ventasIva : null;
+  const limiteActiva = sumarDias_(corte, -param_(P, 'P_DIAS_ACTIVA'));
+  A.clientasActivas = unicos_(lineas.filter(function (l) { return l.fecha > limiteActiva && l.fecha <= corte; }).map(function (l) { return clave_(l.codigoCliente); })).length;
+  const stock = calcularStock_(leerTabla_(ss, 'movimientos', tz).filas);
+  A.stockBajo = leerTabla_(ss, 'productos', tz).filas.filter(function (p) { return esActivo_(p.activo) && (stock[clave_(p.codigo)] || 0) <= p.stockMinimo; })
+    .map(function (p) { return { codigo: p.codigo, nombre: p.nombre, stock: stock[clave_(p.codigo)] || 0, minimo: p.stockMinimo }; });
+
+  // ── B. Cartera a la fecha de corte ──
+  const m = modeloCartera_(ss, tz, corte);
+  let programado = 0;
+  m.creditos.forEach(function (c) {
+    if (c.anulado) return;
+    c.cuotas.forEach(function (q) { if (q.numero > 0 && enMes(q.vencimiento)) programado += q.monto; });
+  });
+  const cobrosVivos = m.cobros.filter(function (c) { return !c.esAnulado; });
+  const cobradoMes = cobrosVivos.filter(function (c) { return !c.esMora && enMes(c.fecha); }).reduce(function (t, c) { return t + (Number(c.monto) || 0); }, 0);
+  const moraMes = cobrosVivos.filter(function (c) { return c.esMora && enMes(c.fecha); }).reduce(function (t, c) { return t + (Number(c.monto) || 0); }, 0);
+  const B = {
+    corte: corte, cartera: m.totales.cartera, vencido: m.totales.vencido, pctVencido: m.totales.cartera ? m.totales.vencido / m.totales.cartera : null,
+    bloqueadas: m.totales.BLOQUEADA, exceden: m.totales['EXCEDE LÍMITE'], sinCategoria: m.totales['ASIGNAR CATEGORÍA'], aConfirmar: m.totales.aConfirmar,
+    aConfirmarN: m.totales.aConfirmarN, programado: programado, cobrado: cobradoMes, mora: moraMes, efectividad: programado ? cobradoMes / programado : null,
+    antiguedad: m.antiguedad, porConciliar: m.totales.porConciliar, porConciliarN: m.totales.porConciliarN,
+  };
+  const C = m.top10;
+
+  // ── D. Margen por línea ──
+  const nombresLinea = LISTAS.LINEAS.filter(function (l) { return l !== 'REVISAR'; });
+  const D = nombresLinea.concat(['REVISAR / sin línea']).map(function (nombre) {
+    const ls = delMes.filter(function (l) { return nombre === 'REVISAR / sin línea' ? nombresLinea.indexOf(l.linea) < 0 : l.linea === nombre; });
+    const neto = suma_(ls, 'neto');
+    const costo = suma_(ls, 'costo');
+    return { linea: nombre, neto: neto, costo: costo, margen: neto - costo, margenPct: neto ? (neto - costo) / neto : null, pctVenta: A.neta ? neto / A.neta : null };
+  }).filter(function (x) { return x.linea !== 'REVISAR / sin línea' || x.neto !== 0 || x.costo !== 0; });
+
+  // ── E. Últimos 12 meses ──
+  const E = [];
+  for (let k = 11; k >= 0; k--) {
+    const mk = mesDesplazado_(mes, -k);
+    const r = resultadoMes_(lineas.filter(function (l) { return String(l.fecha).slice(0, 7) === mk; }), P, varPct, cf);
+    E.push({ mes: mk, neta: r.neta, margen: r.margen, contribucion: r.contribucion, costosFijos: cf, resultado: r.resultado });
+  }
+
+  // ── CONCILIACIÓN 1. Ventas y facturación ──
+  const credPorId = {};
+  m.creditos.forEach(function (c) { if (!c.anulado) credPorId[clave_(c.id)] = c; });
+  const credPorVenta = {};
+  m.creditos.forEach(function (c) { if (!c.anulado && c.venta) credPorVenta[clave_(c.venta)] = c; });
+  const controles = {};
+  let lineasConAlerta = 0;
+  let sinComprobante = 0;
+  delMes.forEach(function (l) {
+    const conPlan = !!(credPorId[clave_(l.nroCredito)] || credPorVenta[clave_(l.id)]);
+    const cs = controlesLineaVenta_(l, P, conComprobante(l), conPlan);
+    if (cs.length) lineasConAlerta++;
+    if (cs.indexOf('SIN COMPROBANTE') >= 0) sinComprobante++;
+    cs.forEach(function (x) { controles[x] = (controles[x] || 0) + 1; });
+  });
+  const ticketsMes = tickets.filter(function (t) { return enMes(t.fecha) && clave_(t.nroComprobante); });
+  const anulados = ticketsMes.filter(function (t) { return t.estado === 'ANULADO' || t.tipoComprobante === 'ANULADO'; });
+  const notasCredito = ticketsMes.filter(function (t) { return t.tipoComprobante === 'NOTA DE CRÉDITO' && t.estado !== 'ANULADO'; });
+  const libro = ticketsMes.filter(function (t) { return t.estado !== 'ANULADO' && t.tipoComprobante !== 'ANULADO'; }).reduce(function (s, t) { return s + (Number(t.total) || 0); }, 0);
+  const marangatu = manual.marangatu === '' || manual.marangatu === null || manual.marangatu === undefined ? null : entero_(manual.marangatu);
+  const C1 = {
+    ventasIva: A.ventasIva, contado: ventasContado, credito: ventasCredito, notasCredito: suma_(notasCredito, 'total'), neta: A.neta,
+    iva10: suma_(delMes.filter(function (l) { return l.tasa === 10; }), 'iva'), iva5: suma_(delMes.filter(function (l) { return l.tasa === 5; }), 'iva'),
+    exentas: suma_(delMes.filter(function (l) { return l.tasa === 0; }), 'total'), comprobantes: unicos_(ticketsMes.map(function (t) { return t.nroComprobante; })).length,
+    comprobantesAnulados: anulados.length, lineasSinComprobante: sinComprobante, lineasConAlertas: lineasConAlerta, controles: controles,
+    libro: libro, difVentasLibro: A.ventasIva - libro, marangatu: isNaN(marangatu) ? null : marangatu,
+    difLibroMarangatu: marangatu === null || isNaN(marangatu) ? null : libro - marangatu,
+  };
+
+  // ── 2. Ingresos de dinero por medio de pago ──
+  let pagos = [];
+  try { pagos = leerTabla_(ss, 'pagosTicket', tz).filas.filter(function (p) { return !esSi_(p.anulado); }); } catch (e) { pagos = []; }
+  const ticketsContado = {};
+  const contadoSinTicket = [];
+  delMes.filter(function (l) { return l.condicion !== 'Crédito'; }).forEach(function (l) {
+    if (clave_(l.ticket) && pagos.some(function (p) { return clave_(p.ticket) === clave_(l.ticket); })) ticketsContado[clave_(l.ticket)] = true;
+    else contadoSinTicket.push(l);
+  });
+  const extractos = manual.extractos && typeof manual.extractos === 'object' ? manual.extractos : {};
+  const medios = LISTAS.MEDIOS_PAGO.concat([SIN_MEDIO_REGISTRADO_]).map(function (medio) {
+    const contado = medio === SIN_MEDIO_REGISTRADO_ ? suma_(contadoSinTicket, 'total')
+      : pagos.filter(function (p) { return ticketsContado[clave_(p.ticket)] && p.medio === medio; }).reduce(function (s, p) { return s + (Number(p.monto) || 0); }, 0);
+    const deCobros = cobrosVivos.filter(function (c) { return enMes(c.fecha) && c.medio === medio; });
+    const cobros = deCobros.reduce(function (s, c) { return s + (Number(c.monto) || 0); }, 0);
+    const v = extractos[medio];
+    const extracto = v === '' || v === null || v === undefined || isNaN(entero_(v)) ? null : entero_(v);
+    return {
+      medio: medio, contado: contado, cobros: cobros, total: contado + cobros, extracto: extracto, diferencia: extracto === null ? null : extracto - (contado + cobros),
+      sinConciliar: deCobros.filter(function (c) { return !c.esConciliado; }).reduce(function (s, c) { return s + (Number(c.monto) || 0); }, 0),
+    };
+  }).filter(function (x) { return x.medio !== SIN_MEDIO_REGISTRADO_ || x.contado; });
+  const C2 = { medios: medios, total: medios.reduce(function (s, x) { return s + x.total; }, 0), sinConciliar: medios.reduce(function (s, x) { return s + x.sinConciliar; }, 0) };
+
+  // ── 3. Cuadre de la cartera (deudores por ventas) ──
+  let inicio = 0;
+  let otorgados = 0;
+  let creditosConVenta = 0;
+  leerTabla_(ss, 'creditos', tz).filas.forEach(function (c) {
+    if (!clave_(c.id) || clave_(c.estadoPlan) === PLAN_.ANULADO) return;
+    const subtotal = Number(c.subtotal) || Math.max(0, (Number(c.total) || 0) - (Number(c.recargo) || 0));
+    const recargo = Number(c.recargo) || 0;
+    const fr = fechaRecargoCredito_(c);
+    if (c.fecha < desde) inicio += subtotal; else if (enMes(c.fecha)) otorgados += subtotal;
+    if (recargo) { if (fr < desde) inicio += recargo; else if (enMes(fr)) otorgados += recargo; }
+    if (clave_(c.venta) && enMes(c.fecha)) creditosConVenta += subtotal;
+    if (recargo && enMes(fr)) creditosConVenta += recargo;
+  });
+  cobrosVivos.forEach(function (c) { if (!c.esMora && c.fecha < desde) inicio -= Number(c.monto) || 0; });
+  const clientasConSaldo = m.clientes.filter(function (c) { return c.saldo > 0; }).reduce(function (s, c) { return s + c.saldo; }, 0);
+  const C3 = {
+    inicio: inicio, otorgados: otorgados, cobros: cobradoMes, cierre: inicio + otorgados - cobradoMes,
+    ventasCredito: ventasCredito, creditosConVenta: creditosConVenta, difVentasSinPlan: ventasCredito - creditosConVenta,
+    carteraCreditos: m.totales.cartera, carteraClientas: clientasConSaldo, difSinClienta: m.totales.cartera - clientasConSaldo, corte: corte,
+  };
+
+  // ── 4. Asiento resumen (códigos de cuenta: «Parámetros de crédito», a completar con el contador) ──
+  const cta = function (k) { return P[k] === null || P[k] === undefined ? '' : String(P[k]); };
+  const netoTipo = function (t) { return suma_(delMes.filter(function (l) { return l.tipo === t; }), 'neto'); };
+  const cmv = suma_(delMes.filter(function (l) { return l.tipo === 'MERCADERÍA'; }), 'costo');
+  const cobrosTodos = cobradoMes + moraMes;
+  const asiento = [
+    { grupo: 'a) Ventas del mes', cuenta: 'Caja y bancos (ventas contado)', codigo: cta('P_CTA_CAJA'), debe: ventasContado, haber: 0, origen: 'Ventas, contado' },
+    { grupo: 'a) Ventas del mes', cuenta: 'Deudores por ventas (ventas a crédito)', codigo: cta('P_CTA_DEUDORES'), debe: ventasCredito, haber: 0, origen: 'Ventas, crédito' },
+    { grupo: 'a) Ventas del mes', cuenta: 'Ventas de mercaderías', codigo: cta('P_CTA_VENTAS_MERC'), debe: 0, haber: netoTipo('MERCADERÍA'), origen: 'Ventas, neto sin IVA' },
+    { grupo: 'a) Ventas del mes', cuenta: 'Ventas de servicios', codigo: cta('P_CTA_VENTAS_SERV'), debe: 0, haber: netoTipo('SERVICIO'), origen: 'Ventas, neto sin IVA' },
+    { grupo: 'a) Ventas del mes', cuenta: 'Ingresos financieros (recargos facturados)', codigo: cta('P_CTA_FINANCIEROS'), debe: 0, haber: netoTipo('FINANCIERO'), origen: 'Ventas, neto sin IVA' },
+    { grupo: 'a) Ventas del mes', cuenta: 'IVA débito fiscal', codigo: cta('P_CTA_IVA_DEBITO'), debe: 0, haber: suma_(delMes, 'iva'), origen: 'Ventas' },
+    { grupo: 'b) Costo de lo vendido', cuenta: 'Costo de mercaderías vendidas', codigo: cta('P_CTA_COSTO'), debe: cmv, haber: 0, origen: 'Costo guardado en cada línea de venta' },
+    { grupo: 'b) Costo de lo vendido', cuenta: 'Mercaderías', codigo: cta('P_CTA_MERCADERIAS'), debe: 0, haber: cmv, origen: 'Salida de inventario' },
+    { grupo: 'c) Cobranzas de créditos', cuenta: 'Caja y bancos (cobros)', codigo: cta('P_CTA_CAJA'), debe: cobrosTodos, haber: 0, origen: 'Cobros' },
+    { grupo: 'c) Cobranzas de créditos', cuenta: 'Deudores por ventas', codigo: cta('P_CTA_DEUDORES'), debe: 0, haber: cobradoMes, origen: 'Cobros sin recargos por mora' },
+    { grupo: 'c) Cobranzas de créditos', cuenta: 'Recargos por mora cobrados', codigo: cta('P_CTA_FINANCIEROS'), debe: 0, haber: moraMes, origen: 'Cobros' },
+  ];
+  const debe = asiento.reduce(function (s, a) { return s + a.debe; }, 0);
+  const haber = asiento.reduce(function (s, a) { return s + a.haber; }, 0);
+  const C4 = { lineas: asiento, debe: debe, haber: haber, diferencia: debe - haber, codigosFaltantes: asiento.filter(function (a) { return !a.codigo; }).length };
+
+  // ── 5. Registro de cierres ──
+  let registros = [];
+  try {
+    registros = leerTabla_(ss, 'cierres', tz).filas.map(function (r) {
+      return { mes: r.mes, fecha: r.fecha, usuario: r.usuario, diferencias: r.diferencias, observaciones: r.observaciones, resultado: r.resultado, cartera: r.cartera };
+    }).sort(function (a, b) { return a.mes < b.mes ? 1 : -1; });
+  } catch (e) { registros = []; }
+
+  // Salón (informativo): servicios del mes; el consolidado por unidad llega con los reportes financieros (Fase 6).
+  const realizados = leerTabla_(ss, 'realizados', tz).filas.filter(function (r) { return r.estado !== 'Anulado' && enMes(r.fecha); });
+  const salon = {
+    servicios: realizados.length, facturacion: suma_(realizados, 'precio'), comisiones: suma_(realizados, 'comision'),
+    iva: realizados.reduce(function (s, r) { let t = ivaGeneral_(P); try { t = String(r.iva) !== '' ? tasaIva_(r.iva, P) : t; } catch (e) { t = ivaGeneral_(P); } return s + ivaIncluido_(r.precio, t); }, 0),
+  };
+
+  const diferencias = [];
+  if (C1.difVentasLibro) diferencias.push('Ventas − libro de ventas: Gs. ' + miles_(C1.difVentasLibro) + ' (ventas sin comprobante registrado en el sistema)');
+  if (C1.difLibroMarangatu !== null && C1.difLibroMarangatu) diferencias.push('Libro − Marangatu / SIFEN: Gs. ' + miles_(C1.difLibroMarangatu));
+  medios.forEach(function (x) { if (x.diferencia) diferencias.push(x.medio + ': extracto o arqueo − registrado = Gs. ' + miles_(x.diferencia)); });
+  if (C3.difVentasSinPlan) diferencias.push('Ventas a crédito sin plan en Créditos: Gs. ' + miles_(C3.difVentasSinPlan));
+  if (C3.difSinClienta) diferencias.push('Créditos sin clienta registrada: Gs. ' + miles_(C3.difSinClienta));
+  if (C4.diferencia) diferencias.push('Asiento: Debe − Haber = Gs. ' + miles_(C4.diferencia));
+
+  return {
+    mes: mes, etiqueta: etiquetaMes_(mes), desde: desde, hasta: hasta, corte: corte, varPct: varPct, emitido: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm'),
+    A: A, B: B, C: C, D: D, E: E, conciliacion: { ventas: C1, medios: C2, cuadre: C3, asiento: C4, registros: registros }, salon: salon,
+    diferencias: diferencias, manual: { marangatu: C1.marangatu, extractos: extractos },
+    parametrosFaltantes: P._faltan.map(function (k) { return P._nombres[k] || k; }), avisos: P._avisos.slice(),
+  };
+}
+
+/** Registra (o actualiza) el cierre del mes en «Cierres mensuales» con sus cifras y las diferencias encontradas. */
+function registrarCierreMensual_(ctx) {
+  const d = ctx.datos;
+  const mes = normalizarMes_(d.mes || ctx.mes);
+  const c = cierreMensual_(ctx.ss, ctx.tz, mes, d.manual);
+  const manualTxt = [];
+  if (c.manual.marangatu !== null) manualTxt.push('Marangatu / SIFEN Gs. ' + miles_(c.manual.marangatu));
+  Object.keys(c.manual.extractos || {}).forEach(function (k) {
+    const v = entero_(c.manual.extractos[k]);
+    if (!isNaN(v)) manualTxt.push(k + ' según extracto o arqueo Gs. ' + miles_(v));
+  });
+  const fila = {
+    mes: mes, fecha: new Date(), usuario: ctx.email,
+    diferencias: (c.diferencias.length ? c.diferencias.join(' · ') : 'Sin diferencias.') + (manualTxt.length ? ' [Cargado a mano: ' + manualTxt.join('; ') + ']' : ''),
+    observaciones: texto_(d.observaciones, 400), ventasIva: c.A.ventasIva, ventaNeta: c.A.neta, costo: c.A.costo, margen: c.A.margen,
+    margenPct: c.A.margenPct === null ? 0 : Math.round(c.A.margenPct * 10000) / 100, resultado: c.A.resultado, cartera: c.B.cartera, vencido: c.B.vencido,
+    cobrado: c.B.cobrado, efectividad: c.B.efectividad === null ? 0 : Math.round(c.B.efectividad * 10000) / 100, servicios: c.salon.facturacion,
+    asiento: 'Debe Gs. ' + miles_(c.conciliacion.asiento.debe) + ' · Haber Gs. ' + miles_(c.conciliacion.asiento.haber) + (c.conciliacion.asiento.diferencia ? ' · DIFERENCIA Gs. ' + miles_(c.conciliacion.asiento.diferencia) : ' · cuadra'),
+  };
+  const tabla = leerTabla_(ctx.ss, 'cierres', ctx.tz);
+  const existente = tabla.filas.filter(function (f) { return String(f.mes) === mes; })[0];
+  if (existente) actualizarCeldas_(tabla, existente._fila, fila, ctx.tz);
+  else agregarFilas_(tabla, [fila], ctx.tz);
+  return { mensaje: 'Cierre de ' + etiquetaMes_(mes) + (existente ? ' actualizado' : ' registrado') + ' en «Cierres mensuales»' + (c.diferencias.length ? ' con ' + c.diferencias.length + ' diferencia(s) anotada(s).' : ' sin diferencias.'), cierre: c };
+}
+
+// ─────────────────────── Estado de cuenta: HTML (pantalla, A4) y PDF ───────────────────────
+
+function escHtml_(v) {
+  return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; });
+}
+
+/** Estilos del documento (prefijados con .ec-doc para no afectar la aplicación; tablas simples para el conversor a PDF). */
+function cssEstadoCuenta_() {
+  return '.ec-doc{font-family:Arial,Helvetica,sans-serif;color:#1C1C1A;font-size:11px;line-height:1.45}' +
+    '.ec-doc h1{font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:normal;margin:0 0 2px}' +
+    '.ec-doc h2{font-family:Georgia,"Times New Roman",serif;font-size:14px;font-weight:normal;margin:16px 0 6px;border-bottom:1px solid #CDC9BF;padding-bottom:3px}' +
+    '.ec-doc .ec-sub{color:#7E7B73;font-size:10px;letter-spacing:.12em;text-transform:uppercase}' +
+    '.ec-doc table{width:100%;border-collapse:collapse;margin:4px 0}' +
+    '.ec-doc th{text-align:left;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:#7E7B73;border-bottom:1px solid #CDC9BF;padding:4px 6px;background:#FAF9F6}' +
+    '.ec-doc td{border-bottom:1px solid #E4E1D9;padding:4px 6px;vertical-align:top}' +
+    '.ec-doc .n{text-align:right;white-space:nowrap}' +
+    '.ec-doc .ec-datos td{border:0;padding:2px 6px 2px 0}' +
+    '.ec-doc .ec-res td{border:1px solid #E4E1D9;padding:6px 8px}' +
+    '.ec-doc .ec-res .v{font-size:14px;font-weight:bold}' +
+    '.ec-doc .neg{color:#8F2E2E}' +
+    '.ec-doc .tenue{color:#7E7B73}' +
+    '.ec-doc .ec-pie{margin-top:14px;font-size:9px;color:#7E7B73;border-top:1px solid #E4E1D9;padding-top:6px}';
+}
+
+/**
+ * Estado de cuenta (R0.6) como HTML: ventas a crédito, créditos y cuotas, cobros, recargos, cobros por confirmar y
+ * saldo. Devuelve { titulo, css, cuerpo }. Sin costos ni márgenes (lo puede ver una operativa).
+ */
+function htmlEstadoCuenta_(ec) {
+  const g = function (n) { return 'Gs. ' + miles_(n); };
+  const f = function (iso) { return iso ? formatoFecha_(String(iso).slice(0, 10)) : '—'; };
+  const cli = ec.cliente;
+  const r = ec.resumen;
+  const filas = function (lista, fn) { return lista.map(fn).join(''); };
+  const vacio = function (cols, txt) { return '<tr><td colspan="' + cols + '" class="tenue">' + escHtml_(txt) + '</td></tr>'; };
+  const titulo = 'Estado de cuenta · ' + cli.codigo + ' ' + cli.nombre;
+  let h = '<div class="ec-doc">';
+  h += '<p class="ec-sub">' + escHtml_(ec.empresa) + ' · Estado de cuenta</p><h1>' + escHtml_(cli.nombre) + '</h1>';
+  h += '<table class="ec-datos"><tr><td><b>Código</b> ' + escHtml_(cli.codigo) + (cli.legado ? ' (legado ' + escHtml_(cli.legado) + ')' : '') + '</td><td><b>RUC / CI</b> ' +
+    escHtml_(cli.ruc || (cli.ci ? 'CI ' + cli.ci : '—')) + '</td><td><b>WhatsApp</b> ' + escHtml_(cli.whatsapp ? '+' + cli.whatsapp : '—') + '</td></tr>' +
+    '<tr><td><b>Categoría</b> ' + escHtml_(cli.categoria || 'Sin categoría') + '</td><td><b>Límite</b> ' + (cli.limite !== '' ? g(cli.limite) : '—') + '</td><td><b>Estado</b> ' +
+    escHtml_(cli.estado) + '</td></tr><tr><td colspan="3" class="tenue">Situación al ' + f(ec.corte) + ' · emitido el ' + escHtml_(formatoFecha_(ec.emitido.slice(0, 10)) + ec.emitido.slice(10)) + '</td></tr></table>';
+  h += '<table class="ec-res"><tr><td>Saldo total<br><span class="v">' + g(r.saldo) + '</span></td><td>Vencido (más de ' + escHtml_(ec.gracia) + ' días de gracia)<br><span class="v' + (r.vencido > 0 ? ' neg' : '') + '">' +
+    g(r.vencido) + '</span></td><td>Próximo vencimiento<br><span class="v">' + (r.proximoVto ? f(r.proximoVto) + ' · ' + g(r.aCobrar) : '—') + '</span></td><td>Disponible<br><span class="v">' +
+    (cli.disponible !== '' ? g(cli.disponible) : '—') + '</span></td></tr></table>';
+  h += '<h2>Créditos</h2><table><tr><th>N°</th><th>Fecha</th><th>Origen</th><th class="n">Total</th><th class="n">Cobrado</th><th class="n">Saldo</th><th>Estado</th></tr>' +
+    (ec.creditos.length ? filas(ec.creditos, function (c) {
+      return '<tr><td>' + escHtml_(c.id) + (c.venta ? '<br><span class="tenue">venta ' + escHtml_(c.venta) + '</span>' : '') + (c.legado ? '<br><span class="tenue">N° ' + escHtml_(c.legado) + '</span>' : '') +
+        '</td><td>' + f(c.fecha) + '</td><td>' + escHtml_(c.origen) + (c.recargo ? '<br><span class="tenue">recargo ' + g(c.recargo) + '</span>' : '') + '</td><td class="n">' + g(c.total) +
+        '</td><td class="n">' + g(c.cobrado) + '</td><td class="n">' + g(c.saldo) + '</td><td>' + escHtml_(c.estado) + (c.atraso ? ' · ' + c.atraso + ' días' : '') + '</td></tr>';
+    }) : vacio(7, 'Sin créditos.')) + '</table>';
+  const pendientes = [];
+  ec.creditos.forEach(function (c) { (c.cuotas || []).forEach(function (q) { if (q.falta > 0 && c.saldo > 0) pendientes.push({ c: c, q: q }); }); });
+  h += '<h2>Cuotas pendientes</h2><table><tr><th>Crédito</th><th>Pago</th><th>Vence</th><th class="n">Monto</th><th class="n">Pagado</th><th class="n">Falta</th><th>Estado</th></tr>' +
+    (pendientes.length ? filas(pendientes, function (x) {
+      return '<tr><td>' + escHtml_(x.c.id) + '</td><td>' + (x.q.n === 0 ? 'Entrega' : 'Cuota ' + x.q.n) + '</td><td>' + f(x.q.vto) + '</td><td class="n">' + g(x.q.monto) + '</td><td class="n">' +
+        g(x.q.pagado) + '</td><td class="n">' + g(x.q.falta) + '</td><td>' + escHtml_(x.q.estado) + '</td></tr>';
+    }) : vacio(7, ec.creditos.some(function (c) { return c.saldo > 0 && c.estadoPlan === PLAN_.A_CONFIRMAR; }) ? 'Hay saldos con plan A CONFIRMAR (todavía sin cuotas).' : 'Sin cuotas pendientes.')) + '</table>';
+  h += '<h2>Cobros</h2><table><tr><th>Fecha</th><th>N°</th><th>Recibo / operación</th><th>Medio</th><th>Concepto</th><th class="n">Monto</th><th>Aplicación</th></tr>' +
+    (ec.cobros.length ? filas(ec.cobros, function (c) {
+      return '<tr' + (c.anulado ? ' class="tenue"' : '') + '><td>' + f(c.fecha) + '</td><td>' + escHtml_(c.id) + '</td><td>' + escHtml_(c.recibo ? 'Recibo ' + c.recibo : (c.operacion ? 'Op. ' + c.operacion : '—')) +
+        '</td><td>' + escHtml_(c.medio) + '</td><td>' + escHtml_(c.concepto) + '</td><td class="n">' + g(c.monto) + '</td><td>' + escHtml_(c.anulado ? 'ANULADO' + (c.motivoAnulacion ? ': ' + c.motivoAnulacion : '') : c.aplicacion) + '</td></tr>';
+    }) : vacio(7, 'Sin cobros registrados.')) + '</table>';
+  if (ec.recargos.length) {
+    h += '<h2>Recargos</h2><table><tr><th>Fecha</th><th>Tipo</th><th>Crédito</th><th>Detalle</th><th class="n">Monto</th></tr>' + filas(ec.recargos, function (x) {
+      return '<tr><td>' + f(x.fecha) + '</td><td>' + (x.tipo === 'MORA' ? 'Por mora' : 'Financiero') + '</td><td>' + escHtml_(x.credito || '—') + '</td><td>' + escHtml_(x.detalle) + '</td><td class="n">' + g(x.monto) + '</td></tr>';
+    }) + '</table>';
+  }
+  if (ec.ventas.length) {
+    h += '<h2>Ventas a crédito</h2><table><tr><th>N° venta</th><th>Fecha</th><th>Crédito</th><th class="n">Total</th><th>Estado</th></tr>' + filas(ec.ventas, function (v) {
+      return '<tr><td>' + escHtml_(v.id) + '</td><td>' + f(v.fecha) + '</td><td>' + escHtml_(v.nroCredito || '—') + '</td><td class="n">' + g(v.total) + '</td><td>' + escHtml_(v.estado) + '</td></tr>';
+    }) + '</table>';
+  }
+  if (ec.porConfirmar.length) {
+    h += '<h2>Pagos mencionados, por confirmar (no descuentan el saldo)</h2><table><tr><th>N°</th><th>Crédito</th><th class="n">Monto</th><th>Fuente</th></tr>' + filas(ec.porConfirmar, function (x) {
+      return '<tr><td>' + escHtml_(x.id) + '</td><td>' + escHtml_(x.credito) + '</td><td class="n">' + g(x.monto) + '</td><td>' + escHtml_(x.fuente) + '</td></tr>';
+    }) + '</table>';
+  }
+  h += '<p class="ec-pie">Documento informativo de la cuenta corriente: no reemplaza a la factura ni al recibo. Los cobros se aplican primero a la entrega y después a la cuota más antigua. ' +
+    (ec.moraHabilitada ? '' : 'No se calculan recargos por mora.') + '</p></div>';
+  return { titulo: titulo, css: cssEstadoCuenta_(), cuerpo: h };
+}
+
+/** Documento HTML completo (A4) para convertir a PDF. */
+function documentoHtml_(titulo, css, cuerpo) {
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + escHtml_(titulo) + '</title><style>@page{size:A4;margin:14mm}body{margin:0}' + css + '</style></head><body>' + cuerpo + '</body></html>';
+}
+
+function nombreArchivo_(s) {
+  return String(s || '').replace(/[\\/:*?"<>|#%]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+/**
+ * Convierte HTML a PDF (Blob.getAs('application/pdf')) y lo guarda en «Distribuidora MB/Exportaciones». Si quien exporta
+ * es OPERATIVA, se le comparte ese único archivo como lectora (sin aviso) para que el enlace le funcione.
+ */
+function exportarPdf_(ctx, html, nombre) {
+  if (MODO_PRUEBA_) return guardarArchivoSistema_(Utilities.newBlob(html, 'text/html', nombre), 'Exportaciones', nombre);
+  const pdf = Utilities.newBlob(html, 'text/html', nombre.replace(/\.pdf$/i, '') + '.html').getAs('application/pdf');
+  pdf.setName(nombre);
+  const a = guardarArchivoSistema_(pdf, 'Exportaciones', nombre);
+  if (!esAdministradora_(ctx.usuario)) {
+    const r = compartirSinAviso_(a.id, ctx.email, 'reader');
+    if (/^ERROR/.test(r)) a.aviso = 'El PDF se guardó, pero no se pudo compartir con ' + ctx.email + ' (' + r + '): pídaselo a una administradora o use «Imprimir».';
+  }
+  return a;
+}
+
+function exportarEstadoCuenta_(ctx) {
+  const ec = estadoCuentaCliente_(ctx.ss, ctx.tz, ctx.datos.codigo, esAdministradora_(ctx.usuario));
+  const h = htmlEstadoCuenta_(ec);
+  const nombre = nombreArchivo_('Estado de cuenta ' + ec.cliente.codigo + ' ' + ec.cliente.nombre + ' ' + ec.corte) + '.pdf';
+  const a = exportarPdf_(ctx, documentoHtml_(h.titulo, h.css, h.cuerpo), nombre);
+  conBloqueo_(function () {
+    auditarEvento_(ctx.ss, ctx.email, ctx.usuario.rol, 'Exportar estado de cuenta', ec.cliente.codigo + ' → «' + nombre + '» (Exportaciones)', '', '', '', ctx.usuario.metodo, 'DISTRIBUIDORA');
+  });
+  return { ok: true, url: a.url || '', nombre: nombre, mensaje: 'Estado de cuenta exportado a PDF: «' + nombre + '» (Distribuidora MB › Exportaciones).' + (a.aviso ? ' ' + a.aviso : '') };
+}

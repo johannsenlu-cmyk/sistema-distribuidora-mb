@@ -1,0 +1,2297 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Base de clientes e historial (v2.3 · Fase 3 · R1)
+ * =====================================================================
+ *  R1.1 «Base de datos» en la app: alta, edición, búsqueda, filtros, completitud y exportación CSV (Drive › Exportaciones).
+ *  R1.2 Tipos PELUQUERÍA / CLIENTA DEL SALÓN / OTRO. «Peluquerías» (C-xxxx) y «Clientas salón» (CS-xxxx) tienen el mismo
+ *       contrato de columnas. La hoja la decide el tipo en el alta y un cliente nunca cambia de hoja. Nadie se duplica
+ *       entre hojas: RUC y CI son únicos en las dos.
+ *  R1.3 Obligatorios por tipo (alta completa o se rechaza); RUC con formato y dígito verificador (módulo 11 de la SET,
+ *       desactivable en «Configuración»); celular normalizado a 595XXXXXXXXX.
+ *  R1.4 Lo cargado o importado incompleto nunca se rechaza ni se pierde: queda INCOMPLETA con la lista exacta de
+ *       faltantes y bloquea la venta a crédito (Cartera.gs), la factura electrónica y WhatsApp (Fase 6, clienteHabilitado_).
+ *       Panel «Pendientes de completar» con edición rápida y CSV de faltantes.
+ *  R1.5 Clientas de «Servicios realizados» (texto libre) → «Clientas salón» INCOMPLETA; «Código cliente» solo por
+ *       coincidencia exacta o aprobación de una administradora; las variantes se proponen como REVISAR y nunca se
+ *       fusionan solas (paso de migrarDatosAntiguos: vista previa + confirmación).
+ *  R1.6 Historial retroactivo: todo entra a «Importación · Historial» (dato original, normalizado, fuente, referencia,
+ *       confianza, huella, LISTO / REVISAR / DUPLICADO). Nada pasa a Ventas sin aprobación en lote de una administradora;
+ *       las ventas aprobadas son «H-», Origen HISTÓRICO, sin stock salvo decisión explícita; una venta histórica a crédito
+ *       se concilia con su saldo HISTÓRICO (9001–9020) y no se suma aparte.
+ *  Todas las escrituras pasan por ejecutar_ (bloqueo, idempotencia, rol validado en el servidor y Auditoría).
+ * =====================================================================
+ */
+
+const CLIENTES_ = Object.freeze({
+  PELUQUERIA: 'PELUQUERÍA',
+  SALON: 'CLIENTA DEL SALÓN',
+  OTRO: 'OTRO',
+  COMPLETA: 'COMPLETA',
+  INCOMPLETA: 'INCOMPLETA',
+  USUARIO_MIGRACION: 'Migración v2.3 (Servicios realizados)',
+  PASO_MIGRACION: 'Clientas del salón (R1.5)',
+});
+
+/** Obligatorios por tipo (R1.3): [clave, etiqueta que se escribe en «Campos faltantes»]. */
+const REQUISITOS_CLIENTE_ = Object.freeze({
+  EMPRESA: Object.freeze([['nombre', 'Nombre comercial'], ['razonSocial', 'Razón social'], ['ruc', 'RUC'], ['contacto', 'Contacto principal'],
+    ['direccion', 'Dirección'], ['celular', 'Celular'], ['ciudad', 'Ciudad']]),
+  SALON: Object.freeze([['nombre', 'Nombre'], ['celular', 'Celular']]),
+});
+
+/** Marcas en «Observación» (legibles para Mirian y fáciles de buscar): propuesta, unificación y descarte (R1.5). */
+const MARCA_CLIENTE_ = Object.freeze({ REVISAR: '[REVISAR UNIFICACIÓN: ', UNIFICADA: '[UNIFICADA EN ', DISTINTA: '[DISTINTA DE ' });
+
+// ─────────────────────── 1. Tipo, obligatorios y completitud (R1.2 – R1.4) ───────────────────────
+
+/** Hoja de un código: CS-xxxx → «Clientas salón»; el resto → «Peluquerías». */
+function hojaDeCodigo_(codigo) {
+  return /^CS-/i.test(String(codigo || '').trim()) ? 'clientasSalon' : 'peluquerias';
+}
+
+/** Tipo de cliente reconocido ('' si está vacío o no es uno de los tres). */
+function tipoCliente_(valor) {
+  const k = normalizar_(valor);
+  if (k === 'peluqueria') return CLIENTES_.PELUQUERIA;
+  if (k === 'clienta del salon' || k === 'clienta salon') return CLIENTES_.SALON;
+  if (k === 'otro') return CLIENTES_.OTRO;
+  return '';
+}
+
+/** Tipo enviado por la pantalla: vacío = '' ; otro texto = error claro. */
+function tipoClienteValido_(valor) {
+  const s = texto_(valor, 40);
+  if (!s) return '';
+  const t = tipoCliente_(s);
+  if (!t) throw errorUsuario_('Tipo de cliente no válido: elija PELUQUERÍA, CLIENTA DEL SALÓN u OTRO.');
+  return t;
+}
+
+/** Tipo con el que se evalúan los obligatorios: el de la fila o, si falta, el de su hoja. */
+function tipoEfectivo_(fila, hoja) {
+  return tipoCliente_(fila && fila.tipo) || ((hoja || hojaDeCodigo_(fila && fila.codigo)) === 'clientasSalon' ? CLIENTES_.SALON : CLIENTES_.PELUQUERIA);
+}
+
+function requisitosCliente_(tipo) {
+  return tipo === CLIENTES_.SALON ? REQUISITOS_CLIENTE_.SALON : REQUISITOS_CLIENTE_.EMPRESA;
+}
+
+function etiquetaCampoCliente_(clave) {
+  return {
+    nombre: 'Nombre', razonSocial: 'Razón social', ruc: 'RUC', contacto: 'Contacto principal', direccion: 'Dirección', celular: 'Celular',
+    ciudad: 'Ciudad', tipo: 'Tipo de cliente', ci: 'CI',
+  }[clave] || clave;
+}
+
+/** Celular utilizable (595XXXXXXXXX): el de «Celular» o, si está vacío, el «Teléfono» cuando es un celular paraguayo. */
+function celularDe_(fila) {
+  const propio = texto_(fila && fila.celular);
+  if (propio) return normalizarCelular_(propio);
+  return normalizarCelular_(fila && fila.telefono);
+}
+
+/** true = dato cargado y válido. Lo usan los faltantes y el control «no borrar un obligatorio que ya estaba». */
+function datosValidosCliente_(fila, validarDv) {
+  const f = fila || {};
+  const ruc = texto_(f.ruc);
+  let ciOk = true;
+  if (texto_(f.ci)) {
+    try { normalizarCi_(f.ci); } catch (e) { ciOk = false; }
+  }
+  return {
+    tipo: !!tipoCliente_(f.tipo),
+    nombre: !!texto_(f.nombre),
+    razonSocial: !!texto_(f.razonSocial),
+    contacto: !!texto_(f.contacto),
+    direccion: !!texto_(f.direccion),
+    ciudad: !!texto_(f.ciudad),
+    ruc: !!ruc && !revisarRuc_(ruc, validarDv !== false).error,
+    rucCargado: !!ruc,
+    celular: !!celularDe_(f),
+    celularCargado: !!texto_(f.celular),
+    ci: ciOk,
+  };
+}
+
+/**
+ * Lista EXACTA de faltantes (R1.4), con las etiquetas de «Campos faltantes». Un dato cargado pero inválido figura como
+ * «RUC válido», «Celular válido» o «CI válida». Sin tipo: «Tipo de cliente» + los obligatorios de su hoja.
+ * La categoría de crédito NO es parte de la completitud: se exige aparte para vender a crédito (ASIGNAR CATEGORÍA).
+ */
+function faltantesCliente_(fila, hoja, validarDv) {
+  const f = fila || {};
+  const v = datosValidosCliente_(f, validarDv);
+  const tipo = tipoEfectivo_(f, hoja);
+  const lista = [];
+  if (!v.tipo) lista.push('Tipo de cliente');
+  requisitosCliente_(tipo).forEach(function (r) {
+    if (r[0] === 'ruc') { if (!v.ruc) lista.push(v.rucCargado ? 'RUC válido' : r[1]); return; }
+    if (r[0] === 'celular') { if (!v.celular) lista.push(v.celularCargado ? 'Celular válido' : r[1]); return; }
+    if (!v[r[0]]) lista.push(r[1]);
+  });
+  if (tipo === CLIENTES_.SALON && v.rucCargado && !v.ruc) lista.push('RUC válido');
+  if (!v.ci) lista.push('CI válida');
+  return lista;
+}
+
+function completitudDe_(faltantes) {
+  return faltantes.length ? CLIENTES_.INCOMPLETA : CLIENTES_.COMPLETA;
+}
+
+/**
+ * Recalcula «Completitud» y «Campos faltantes» de las dos hojas (los mantiene el sistema: solo escribe lo que cambió;
+ * así también se corrige lo editado a mano en la hoja). tablas: [{ clave, tabla }] opcional.
+ */
+function recalcularCompletitud_(ss, tz, tablas) {
+  const lista = tablas || tablasBaseClientes_(ss, tz);
+  const validarDv = configSi_(ss, CFG.RUC_DV);
+  const r = { incompletas: 0, completas: 0, cambios: 0 };
+  lista.forEach(function (tc) {
+    if (!tc || !tc.tabla) return;
+    const comp = {};
+    const falt = {};
+    tc.tabla.filas.forEach(function (f) {
+      if (!clave_(f.codigo)) return;
+      const l = faltantesCliente_(f, tc.clave, validarDv);
+      const c = completitudDe_(l);
+      if (c === CLIENTES_.COMPLETA) r.completas++; else r.incompletas++;
+      const t = l.join(', ');
+      if (f.completitud !== c) { comp[f._fila] = c; r.cambios++; }
+      if (f.faltantes !== t) { falt[f._fila] = t; r.cambios++; }
+    });
+    if (Object.keys(comp).length) escribirColumna_(tc.tabla, 'completitud', comp, tz);
+    if (Object.keys(falt).length) escribirColumna_(tc.tabla, 'faltantes', falt, tz);
+  });
+  return r;
+}
+
+/**
+ * ¿Se puede usar el cliente para algo que exige la ficha completa? uso: 'credito' | 'factura' | 'whatsapp'.
+ * Lo usan la cartera (venta a crédito) y, en la Fase 6, la factura electrónica, el KuDE y WhatsApp. { ok, faltantes, mensaje }.
+ */
+function clienteHabilitado_(ss, tz, codigo, uso) {
+  const f = buscarClienteEnBase_(ss, tz, codigo);
+  if (!f) return { ok: false, faltantes: [], mensaje: 'No se encontró el cliente ' + codigo + '.' };
+  const falt = faltantesCliente_(f, hojaDeCodigo_(f.codigo), configSi_(ss, CFG.RUC_DV));
+  return { ok: !falt.length, faltantes: falt, mensaje: falt.length ? mensajeIncompleta_(falt, uso) : '' };
+}
+
+function mensajeIncompleta_(faltantes, uso) {
+  const para = { credito: 'venderle a crédito', factura: 'emitirle una factura electrónica', whatsapp: 'enviarle mensajes por WhatsApp' }[uso] || 'esta operación';
+  return 'CLIENTA INCOMPLETA: falta ' + faltantes.join(', ') + '. Complete sus datos en «Base de datos» antes de ' + para + '.';
+}
+
+// ─────────────────────── 2. Las dos hojas de clientes ───────────────────────
+
+/** «Peluquerías» y «Clientas salón» (si existe) como [{ clave, tabla }] (mismo contrato de columnas). */
+function tablasBaseClientes_(ss, tz) {
+  const lista = [{ clave: 'peluquerias', tabla: leerTabla_(ss, 'peluquerias', tz) }];
+  if (ss.getSheetByName(ESQUEMA.clientasSalon.hoja)) {
+    try { lista.push({ clave: 'clientasSalon', tabla: leerTabla_(ss, 'clientasSalon', tz) }); } catch (e) { console.warn('Clientas salón: ' + e.message); }
+  }
+  return lista;
+}
+
+/** { tablas: { peluquerias, clientasSalon }, filas: [{ hoja, tabla, fila }] } con todas las filas con código. */
+function baseClientes_(ss, tz) {
+  const tablas = {};
+  const filas = [];
+  tablasBaseClientes_(ss, tz).forEach(function (tc) {
+    tablas[tc.clave] = tc.tabla;
+    tc.tabla.filas.forEach(function (f) { if (clave_(f.codigo)) filas.push({ hoja: tc.clave, tabla: tc.tabla, fila: f }); });
+  });
+  return { tablas: tablas, filas: filas };
+}
+
+/** Cliente (fila de su hoja) por código en cualquiera de las dos hojas, o null. Lo usa prepararVenta_ (Código.gs). */
+function buscarClienteEnBase_(ss, tz, codigo) {
+  const k = clave_(codigo);
+  if (!k) return null;
+  const orden = hojaDeCodigo_(k) === 'clientasSalon' ? ['clientasSalon', 'peluquerias'] : ['peluquerias', 'clientasSalon'];
+  for (let i = 0; i < orden.length; i++) {
+    if (!ss.getSheetByName(ESQUEMA[orden[i]].hoja)) continue;
+    const f = buscarPorCodigo_(leerTabla_(ss, orden[i], tz).filas, k);
+    if (f) return f;
+  }
+  return null;
+}
+
+function rucBase_(ruc) {
+  const m = String(ruc || '').trim().match(/^(\d{3,9})-\d$/);
+  return m ? m[1] : '';
+}
+
+function ciLimpia_(ci) {
+  return String(ci === null || ci === undefined ? '' : ci).replace(/[.\s]/g, '').trim();
+}
+
+/**
+ * Duplicados en las DOS hojas (R1.2 / R1.3): mismo RUC o misma CI → rechazo. RUC de una = CI de otra, mismo celular o
+ * mismo nombre en «Clientas salón» o en la otra hoja → aviso (puede ser la misma persona). En «Peluquerías» el mismo
+ * nombre se rechaza, como en la v2.1. propio: código que se está editando (se excluye).
+ */
+function revisarDuplicadosCliente_(filas, datos, hoja, propio) {
+  const r = { errores: [], avisos: [] };
+  const ruc = clave_(datos.ruc);
+  const ci = ciLimpia_(datos.ci);
+  const base = rucBase_(ruc);
+  const cel = celularDe_(datos);
+  const n = normalizar_(datos.nombre);
+  filas.forEach(function (x) {
+    const f = x.fila;
+    if (propio && clave_(f.codigo) === clave_(propio)) return;
+    const quien = f.codigo + ' «' + f.nombre + '»' + (esActivo_(f.activo) ? '' : ' (inactivo)');
+    const rucOtro = clave_(f.ruc);
+    const ciOtro = ciLimpia_(f.ci);
+    if (ruc && rucOtro === ruc) r.errores.push('Ya existe un cliente con el RUC ' + ruc + ': ' + quien + '. No se duplican clientes: use esa ficha.');
+    else if (ci && ciOtro === ci) r.errores.push('Ya existe un cliente con la CI ' + ci + ': ' + quien + '. No se duplican clientes: use esa ficha.');
+    else if ((base && ciOtro === base) || (ci && rucBase_(rucOtro) === ci)) r.avisos.push('El RUC o la CI coincide con ' + quien + ': revise si es la misma persona.');
+    if (n && normalizar_(f.nombre) === n) {
+      if (hoja === 'peluquerias' && x.hoja === 'peluquerias') {
+        r.errores.push('Ya existe «' + f.nombre + '» (código ' + f.codigo + ')' + (esActivo_(f.activo) ? '' : ', inactivo: reactívelo en lugar de crear otro') + '.');
+      } else {
+        r.avisos.push('Mismo nombre que ' + quien + ': si es la misma persona, use esa ficha.');
+      }
+    }
+    if (cel && celularDe_(f) === cel) r.avisos.push('El celular ya figura en ' + quien + '.');
+  });
+  return r;
+}
+
+function correoCliente_(valor) {
+  const s = texto_(valor, 120).toLowerCase();
+  if (s && !correoValido_(s)) throw errorUsuario_('El correo «' + s + '» no es válido.');
+  return s;
+}
+
+function zonaCliente_(valor) {
+  const k = normalizar_(valor);
+  if (!k) return '';
+  const z = LISTAS.ZONAS.filter(function (x) { return normalizar_(x) === k; })[0];
+  if (!z) throw errorUsuario_('Zona no válida: elija ' + LISTAS.ZONAS.join(', ') + '.');
+  return z;
+}
+
+/** Texto de un campo para comparar «antes / después» (vacío, null y undefined son lo mismo). */
+function textoCampo_(v) {
+  return v === null || v === undefined ? '' : String(v);
+}
+
+// ─────────────────────── 3. Alta y edición (R1.1 – R1.4) ───────────────────────
+
+function guardarCliente(req) { return ejecutar_('guardarCliente', req, 'escritura', function (ctx) { return guardarCliente_(ctx, ''); }); }
+
+/**
+ * Alta o edición de un cliente (Base de datos; también «guardarPeluqueria» de la v2.1 con hojaDefecto 'peluquerias').
+ *  - Alta: la hoja la decide el tipo (CLIENTA DEL SALÓN → «Clientas salón», CS-; el resto → «Peluquerías», C-) y se
+ *    exigen TODOS los obligatorios del tipo: si falta alguno, se rechaza con la lista.
+ *  - Edición: los campos que la pantalla no envía conservan su valor; se guarda aunque siga INCOMPLETA (edición rápida),
+ *    pero nunca se borra un obligatorio que ya estaba cargado. Un cliente nunca cambia de hoja.
+ *  - La categoría de crédito solo la asigna o cambia una administradora.
+ */
+function guardarCliente_(ctx, hojaDefecto) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const validarDv = configSi_(ctx.ss, CFG.RUC_DV);
+  const base = baseClientes_(ctx.ss, tz);
+  const original = clave_(d.codigoOriginal);
+  let actual = null;
+  if (original) {
+    actual = base.filas.filter(function (x) { return clave_(x.fila.codigo) === original; })[0] || null;
+    if (!actual) throw errorUsuario_('El cliente ' + original + ' no existe. Actualice los datos e intente nuevamente.');
+  }
+  const previo = actual ? actual.fila : {};
+  const tiene = function (k) { return Object.prototype.hasOwnProperty.call(d, k); };
+  let tipo = tiene('tipo') ? tipoClienteValido_(d.tipo) : '';
+  if (!tipo) tipo = actual ? tipoCliente_(previo.tipo) : (hojaDefecto === 'clientasSalon' ? CLIENTES_.SALON : CLIENTES_.PELUQUERIA);
+  const hoja = actual ? actual.hoja : (tipo === CLIENTES_.SALON ? 'clientasSalon' : 'peluquerias');
+  const tabla = base.tablas[hoja];
+  if (!tabla) throw errorUsuario_('Falta la hoja «' + ESQUEMA[hoja].hoja + '». Una administradora debe ingresar para que el sistema la cree.');
+  const tipoEval = tipo || tipoEfectivo_(previo, hoja);
+  const val = function (k, max) { return tiene(k) ? texto_(d[k], max) : textoCampo_(previo[k]); };
+
+  const nuevo = {
+    tipo: tipo,
+    nombre: (tiene('nombre') || !actual) ? requerirTexto_(d.nombre, tipoEval === CLIENTES_.SALON ? 'Nombre' : 'Nombre comercial', 100) : textoCampo_(previo.nombre),
+    razonSocial: val('razonSocial', 150),
+    contacto: val('contacto', 80),
+    telefono: val('telefono', 40),
+    ciudad: val('ciudad', 60),
+    direccion: val('direccion', 150),
+    alias: val('alias', 300),
+    observacion: val('observacion', 600),
+    ruc: tiene('ruc') ? validarRuc_(d.ruc, { validarDv: validarDv }) : textoCampo_(previo.ruc),
+    ci: tiene('ci') ? normalizarCi_(d.ci) : textoCampo_(previo.ci),
+    correo: tiene('correo') ? correoCliente_(d.correo) : textoCampo_(previo.correo),
+    zona: tiene('zona') ? zonaCliente_(d.zona) : textoCampo_(previo.zona),
+    activo: tiene('activo') ? activoDe_(d.activo) : (actual ? (textoCampo_(previo.activo) || 'Sí') : 'Sí'),
+  };
+  let celular = textoCampo_(previo.celular);
+  if (tiene('celular')) {
+    const bruto = texto_(d.celular, 40);
+    celular = bruto ? normalizarCelular_(bruto) : '';
+    if (bruto && !celular) throw errorUsuario_('El celular «' + bruto + '» no es válido. Escríbalo como 0981 123 456 (se guarda como 595981123456).');
+  }
+  if (!celular) celular = normalizarCelular_(nuevo.telefono);
+  nuevo.celular = celular;
+  if (tiene('categoria')) {
+    const cat = validarCategoria_(ctx.ss, tz, d.categoria);
+    if (cat !== clave_(previo.categoria || '')) {
+      exigirAdministradora_(ctx, 'asignar o cambiar la categoría de crédito');
+      nuevo.categoria = cat;
+    }
+  }
+
+  const resultante = Object.assign({}, previo, nuevo);
+  const faltan = faltantesCliente_(resultante, hoja, validarDv);
+  if (!actual && faltan.length) {
+    const quien = tipoEval === CLIENTES_.SALON ? 'una clienta del salón' : (tipoEval === CLIENTES_.OTRO ? 'un cliente (OTRO)' : 'una peluquería');
+    throw errorUsuario_('Faltan datos obligatorios para registrar ' + quien + ': ' + faltan.join(', ') + '.');
+  }
+  if (actual) {
+    const antes = datosValidosCliente_(previo, validarDv);
+    const despues = datosValidosCliente_(resultante, validarDv);
+    const requeridos = requisitosCliente_(tipoEfectivo_(resultante, hoja)).map(function (r) { return r[0]; }).concat(['tipo']);
+    const perdidos = requeridos.filter(function (k) { return antes[k] && !despues[k]; });
+    if (perdidos.length) {
+      throw errorUsuario_('No se puede borrar un dato obligatorio que ya estaba cargado: ' + perdidos.map(etiquetaCampoCliente_).join(', ') + '. Corríjalo en lugar de dejarlo vacío.');
+    }
+  }
+  const dup = revisarDuplicadosCliente_(base.filas, resultante, hoja, actual ? previo.codigo : '');
+  if (dup.errores.length) throw errorUsuario_(dup.errores[0]);
+
+  nuevo.completitud = completitudDe_(faltan);
+  nuevo.faltantes = faltan.join(', ');
+  const ahora = new Date();
+  let codigo;
+  let recalcular = false;
+  let cambioNombre = false;
+  if (actual) {
+    codigo = previo.codigo;
+    const cambios = {};
+    Object.keys(nuevo).forEach(function (k) { if (textoCampo_(nuevo[k]) !== textoCampo_(previo[k])) cambios[k] = nuevo[k]; });
+    if (!Object.keys(cambios).length) {
+      return { mensaje: 'Sin cambios en «' + previo.nombre + '».', codigo: codigo, completitud: nuevo.completitud, faltantes: faltan };
+    }
+    recalcular = Object.prototype.hasOwnProperty.call(cambios, 'categoria') || Object.prototype.hasOwnProperty.call(cambios, 'activo');
+    cambioNombre = Object.prototype.hasOwnProperty.call(cambios, 'nombre');
+    cambios.actualizado = ahora;
+    cambios.usuario = ctx.email;
+    actualizarCeldas_(tabla, previo._fila, cambios, tz);
+  } else {
+    codigo = siguienteCodigo_(tabla.filas.map(function (f) { return f.codigo; }), hoja === 'clientasSalon' ? 'CS-' : 'C-', 4);
+    agregarFilas_(tabla, [Object.assign({ codigo: codigo, alta: hoy_(tz), actualizado: ahora, usuario: ctx.email }, nuevo)], tz);
+    recalcular = true;
+    cambioNombre = true;
+  }
+  const vinculados = cambioNombre ? vincularServiciosPorNombre_(ctx.ss, tz, codigo, nuevo.nombre) : 0;
+  if (recalcular && typeof recalcularCartera_ === 'function') recalcularCartera_(ctx.ss, tz);
+  const estado = faltan.length ? ' Queda INCOMPLETA: falta ' + faltan.join(', ') + ' (no se le vende a crédito hasta completarla).' : ' Ficha COMPLETA.';
+  const extra = (vinculados ? ' Se vincularon ' + cantidadTexto_(vinculados, 'servicio realizado', 'servicios realizados') + ' con el mismo nombre.' : '') +
+    (dup.avisos.length ? ' Aviso: ' + dup.avisos.join(' ') : '');
+  return {
+    mensaje: (actual ? 'Datos de «' + nuevo.nombre + '» actualizados.' : 'Se registró «' + nuevo.nombre + '» con el código ' + codigo + '.') + estado + extra,
+    codigo: codigo, completitud: nuevo.completitud, faltantes: faltan, avisos: dup.avisos,
+  };
+}
+
+function cantidadTexto_(n, uno, varios) {
+  return miles_(n) + ' ' + (n === 1 ? uno : varios);
+}
+
+// ─────────────────────── 4. Nombres de clientas: texto exacto, variantes y vínculos (R1.5) ───────────────────────
+
+/** Texto del cliente tal como se escribió (espacios repetidos y extremos fuera; nada más cambia). */
+function textoClienteServicio_(valor) {
+  return texto_(valor, 150);
+}
+
+/** «Sin nombre» (o equivalentes evidentes) no identifica a nadie: no se crea clienta ni se vincula. */
+function esSinNombre_(texto) {
+  const k = normalizar_(texto);
+  return !k || k === 'sin nombre' || k === 's/n' || /^[-–—.\s]+$/.test(k);
+}
+
+function marcasCliente_(observacion) {
+  const s = String(observacion || '');
+  const uni = s.match(/\[UNIFICADA EN ([A-Z]{1,3}-\d+)\]/i);
+  const distintas = [];
+  const re = /\[DISTINTA DE ([A-Z]{1,3}-\d+)\]/gi;
+  let m;
+  while ((m = re.exec(s)) !== null) distintas.push(clave_(m[1]));
+  return { unificadaEn: uni ? clave_(uni[1]) : '', distintas: distintas, revisar: s.indexOf(MARCA_CLIENTE_.REVISAR) >= 0 };
+}
+
+/** Quita la marca de propuesta «[REVISAR UNIFICACIÓN: …]» de una observación. */
+function sinMarcaRevisar_(observacion) {
+  return String(observacion || '').replace(/\s*\[REVISAR UNIFICACIÓN:[^\]]*\]/g, '').trim();
+}
+
+/** Distancia de edición (Levenshtein) con tope: devuelve tope + 1 si la supera. */
+function distanciaEdicion_(a, b, tope) {
+  if (Math.abs(a.length - b.length) > tope) return tope + 1;
+  let previa = [];
+  for (let j = 0; j <= b.length; j++) previa[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    const fila = [i];
+    let minimo = i;
+    for (let j = 1; j <= b.length; j++) {
+      fila[j] = Math.min(previa[j] + 1, fila[j - 1] + 1, previa[j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1));
+      if (fila[j] < minimo) minimo = fila[j];
+    }
+    if (minimo > tope) return tope + 1;
+    previa = fila;
+  }
+  return previa[b.length];
+}
+
+/**
+ * ¿Dos nombres pueden ser la misma persona? Devuelve el motivo o ''. Criterios (solo PROPONEN; nunca fusionan):
+ *  - iguales sin mayúsculas ni tildes («JULIETA ALHELÌ …» / «Julieta Alhelí …»);
+ *  - uno es el comienzo del otro, con al menos dos palabras («María Pia» / «María Pia Garcia»);
+ *  - mismas palabras salvo una que difiere en una sola letra («Melisa» / «Melissa»; palabras de 4 letras o más, sin números).
+ */
+function similitudNombres_(a, b) {
+  const x = normalizar_(a);
+  const y = normalizar_(b);
+  if (!x || !y) return '';
+  if (x === y) return 'mismo nombre con otras mayúsculas o tildes';
+  const tx = x.split(' ');
+  const ty = y.split(' ');
+  const corto = tx.length <= ty.length ? tx : ty;
+  const largo = tx.length <= ty.length ? ty : tx;
+  if (corto.length >= 2 && corto.length < largo.length && corto.every(function (w, i) { return w === largo[i]; })) return 'un nombre es el comienzo del otro';
+  if (tx.length === ty.length) {
+    let distintas = 0;
+    let parecidas = true;
+    for (let i = 0; i < tx.length; i++) {
+      if (tx[i] === ty[i]) continue;
+      distintas++;
+      if (!/^[a-z]{4,}$/.test(tx[i]) || !/^[a-z]{4,}$/.test(ty[i]) || distanciaEdicion_(tx[i], ty[i], 1) > 1) parecidas = false;
+    }
+    if (distintas === 1 && parecidas) return 'difieren en una letra';
+  }
+  return '';
+}
+
+/**
+ * Agrupa registros [{ codigo, nombre }] que pueden ser la misma persona (unión transitiva). distintas: { 'A|B': true }
+ * con los pares que una administradora ya marcó como personas distintas. Devuelve [{ miembros: [registro], motivos: [] }].
+ */
+function gruposVariantes_(registros, distintas) {
+  const padre = registros.map(function (r, i) { return i; });
+  const raiz = function (i) { while (padre[i] !== i) { padre[i] = padre[padre[i]]; i = padre[i]; } return i; };
+  const motivos = {};
+  for (let i = 0; i < registros.length; i++) {
+    for (let j = i + 1; j < registros.length; j++) {
+      const a = clave_(registros[i].codigo);
+      const b = clave_(registros[j].codigo);
+      if (distintas && (distintas[a + '|' + b] || distintas[b + '|' + a])) continue;
+      const m = similitudNombres_(registros[i].nombre, registros[j].nombre);
+      if (!m) continue;
+      const ri = raiz(i);
+      const rj = raiz(j);
+      if (ri !== rj) padre[rj] = ri;
+      (motivos[a + '|' + b] = m);
+    }
+  }
+  const porRaiz = {};
+  const orden = [];
+  registros.forEach(function (r, i) {
+    const k = raiz(i);
+    if (!porRaiz[k]) { porRaiz[k] = []; orden.push(k); }
+    porRaiz[k].push(r);
+  });
+  return orden.map(function (k) { return porRaiz[k]; }).filter(function (g) { return g.length > 1; }).map(function (g) {
+    const cods = g.map(function (r) { return clave_(r.codigo); });
+    const lista = [];
+    Object.keys(motivos).forEach(function (par) {
+      const p = par.split('|');
+      if (cods.indexOf(p[0]) >= 0 && cods.indexOf(p[1]) >= 0 && lista.indexOf(motivos[par]) < 0) lista.push(motivos[par]);
+    });
+    return { miembros: g, motivos: lista };
+  });
+}
+
+/** Principal sugerido de un grupo: el nombre más completo; a igualdad, el que no está todo en mayúsculas, el de más servicios y el código menor. */
+function principalSugerido_(miembros) {
+  return miembros.slice().sort(function (a, b) {
+    const pa = normalizar_(a.nombre).split(' ').length;
+    const pb = normalizar_(b.nombre).split(' ').length;
+    if (pa !== pb) return pb - pa;
+    const ma = a.nombre === String(a.nombre).toUpperCase() ? 1 : 0;
+    const mb = b.nombre === String(b.nombre).toUpperCase() ? 1 : 0;
+    if (ma !== mb) return ma - mb;
+    if ((b.servicios || 0) !== (a.servicios || 0)) return (b.servicios || 0) - (a.servicios || 0);
+    return clave_(a.codigo) < clave_(b.codigo) ? -1 : 1;
+  })[0];
+}
+
+/**
+ * Propuestas de unificación VIGENTES (se recalculan siempre; desaparecen al resolverse): por hoja, entre clientes
+ * activos que no fueron unificados ni marcados como distintos. porCliente: { código: N° de servicios } (opcional).
+ */
+function propuestasUnificacion_(base, porCliente) {
+  const salida = [];
+  ['clientasSalon', 'peluquerias'].forEach(function (hoja) {
+    const distintas = {};
+    const registros = [];
+    base.filas.filter(function (x) { return x.hoja === hoja; }).forEach(function (x) {
+      const m = marcasCliente_(x.fila.observacion);
+      m.distintas.forEach(function (o) { distintas[clave_(x.fila.codigo) + '|' + o] = true; });
+      if (!esActivo_(x.fila.activo) || m.unificadaEn) return;
+      registros.push({ codigo: x.fila.codigo, nombre: x.fila.nombre, servicios: porCliente ? (porCliente[clave_(x.fila.codigo)] || 0) : 0,
+        legado: x.fila.legado || '', completitud: x.fila.completitud || '' });
+    });
+    gruposVariantes_(registros, distintas).forEach(function (g) {
+      const p = principalSugerido_(g.miembros);
+      salida.push({ hoja: hoja, miembros: g.miembros, motivo: g.motivos.join('; '), principal: p.codigo,
+        clave: g.miembros.map(function (m) { return clave_(m.codigo); }).sort().join('|') });
+    });
+  });
+  return salida;
+}
+
+/**
+ * Índice «texto exacto → cliente» para vincular servicios (R1.5: solo coincidencia exacta). Prioridad: nombre de un
+ * cliente activo; alias de un cliente activo; cliente inactivo (si fue unificado, su principal). Si dos clientes
+ * activos tienen exactamente el mismo nombre, el texto queda AMBIGUO (no se vincula solo).
+ */
+function indiceNombresExactos_(base) {
+  const niveles = [{}, {}, {}];
+  const porCodigo = {};
+  base.filas.forEach(function (x) { porCodigo[clave_(x.fila.codigo)] = x.fila; });
+  function poner(nivel, texto, fila) {
+    const t = textoClienteServicio_(texto);
+    if (!t || esSinNombre_(t)) return;
+    const previo = niveles[nivel][t];
+    if (previo && clave_(previo.codigo) !== clave_(fila.codigo)) niveles[nivel][t] = { ambiguo: true, codigos: (previo.codigos || [previo.codigo]).concat([fila.codigo]) };
+    else if (!previo) niveles[nivel][t] = fila;
+  }
+  base.filas.forEach(function (x) {
+    const f = x.fila;
+    const activo = esActivo_(f.activo) && !marcasCliente_(f.observacion).unificadaEn;
+    if (activo) {
+      poner(0, f.nombre, f);
+      String(f.alias || '').split(/\s*;\s*/).forEach(function (a) { poner(1, a, f); });
+    } else {
+      const destino = porCodigo[marcasCliente_(f.observacion).unificadaEn] || f;
+      poner(2, f.nombre, destino);
+    }
+  });
+  return function (texto) {
+    const t = textoClienteServicio_(texto);
+    for (let i = 0; i < niveles.length; i++) {
+      const v = niveles[i][t];
+      if (v) return v.ambiguo ? { ambiguo: true, codigos: v.codigos } : { fila: v, via: ['nombre', 'alias', 'ficha inactiva'][i] };
+    }
+    return null;
+  };
+}
+
+/** Vincula los servicios sin «Código cliente» cuyo texto coincide EXACTAMENTE con el nombre dado (alta o cambio de nombre). */
+function vincularServiciosPorNombre_(ss, tz, codigo, nombre) {
+  const t = textoClienteServicio_(nombre);
+  if (!t || esSinNombre_(t)) return 0;
+  const buscar = indiceNombresExactos_(baseClientes_(ss, tz));
+  const r = buscar(t);
+  if (!r || r.ambiguo || clave_(r.fila.codigo) !== clave_(codigo)) return 0;
+  const realizados = leerTabla_(ss, 'realizados', tz);
+  const lote = realizados.filas.filter(function (s) { return !clave_(s.codigoCliente) && textoClienteServicio_(s.cliente) === t; })
+    .map(function (s) { return { fila: s._fila, valores: { codigoCliente: clave_(codigo) } }; });
+  return actualizarFilas_(realizados, lote, tz);
+}
+
+/**
+ * Servicios realizados sin «Código cliente»: por texto, con su destino exacto (si existe y no es ambiguo).
+ * Devuelve { total, conNombre, exactos, sinCoincidencia, sinNombre, porTexto: [{ texto, n, ids, destino, nombreDestino, ambiguo }] }.
+ */
+function serviciosSinCliente_(realizados, base) {
+  const buscar = indiceNombresExactos_(base);
+  const porTexto = {};
+  const orden = [];
+  const r = { total: 0, conNombre: 0, exactos: 0, sinCoincidencia: 0, sinNombre: 0, porTexto: [] };
+  realizados.forEach(function (s) {
+    if (clave_(s.codigoCliente) || !clave_(s.id)) return;
+    r.total++;
+    const t = textoClienteServicio_(s.cliente);
+    if (esSinNombre_(t)) { r.sinNombre++; return; }
+    r.conNombre++;
+    if (!porTexto[t]) {
+      const b = buscar(t);
+      porTexto[t] = { texto: t, n: 0, ids: [], destino: b && !b.ambiguo ? b.fila.codigo : '', nombreDestino: b && !b.ambiguo ? b.fila.nombre : '',
+        ambiguo: !!(b && b.ambiguo), via: b && !b.ambiguo ? b.via : '' };
+      orden.push(t);
+    }
+    porTexto[t].n++;
+    porTexto[t].ids.push(s.id);
+    if (porTexto[t].destino) r.exactos++; else r.sinCoincidencia++;
+  });
+  r.porTexto = orden.map(function (t) { return porTexto[t]; });
+  return r;
+}
+
+// ─────────────────────── 5. Datos para la app, historial y pendientes ───────────────────────
+
+function clienteParaApp_(f, hoja, admin, validarDv, estados, servicios) {
+  const falt = faltantesCliente_(f, hoja, validarDv);
+  const e = estados ? estados[clave_(f.codigo)] : null;
+  const m = marcasCliente_(f.observacion);
+  const o = {
+    codigo: f.codigo, hoja: hoja, nombre: f.nombre, razonSocial: f.razonSocial, contacto: f.contacto, telefono: f.telefono, celular: f.celular,
+    whatsapp: celularDe_(f), correo: f.correo, ciudad: f.ciudad, direccion: f.direccion, zona: f.zona, ruc: f.ruc, ci: f.ci,
+    tipo: tipoCliente_(f.tipo), tipoEfectivo: tipoEfectivo_(f, hoja), categoria: f.categoria, legado: f.legado, alias: f.alias,
+    observacion: f.observacion, activo: esActivo_(f.activo), alta: f.alta, actualizado: f.actualizado,
+    completitud: completitudDe_(falt), faltantes: falt, unificadaEn: m.unificadaEn, revisar: m.revisar,
+    estadoCredito: e ? e.estado : (f.estadoCredito || ''), saldo: e ? e.saldo : (Number(f.saldo) || 0), atraso: e ? e.atraso : (Number(f.atraso) || 0),
+    servicios: servicios ? (servicios[clave_(f.codigo)] || 0) : 0,
+  };
+  if (admin) o.sugerencia = e ? e.sugerencia : f.sugerencia;
+  return o;
+}
+
+/**
+ * Datos de «Base de datos» para la app (todas las usuarias: identificación y completitud, nunca costos). Solo
+ * administradoras: propuestas de unificación, servicios sin cliente y resumen de la importación del historial.
+ */
+function datosClientes_(ss, tz, usuario, contexto) {
+  const admin = esAdministradora_(usuario);
+  const validarDv = configSi_(ss, CFG.RUC_DV);
+  const base = baseClientes_(ss, tz);
+  const estados = contexto && contexto.modeloCartera ? contexto.modeloCartera.clientesPorCodigo : null;
+  const realizados = contexto && contexto.realizados ? contexto.realizados : leerTabla_(ss, 'realizados', tz).filas;
+  const porCliente = {};
+  realizados.forEach(function (s) {
+    const k = clave_(s.codigoCliente);
+    if (k && s.estado !== 'Anulado') porCliente[k] = (porCliente[k] || 0) + 1;
+  });
+  const lista = base.filas.map(function (x) { return clienteParaApp_(x.fila, x.hoja, admin, validarDv, estados, porCliente); }).sort(ordenarPor_(['nombre', 'codigo']));
+  const activos = lista.filter(function (c) { return c.activo; });
+  const porTipo = {};
+  activos.forEach(function (c) { const k = c.tipo || 'SIN TIPO'; porTipo[k] = (porTipo[k] || 0) + 1; });
+  const etiquetas = function (tipo) { return requisitosCliente_(tipo).map(function (r) { return r[1]; }); };
+  const d = {
+    lista: lista,
+    requeridos: { 'PELUQUERÍA': etiquetas(CLIENTES_.PELUQUERIA), 'OTRO': etiquetas(CLIENTES_.OTRO), 'CLIENTA DEL SALÓN': etiquetas(CLIENTES_.SALON) },
+    resumen: {
+      total: lista.length, activos: activos.length, completas: activos.filter(function (c) { return c.completitud === CLIENTES_.COMPLETA; }).length,
+      incompletas: activos.filter(function (c) { return c.completitud === CLIENTES_.INCOMPLETA; }).length, porTipo: porTipo,
+    },
+    validarDv: validarDv,
+  };
+  if (admin) {
+    d.unificaciones = propuestasUnificacion_(base, porCliente);
+    const sc = serviciosSinCliente_(realizados, base);
+    d.serviciosSinCliente = { total: sc.total, conNombre: sc.conNombre, exactos: sc.exactos, sinCoincidencia: sc.sinCoincidencia, sinNombre: sc.sinNombre,
+      porTexto: sc.porTexto.slice(0, 200) };
+    d.serviciosSueltos = realizados.filter(function (s) { return !clave_(s.codigoCliente) && clave_(s.id); }).slice(-300).reverse().map(function (s) {
+      return { id: s.id, fecha: s.fecha, cliente: s.cliente, servicio: s.servicio, profesional: s.profesional, estado: s.estado };
+    });
+    d.importacion = resumenImportacion_(ss, tz);
+  }
+  return d;
+}
+
+function obtenerClientes(req) { return ejecutar_('obtenerClientes', req, 'lectura', obtenerClientes_); }
+
+/**
+ * Sin código: la base completa (como datos.clientes). Con código: la ficha y su HISTORIAL (ventas —incluidas las
+ * históricas «H-»—, servicios del salón y, para administradoras, lo que espera aprobación en la importación).
+ */
+function obtenerClientes_(ctx) {
+  const d = ctx.datos;
+  const admin = esAdministradora_(ctx.usuario);
+  if (!clave_(d.codigo)) return { ok: true, clientes: datosClientes_(ctx.ss, ctx.tz, ctx.usuario, null) };
+  const f = buscarClienteEnBase_(ctx.ss, ctx.tz, d.codigo);
+  if (!f) throw errorUsuario_('No se encontró el cliente ' + d.codigo + '.');
+  const k = clave_(f.codigo);
+  const validarDv = configSi_(ctx.ss, CFG.RUC_DV);
+  const ventas = agruparVentas_(leerTabla_(ctx.ss, 'ventas', ctx.tz).filas.filter(function (v) { return clave_(v.codigoCliente) === k; }))
+    .sort(porFechaDesc_).map(function (v) {
+      return { id: v.id, fecha: v.fecha, condicion: v.condicion, estado: v.estado, total: v.total, origen: v.origen || '', nroCredito: v.nroCredito, nota: v.nota,
+        items: v.items.map(function (i) { return { producto: i.producto, cantidad: i.cantidad, subtotal: i.subtotal }; }) };
+    });
+  const servicios = leerTabla_(ctx.ss, 'realizados', ctx.tz).filas.filter(function (s) { return clave_(s.codigoCliente) === k; }).sort(porFechaDesc_).map(function (s) {
+    const o = { id: s.id, fecha: s.fecha, servicio: s.servicio, profesional: s.profesional, precio: s.precio, estado: s.estado, origen: s.origen || '', textoCliente: s.cliente };
+    if (admin) o.comision = s.comision;
+    return o;
+  });
+  let importados = [];
+  if (admin && ctx.ss.getSheetByName(ESQUEMA.importacion.hoja)) {
+    importados = leerTabla_(ctx.ss, 'importacion', ctx.tz).filas.filter(function (x) { return clave_(x.codigoCliente) === k && x.estado !== 'APROBADO'; }).map(function (x) {
+      return { id: x.id, lote: x.lote, fecha: x.fecha, item: x.item, monto: x.monto, estado: x.estado, motivo: x.motivo };
+    });
+  }
+  const vigentes = ventas.filter(function (v) { return v.estado !== 'Anulada'; });
+  const serviciosVigentes = servicios.filter(function (s) { return s.estado !== 'Anulado'; });
+  return {
+    ok: true,
+    cliente: clienteParaApp_(f, hojaDeCodigo_(f.codigo), admin, validarDv, null, null),
+    ventas: ventas, servicios: servicios, importados: importados,
+    totales: {
+      ventas: vigentes.reduce(function (t, v) { return t + v.total; }, 0), nVentas: vigentes.length,
+      historicas: vigentes.filter(function (v) { return clave_(v.origen) === 'HISTÓRICO'; }).length,
+      servicios: serviciosVigentes.reduce(function (t, s) { return t + (Number(s.precio) || 0); }, 0), nServicios: serviciosVigentes.length,
+      ultimaCompra: vigentes.length ? vigentes[0].fecha : '', ultimoServicio: serviciosVigentes.length ? serviciosVigentes[0].fecha : '',
+    },
+  };
+}
+
+/** Panel «Pendientes» (administradoras): incompletos, variantes a revisar, servicios sin cliente e importación. */
+function pendientesClientes_(ss, tz, c) {
+  const lista = [];
+  function agregar(clave, titulo, items, accion) {
+    if (items.length) lista.push({ clave: clave, titulo: titulo, cantidad: items.length, detalle: items.slice(0, 30), accion: accion || '' });
+  }
+  const base = baseClientes_(ss, tz);
+  const validarDv = configSi_(ss, CFG.RUC_DV);
+  const incompletos = [];
+  base.filas.forEach(function (x) {
+    if (!esActivo_(x.fila.activo)) return;
+    const falt = faltantesCliente_(x.fila, x.hoja, validarDv);
+    if (falt.length) incompletos.push(x.fila.codigo + ' ' + x.fila.nombre + ': falta ' + falt.join(', '));
+  });
+  agregar('clientesIncompletos', 'Clientes con datos incompletos (INCOMPLETA)', incompletos,
+    'Base de datos › Pendientes de completar (edición rápida). Mientras estén incompletos no se les vende a crédito.');
+  const realizados = c && c.realizados && c.realizados.length ? c.realizados : leerTabla_(ss, 'realizados', tz).filas;
+  const sc = serviciosSinCliente_(realizados, base);
+  agregar('serviciosSinCliente', 'Servicios realizados con cliente sin vincular a la base', sc.porTexto.map(function (p) {
+    return '«' + p.texto + '» (' + cantidadTexto_(p.n, 'servicio', 'servicios') + '): ' +
+      (p.destino ? 'coincide exacto con ' + p.destino : (p.ambiguo ? 'nombre repetido en la base (vincular a mano)' : 'sin ficha en la base'));
+  }), 'Sistema › Migración (crea las clientas INCOMPLETA y vincula por nombre exacto) o Base de datos › Unificar y vincular.');
+  agregar('unificar', 'Posibles variantes de una misma clienta (REVISAR)', propuestasUnificacion_(base, null).map(function (g) {
+    return g.miembros.map(function (m) { return m.codigo + ' «' + m.nombre + '»'; }).join(' / ') + ' (' + g.motivo + ')';
+  }), 'Base de datos › Unificar y vincular: unificar o marcar como personas distintas (nunca se fusionan solas).');
+  const imp = resumenImportacion_(ss, tz);
+  if (imp.porEstado.REVISAR) agregar('importacionRevisar', 'Importación del historial: filas a revisar', imp.lotes.filter(function (l) { return l.porEstado.REVISAR; }).map(function (l) {
+    return l.lote + ' · ' + l.fuente + ': ' + cantidadTexto_(l.porEstado.REVISAR.n, 'fila', 'filas');
+  }), 'Base de datos › Importación: corregir o rechazar.');
+  if (imp.porEstado.LISTO) agregar('importacionListas', 'Importación del historial: filas listas para aprobar', imp.lotes.filter(function (l) { return l.porEstado.LISTO; }).map(function (l) {
+    return l.lote + ' · ' + l.fuente + ': ' + cantidadTexto_(l.porEstado.LISTO.n, 'fila', 'filas') + ' por Gs. ' + miles_(l.porEstado.LISTO.monto);
+  }), 'Base de datos › Importación: revisar y aprobar en lote (nada pasa a Ventas sin aprobación).');
+  return lista;
+}
+
+// ─────────────────────── 6. Exportación CSV (R1.1 y R1.4) ───────────────────────
+
+/** CSV para Excel en español: separador «;», comillas cuando hace falta y BOM UTF-8 (acentos correctos). */
+function csvDe_(filas) {
+  const celda = function (v) {
+    const s = String(v === null || v === undefined ? '' : v);
+    return /[";\r\n]/.test(s) || /^[=+\-@]/.test(s) ? '"' + (/^[=+\-@]/.test(s) ? "'" : '') + s.replace(/"/g, '""') + '"' : s;
+  };
+  return '﻿' + filas.map(function (f) { return f.map(celda).join(';'); }).join('\r\n');
+}
+
+function exportarClientesCsv(req) { return ejecutar_('exportarClientesCsv', req, 'escritura', exportarClientesCsv_); }
+
+/**
+ * Exporta la base (tipo 'base') o solo los faltantes de los clientes INCOMPLETA activos (tipo 'faltantes') a
+ * «Distribuidora MB/Exportaciones» y devuelve el enlace. Solo administradoras (datos personales).
+ */
+function exportarClientesCsv_(ctx) {
+  const tipo = ctx.datos.tipo === 'faltantes' ? 'faltantes' : 'base';
+  const tz = ctx.tz;
+  const validarDv = configSi_(ctx.ss, CFG.RUC_DV);
+  const base = baseClientes_(ctx.ss, tz);
+  let filas;
+  if (tipo === 'faltantes') {
+    filas = [['Código', 'Tipo de cliente', 'Nombre', 'Campos faltantes', 'Razón social', 'RUC', 'CI', 'Contacto principal', 'Celular', 'Teléfono', 'Ciudad', 'Dirección', 'Código legado']];
+    base.filas.forEach(function (x) {
+      const f = x.fila;
+      if (!esActivo_(f.activo)) return;
+      const falt = faltantesCliente_(f, x.hoja, validarDv);
+      if (!falt.length) return;
+      filas.push([f.codigo, tipoEfectivo_(f, x.hoja) + (tipoCliente_(f.tipo) ? '' : ' (sin tipo)'), f.nombre, falt.join(', '), f.razonSocial, f.ruc, f.ci, f.contacto, f.celular, f.telefono, f.ciudad, f.direccion, f.legado]);
+    });
+  } else {
+    filas = [['Código', 'Hoja', 'Tipo de cliente', 'Nombre', 'Razón social', 'RUC', 'CI', 'Contacto principal', 'Celular', 'Teléfono', 'Correo', 'Ciudad', 'Dirección', 'Zona',
+      'Categoría de crédito', 'Código legado', 'Alias', 'Completitud', 'Campos faltantes', 'Fecha de alta', 'Activo', 'Observación']];
+    base.filas.forEach(function (x) {
+      const f = x.fila;
+      const falt = faltantesCliente_(f, x.hoja, validarDv);
+      filas.push([f.codigo, ESQUEMA[x.hoja].hoja, tipoCliente_(f.tipo), f.nombre, f.razonSocial, f.ruc, f.ci, f.contacto, f.celular, f.telefono, f.correo, f.ciudad, f.direccion, f.zona,
+        f.categoria, f.legado, f.alias, completitudDe_(falt), falt.join(', '), formatoFecha_(f.alta), esActivo_(f.activo) ? 'Sí' : 'No', f.observacion]);
+    });
+  }
+  const nombre = (tipo === 'faltantes' ? 'Clientes - datos faltantes ' : 'Clientes - base completa ') + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HHmm') + '.csv';
+  const archivo = guardarArchivoSistema_(Utilities.newBlob(csvDe_(filas), 'text/csv', nombre), 'Exportaciones', nombre);
+  anotarAuditoria_('', '', 'Exportación CSV «' + nombre + '» (' + cantidadTexto_(filas.length - 1, 'fila', 'filas') + ').', '');
+  return {
+    mensaje: 'Listo: «' + nombre + '» (' + cantidadTexto_(filas.length - 1, 'cliente', 'clientes') + ') en «' + CONFIG.CARPETA_SISTEMA + '/Exportaciones».',
+    url: archivo.url, nombre: nombre, filas: filas.length - 1,
+  };
+}
+
+// ─────────────────────── 7. R1.5 · Clientas de «Servicios realizados» (paso de migrarDatosAntiguos) ───────────────────────
+
+/**
+ * Calcula (op.simular = true) o aplica (op.simular = false) el paso R1.5 dentro de migrarDatosAntiguos_ (Migracion.gs):
+ *  - cada texto distinto de «Cliente» (sin «Sin nombre» ni vacíos) → la ficha que ya tenga EXACTAMENTE ese nombre (o
+ *    alias); si no existe, una clienta nueva en «Clientas salón» (CS-xxxx), INCOMPLETA (falta el celular);
+ *  - «Código cliente» de cada servicio: solo por coincidencia exacta (nunca se pisa uno ya cargado);
+ *  - variantes de una misma persona: propuesta de unificación marcada REVISAR (nunca se fusionan solas).
+ * Las clientas del xlsx que la misma migración va a crear se consideran en la vista previa, para que lo que se
+ * confirma sea exactamente lo que se aplica. Devuelve { acciones, controles, resumen } (las acciones van a la huella).
+ */
+function migrarClientasServicios_(ss, tz, email, op) {
+  const simular = !op || op.simular !== false;
+  const r = { acciones: [], controles: [], resumen: '' };
+  const paso = CLIENTES_.PASO_MIGRACION;
+  function accion(tipo, ref, detalle) { r.acciones.push({ paso: paso, tipo: tipo, ref: String(ref), detalle: detalle || '' }); }
+  if (!ss.getSheetByName(ESQUEMA.clientasSalon.hoja)) {
+    r.controles.push({ nombre: 'Hoja «Clientas salón»', ok: false, detalle: 'Falta la hoja: ejecute la instalación (instalarActualizacionMB) y repita la vista previa.' });
+    return r;
+  }
+  const base = baseClientes_(ss, tz);
+  const tSalon = base.tablas.clientasSalon;
+  const realizados = leerTabla_(ss, 'realizados', tz);
+  const validarDv = configSi_(ss, CFG.RUC_DV);
+  const ahora = new Date();
+  const hoy = hoy_(tz);
+  const buscar = indiceNombresExactos_(base);
+
+  // Clientas del xlsx que esta misma migración creará (solo importa en la vista previa: después ya existen en la hoja).
+  const delXlsx = {};
+  if (simular && typeof XLSX_CLIENTAS_ !== 'undefined') {
+    const legados = {};
+    base.filas.forEach(function (x) { if (clave_(x.fila.legado)) legados[clave_(x.fila.legado)] = true; });
+    XLSX_CLIENTAS_.forEach(function (c) {
+      if (legados[clave_(c[0])]) return;
+      const n = normalizar_(c[1]);
+      const existe = base.filas.some(function (x) { return !clave_(x.fila.legado) && (normalizar_(x.fila.nombre) === n || normalizar_(x.fila.contacto) === n); });
+      if (!existe) delXlsx[textoClienteServicio_(c[1])] = c[0];
+    });
+  }
+
+  const grupos = {};
+  const orden = [];
+  let sinNombre = 0;
+  realizados.filas.forEach(function (s) {
+    if (!clave_(s.id)) return;
+    const t = textoClienteServicio_(s.cliente);
+    if (esSinNombre_(t)) { sinNombre++; return; }
+    if (!grupos[t]) { grupos[t] = []; orden.push(t); }
+    grupos[t].push(s);
+  });
+
+  let siguiente = siguienteNumero_(tSalon.filas.map(function (f) { return f.codigo; }), 'CS-');
+  const nuevas = [];
+  const enlaces = [];
+  let existentes = 0;
+  let ambiguos = 0;
+  let vinculables = 0;
+  orden.forEach(function (t) {
+    const filas = grupos[t];
+    const sinCodigo = filas.filter(function (s) { return !clave_(s.codigoCliente); });
+    if (!sinCodigo.length) {
+      existentes++;
+      accion('YA VINCULADOS', t, cantidadTexto_(filas.length, 'servicio', 'servicios') + ' con «Código cliente».');
+      return;
+    }
+    let destino = '';
+    const b = buscar(t);
+    if (b && b.ambiguo) {
+      ambiguos++;
+      accion('YA EN PENDIENTES (nombre repetido)', t, 'Hay más de una ficha con este nombre exacto (' + b.codigos.join(', ') + '): se vincula a mano (Base de datos › Unificar y vincular).');
+      return;
+    }
+    if (b) {
+      destino = b.fila.codigo;
+      existentes++;
+    } else if (delXlsx[t]) {
+      existentes++;
+      vinculables += sinCodigo.length;
+      accion('VINCULAR SERVICIOS', t, cantidadTexto_(sinCodigo.length, 'servicio', 'servicios') + ' → la clienta del xlsx ' + delXlsx[t] + ' (se crea en este mismo paso, nombre exacto).');
+      return;
+    } else {
+      destino = formatoCodigo_('CS-', siguiente++, 4);
+      const fila = {
+        codigo: destino, nombre: t, tipo: CLIENTES_.SALON, activo: 'Sí', alta: hoy, actualizado: ahora, usuario: CLIENTES_.USUARIO_MIGRACION,
+        observacion: 'Creada desde «Servicios realizados» (texto libre; ' + cantidadTexto_(filas.length, 'servicio', 'servicios') + '). Completar el celular.',
+      };
+      const falt = faltantesCliente_(fila, 'clientasSalon', validarDv);
+      fila.completitud = completitudDe_(falt);
+      fila.faltantes = falt.join(', ');
+      nuevas.push(fila);
+      accion('CREAR', destino, '«' + t + '» · ' + fila.completitud + ' (falta ' + fila.faltantes + ') · ' + cantidadTexto_(filas.length, 'servicio', 'servicios'));
+    }
+    vinculables += sinCodigo.length;
+    sinCodigo.forEach(function (s) { enlaces.push({ fila: s._fila, valores: { codigoCliente: destino } }); });
+    accion('VINCULAR SERVICIOS', destino, cantidadTexto_(sinCodigo.length, 'servicio', 'servicios') + ' «' + t + '» → ' + destino + (b ? ' «' + b.fila.nombre + '» (' + b.via + ')' : ''));
+  });
+
+  // Propuestas de unificación entre las clientas del salón (existentes activas + nuevas): REVISAR, nunca se fusionan.
+  const registros = [];
+  const distintas = {};
+  tSalon.filas.forEach(function (f) {
+    const m = marcasCliente_(f.observacion);
+    m.distintas.forEach(function (o) { distintas[clave_(f.codigo) + '|' + o] = true; });
+    if (clave_(f.codigo) && esActivo_(f.activo) && !m.unificadaEn) registros.push({ codigo: f.codigo, nombre: f.nombre, nueva: null });
+  });
+  nuevas.forEach(function (f) { registros.push({ codigo: f.codigo, nombre: f.nombre, nueva: f }); });
+  const propuestas = gruposVariantes_(registros, distintas).filter(function (g) { return g.miembros.some(function (m) { return m.nueva; }); });
+  propuestas.forEach(function (g) {
+    g.miembros.forEach(function (m) {
+      if (!m.nueva) return;
+      const otros = g.miembros.filter(function (o) { return o !== m; }).map(function (o) { return o.codigo + ' «' + o.nombre + '»'; });
+      m.nueva.observacion += ' ' + MARCA_CLIENTE_.REVISAR + 'posible misma clienta que ' + otros.join(', ') + '; propuesta de unificación, no se fusiona sola]';
+    });
+    accion('PROPUESTA · REVISAR', g.miembros.map(function (m) { return m.codigo; }).join(' / '),
+      g.miembros.map(function (m) { return '«' + m.nombre + '»'; }).join(' / ') + ' (' + g.motivos.join('; ') + '). La decide una administradora en Base de datos › Unificar y vincular.');
+  });
+
+  if (!simular) {
+    agregarFilas_(tSalon, nuevas, tz);
+    actualizarFilas_(realizados, enlaces, tz);
+    if (nuevas.length || enlaces.length) {
+      anotarAuditoria_(ESQUEMA.realizados.hoja, '', 'R1.5: ' + cantidadTexto_(nuevas.length, 'clienta nueva', 'clientas nuevas') + ' en «Clientas salón» y ' +
+        cantidadTexto_(enlaces.length, 'servicio vinculado', 'servicios vinculados') + ' por nombre exacto.', 'SALÓN');
+    }
+  }
+  const conNombre = orden.reduce(function (t, x) { return t + grupos[x].length; }, 0);
+  const yaConCodigo = orden.reduce(function (t, x) { return t + grupos[x].filter(function (s) { return clave_(s.codigoCliente); }).length; }, 0);
+  r.controles.push({ nombre: 'Clientas de «Servicios realizados» (nombres distintos)', ok: true,
+    detalle: orden.length + ' nombres distintos (sin contar «Sin nombre» ni vacíos: ' + cantidadTexto_(sinNombre, 'servicio', 'servicios') + '). ' +
+      cantidadTexto_(nuevas.length, 'clienta nueva', 'clientas nuevas') + ' INCOMPLETA en «Clientas salón», ' + existentes + ' ya tenían ficha.' });
+  r.controles.push({ nombre: 'Servicios con «Código cliente» (solo coincidencia exacta)', ok: !ambiguos,
+    detalle: (yaConCodigo + vinculables) + ' de ' + conNombre + ' servicios con nombre quedan vinculados' + (ambiguos ? '; ' + ambiguos + ' nombre(s) ambiguo(s) a vincular a mano' : '') + '.' });
+  r.controles.push({ nombre: 'Variantes de una misma clienta (REVISAR)', ok: true,
+    detalle: propuestas.length ? cantidadTexto_(propuestas.length, 'propuesta', 'propuestas') + ' de unificación: ' + propuestas.map(function (g) {
+      return g.miembros.map(function (m) { return m.nombre; }).join(' / ');
+    }).join(' · ') + '. Ninguna se fusiona sola.' : 'Sin variantes nuevas.' });
+  r.resumen = cantidadTexto_(nuevas.length, 'clienta del salón nueva', 'clientas del salón nuevas') + ', ' + cantidadTexto_(vinculables, 'servicio vinculado', 'servicios vinculados') +
+    ', ' + cantidadTexto_(propuestas.length, 'propuesta de unificación', 'propuestas de unificación') + ' (REVISAR).';
+  return r;
+}
+
+// ─────────────────────── 8. Unificar variantes y vincular servicios (solo administradoras) ───────────────────────
+
+function resolverUnificacion(req) { return ejecutar_('resolverUnificacion', req, 'escritura', resolverUnificacion_); }
+
+/**
+ * Decide una propuesta (R1.5). accion 'unificar': las variantes quedan inactivas con «[UNIFICADA EN principal]», sus
+ * servicios pasan al principal, su nombre queda como alias y los datos que al principal le faltan (nunca se pisan) se
+ * completan con los de la variante. accion 'distintas': cada par queda marcado «[DISTINTA DE …]» y no se vuelve a proponer.
+ * No se unifican fichas con créditos, cobros o ventas (habría que mover su cuenta corriente): se avisa.
+ */
+function resolverUnificacion_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const base = baseClientes_(ctx.ss, tz);
+  const porCodigo = {};
+  base.filas.forEach(function (x) { porCodigo[clave_(x.fila.codigo)] = x; });
+  const ahora = new Date();
+  const fecha = Utilities.formatDate(ahora, tz, 'dd/MM/yyyy');
+  if (d.accion === 'distintas') {
+    const miembros = unicos_((Array.isArray(d.miembros) ? d.miembros : []).map(clave_)).map(clave_);
+    if (miembros.length < 2) throw errorUsuario_('Indique al menos dos clientas.');
+    const xs = miembros.map(function (c) {
+      const x = porCodigo[c];
+      if (!x) throw errorUsuario_('No se encontró la clienta ' + c + '.');
+      return x;
+    });
+    let n = 0;
+    xs.forEach(function (x) {
+      let obs = sinMarcaRevisar_(x.fila.observacion);
+      const marcas = marcasCliente_(obs);
+      xs.forEach(function (o) {
+        const c = clave_(o.fila.codigo);
+        if (c !== clave_(x.fila.codigo) && marcas.distintas.indexOf(c) < 0) obs = (obs + ' ' + MARCA_CLIENTE_.DISTINTA + c + ']').trim();
+      });
+      if (obs !== textoCampo_(x.fila.observacion)) { actualizarCeldas_(x.tabla, x.fila._fila, { observacion: obs, actualizado: ahora, usuario: ctx.email }, tz); n++; }
+    });
+    return 'Listo: ' + xs.map(function (x) { return '«' + x.fila.nombre + '»'; }).join(', ') + ' quedan como personas distintas (no se vuelven a proponer).' + (n ? '' : ' Ya estaban marcadas.');
+  }
+  if (d.accion !== 'unificar') throw errorUsuario_('Elija «Unificar» o «Son personas distintas».');
+  const principal = porCodigo[clave_(d.principal)];
+  if (!principal) throw errorUsuario_('Elija la ficha principal (la que se conserva).');
+  if (!esActivo_(principal.fila.activo) || marcasCliente_(principal.fila.observacion).unificadaEn) throw errorUsuario_('La ficha principal debe estar activa.');
+  const variantes = unicos_((Array.isArray(d.variantes) ? d.variantes : []).map(clave_)).map(clave_).filter(function (c) { return c !== clave_(principal.fila.codigo); });
+  if (!variantes.length) throw errorUsuario_('Elija al menos una variante para unificar con «' + principal.fila.nombre + '».');
+  const conCuenta = codigosConCuentaCorriente_(ctx.ss, tz);
+  const xs = variantes.map(function (c) {
+    const x = porCodigo[c];
+    if (!x) throw errorUsuario_('No se encontró la clienta ' + c + '.');
+    if (x.hoja !== principal.hoja) throw errorUsuario_('Solo se unifican fichas de la misma hoja («' + ESQUEMA[principal.hoja].hoja + '»): ' + c + ' está en otra.');
+    if (!esActivo_(x.fila.activo)) throw errorUsuario_(c + ' ya está inactiva.');
+    if (conCuenta[c]) throw errorUsuario_(c + ' «' + x.fila.nombre + '» tiene créditos, cobros o ventas: no se unifica automáticamente (su cuenta corriente quedaría en otra ficha). Consulte a soporte.');
+    if (clave_(x.fila.legado) && clave_(principal.fila.legado) && clave_(x.fila.legado) !== clave_(principal.fila.legado)) {
+      throw errorUsuario_(c + ' y ' + principal.fila.codigo + ' tienen códigos legado distintos (' + x.fila.legado + ' / ' + principal.fila.legado + '): revíselas a mano.');
+    }
+    return x;
+  });
+  const validarDv = configSi_(ctx.ss, CFG.RUC_DV);
+  const p = principal.fila;
+  const completar = {};
+  ['razonSocial', 'contacto', 'telefono', 'celular', 'correo', 'ciudad', 'direccion', 'zona', 'ruc', 'ci', 'legado'].forEach(function (k) {
+    if (textoCampo_(p[k])) return;
+    const fuente = xs.filter(function (x) { return textoCampo_(x.fila[k]); })[0];
+    if (fuente) completar[k] = fuente.fila[k];
+  });
+  let alias = String(p.alias || '').split(/\s*;\s*/).filter(String);
+  xs.forEach(function (x) {
+    [x.fila.nombre].concat(String(x.fila.alias || '').split(/\s*;\s*/)).forEach(function (a) {
+      if (a && a !== p.nombre && alias.indexOf(a) < 0) alias.push(a);
+    });
+  });
+  const resultante = Object.assign({}, p, completar);
+  const falt = faltantesCliente_(resultante, principal.hoja, validarDv);
+  const cambiosP = Object.assign({}, completar, {
+    alias: alias.join('; '),
+    observacion: (sinMarcaRevisar_(p.observacion) + ' Unificó ' + xs.map(function (x) { return x.fila.codigo + ' «' + x.fila.nombre + '»'; }).join(', ') + ' (' + fecha + ', ' + ctx.email + ').').trim(),
+    completitud: completitudDe_(falt), faltantes: falt.join(', '), actualizado: ahora, usuario: ctx.email,
+  });
+  actualizarCeldas_(principal.tabla, p._fila, cambiosP, tz);
+  xs.forEach(function (x) {
+    actualizarCeldas_(x.tabla, x.fila._fila, {
+      activo: 'No', observacion: (MARCA_CLIENTE_.UNIFICADA + p.codigo + '] ' + sinMarcaRevisar_(x.fila.observacion)).trim(), actualizado: ahora, usuario: ctx.email,
+    }, tz);
+  });
+  const realizados = leerTabla_(ctx.ss, 'realizados', tz);
+  const cods = xs.map(function (x) { return clave_(x.fila.codigo); });
+  const lote = realizados.filas.filter(function (s) { return cods.indexOf(clave_(s.codigoCliente)) >= 0; })
+    .map(function (s) { return { fila: s._fila, valores: { codigoCliente: p.codigo } }; });
+  const movidos = actualizarFilas_(realizados, lote, tz);
+  if (typeof recalcularCartera_ === 'function') recalcularCartera_(ctx.ss, tz);
+  return {
+    mensaje: 'Unificado en ' + p.codigo + ' «' + p.nombre + '»: ' + xs.map(function (x) { return x.fila.codigo; }).join(', ') +
+      (xs.length === 1 ? ' queda inactiva' : ' quedan inactivas') + ' (con la marca de unificación), ' +
+      cantidadTexto_(movidos, 'servicio pasó', 'servicios pasaron') + ' a la ficha principal' + (Object.keys(completar).length ? ' y se completaron ' + Object.keys(completar).map(etiquetaCampoCliente_).join(', ') : '') + '.',
+    codigo: p.codigo,
+  };
+}
+
+/** Códigos de clientes con créditos, cobros o ventas registrados (su cuenta corriente no se mueve al unificar). */
+function codigosConCuentaCorriente_(ss, tz) {
+  const r = {};
+  [['creditos', 'codigoCliente'], ['cobros', 'codigoCliente'], ['ventas', 'codigoCliente']].forEach(function (par) {
+    if (!ss.getSheetByName(ESQUEMA[par[0]].hoja)) return;
+    try { leerTabla_(ss, par[0], tz).filas.forEach(function (f) { if (clave_(f[par[1]])) r[clave_(f[par[1]])] = true; }); } catch (e) { /* hoja de una fase no instalada */ }
+  });
+  return r;
+}
+
+function vincularClienteServicio(req) { return ejecutar_('vincularClienteServicio', req, 'escritura', vincularClienteServicio_); }
+
+/**
+ * «Código cliente» de servicios realizados aprobado por una administradora (R1.5):
+ *  - accion 'exactos': vincula todos los que coinciden EXACTAMENTE con una ficha (nombre o alias, sin ambigüedad);
+ *  - ids + codigo: vincula esos servicios a esa ficha (aunque el texto no coincida: lo decide la administradora);
+ *  - ids + codigo vacío: los desvincula (corrección).
+ */
+function vincularClienteServicio_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const realizados = leerTabla_(ctx.ss, 'realizados', tz);
+  if (d.accion === 'exactos') {
+    const sc = serviciosSinCliente_(realizados.filas, baseClientes_(ctx.ss, tz));
+    const destino = {};
+    sc.porTexto.forEach(function (p) { if (p.destino) p.ids.forEach(function (id) { destino[clave_(id)] = p.destino; }); });
+    const lote = realizados.filas.filter(function (s) { return !clave_(s.codigoCliente) && destino[clave_(s.id)]; })
+      .map(function (s) { return { fila: s._fila, valores: { codigoCliente: destino[clave_(s.id)] } }; });
+    const n = actualizarFilas_(realizados, lote, tz);
+    return n ? 'Se vincularon ' + cantidadTexto_(n, 'servicio', 'servicios') + ' por coincidencia exacta de nombre.' : 'No hay servicios con coincidencia exacta para vincular.';
+  }
+  const ids = unicos_((Array.isArray(d.ids) ? d.ids : []).map(clave_)).map(clave_);
+  if (!ids.length) throw errorUsuario_('Elija los servicios a vincular.');
+  if (ids.length > 500) throw errorUsuario_('Hasta 500 servicios por vez.');
+  const codigo = clave_(d.codigo);
+  let cliente = null;
+  if (codigo) {
+    cliente = buscarClienteEnBase_(ctx.ss, tz, codigo);
+    if (!cliente) throw errorUsuario_('No se encontró el cliente ' + codigo + '.');
+    if (!esActivo_(cliente.activo)) throw errorUsuario_('«' + cliente.nombre + '» está inactiva: elija la ficha activa.');
+  }
+  const porId = {};
+  realizados.filas.forEach(function (s) { porId[clave_(s.id)] = s; });
+  const lote = ids.map(function (id) {
+    const s = porId[id];
+    if (!s) throw errorUsuario_('No se encontró el servicio ' + id + '.');
+    return { fila: s._fila, valores: { codigoCliente: codigo } };
+  });
+  const n = actualizarFilas_(realizados, lote, tz);
+  if (!codigo) return 'Se desvincularon ' + cantidadTexto_(n, 'servicio', 'servicios') + '.';
+  return 'Se vincularon ' + cantidadTexto_(n, 'servicio', 'servicios') + ' a ' + cliente.codigo + ' «' + cliente.nombre + '» (aprobado por ' + ctx.email + ').';
+}
+
+// ─────────────────────── 9. R1.6 · Importación del historial («Importación · Historial») ───────────────────────
+
+/**
+ * Plantilla (vacía) de la importación: títulos que el sistema reconoce. Columnas extra de la fuente (Profesional,
+ * Nota, N° de venta…) no se interpretan pero quedan guardadas en «Dato original».
+ */
+const IMPORTACION_ = Object.freeze({
+  PLANTILLA: Object.freeze(['Fecha', 'Cliente', 'Código cliente', 'Tipo (PRODUCTO / SERVICIO)', 'Código ítem', 'Ítem', 'Cantidad', 'Monto (Gs.)',
+    'Condición (CONTADO / CRÉDITO)', 'Ubicación en la fuente', 'Confianza (ALTA / MEDIA / BAJA)']),
+  MAX_FILAS: 3000,
+  MAX_APROBAR: 300,
+  MAX_ARCHIVO_BYTES: 10 * 1024 * 1024,
+  PROP_LOTES: 'MB_IMPORTACION_LOTES',
+  MAX_LOTES_GUARDADOS: 40,
+});
+
+function md5Hex_(texto) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, String(texto), Utilities.Charset.UTF_8);
+  let h = '';
+  for (let i = 0; i < bytes.length; i++) h += ('0' + (bytes[i] & 0xff).toString(16)).slice(-2);
+  return h;
+}
+
+/** CSV / TSV pegado o subido: detecta el separador (tabulación, «;» o «,»), respeta comillas y saltos de línea dentro de ellas. */
+function parsearCsv_(texto) {
+  const s = String(texto || '').replace(/^﻿/, '');
+  const primera = s.split(/\r?\n/)[0] || '';
+  const cuenta = function (ch) { return primera.split(ch).length - 1; };
+  let sep = '\t';
+  [';', ','].forEach(function (ch) { if (cuenta(ch) > cuenta(sep)) sep = ch; });
+  const filas = [];
+  let fila = [];
+  let celda = '';
+  let comillas = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charAt(i);
+    if (comillas) {
+      if (ch === '"') {
+        if (s.charAt(i + 1) === '"') { celda += '"'; i++; } else comillas = false;
+      } else celda += ch;
+    } else if (ch === '"' && celda.trim() === '') {
+      comillas = true;
+      celda = '';
+    } else if (ch === sep) {
+      fila.push(celda);
+      celda = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && s.charAt(i + 1) === '\n') i++;
+      fila.push(celda);
+      filas.push(fila);
+      fila = [];
+      celda = '';
+    } else celda += ch;
+  }
+  if (celda !== '' || fila.length) { fila.push(celda); filas.push(fila); }
+  return { separador: sep, filas: filas.filter(function (f) { return f.some(function (c) { return String(c).trim() !== ''; }); }) };
+}
+
+/** Título de columna de la fuente → clave interna ('' si no se reconoce). Sin importar mayúsculas, tildes ni paréntesis. */
+function claveColumnaImportacion_(titulo) {
+  const t = normalizar_(String(titulo || '').replace(/\(.*?\)/g, ' ').replace(/[°º#.:\/]/g, ' ')).replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  const reglas = [
+    ['codigoCliente', /^(codigo|cod) (de )?(la )?(cliente|clienta|peluqueria)$/],
+    ['codigoItem', /^(codigo|cod) (de )?(item|producto|servicio)$|^codigo$/],
+    ['fecha', /^(fecha|dia)( de (la )?venta)?$/],
+    ['cliente', /^(cliente|clienta|peluqueria|nombre|nombre (del cliente|de la clienta))$/],
+    ['tipo', /^tipo( de item)?$/],
+    ['item', /^(item|producto|servicio|detalle|descripcion|articulo)$/],
+    ['cantidad', /^(cantidad|cant|unidades)$/],
+    ['monto', /^(monto|importe|total|precio|valor)( gs)?$/],
+    ['condicion', /^(condicion|forma de pago|pago)$/],
+    ['ubicacion', /^(ubicacion|ubicacion en la fuente|fila|pagina|renglon)$/],
+    ['confianza', /^confianza$/],
+  ];
+  for (let i = 0; i < reglas.length; i++) if (reglas[i][1].test(t)) return reglas[i][0];
+  return '';
+}
+
+/** Fecha de la fuente (dd/mm/aaaa, d/m/aa, aaaa-mm-dd, dd-mm-aaaa o dd.mm.aaaa) → { fecha ISO, error }. */
+function fechaImportada_(valor, hoy) {
+  const s = String(valor === null || valor === undefined ? '' : valor).trim();
+  if (!s) return { fecha: '', error: 'Falta la fecha' };
+  let y;
+  let m;
+  let d;
+  let x = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (x) { y = +x[1]; m = +x[2]; d = +x[3]; } else {
+    x = s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/);
+    if (!x) return { fecha: '', error: 'Fecha ilegible («' + s + '»)' };
+    d = +x[1]; m = +x[2]; y = +x[3];
+    if (y < 100) y += 2000;
+  }
+  const f = new Date(Date.UTC(y, m - 1, d));
+  if (f.getUTCFullYear() !== y || f.getUTCMonth() !== m - 1 || f.getUTCDate() !== d) return { fecha: '', error: 'La fecha «' + s + '» no existe' };
+  const iso = y + '-' + ('0' + m).slice(-2) + '-' + ('0' + d).slice(-2);
+  if (hoy && iso > hoy) return { fecha: '', error: 'Fecha futura («' + s + '»)' };
+  if (iso < '2015-01-01') return { fecha: '', error: 'Revise el año («' + s + '»)' };
+  return { fecha: iso, error: '' };
+}
+
+/** Monto en guaraníes: «Gs. 1.234.000», «1234000», «1,234,000» o con 1–2 decimales (se redondea). { monto, error }. */
+function montoImportado_(valor) {
+  if (typeof valor === 'number') return isFinite(valor) && valor >= 0 ? { monto: Math.round(valor), error: '' } : { monto: null, error: 'Monto ilegible' };
+  const bruto = String(valor === null || valor === undefined ? '' : valor);
+  const s = bruto.replace(/gs\.?|₲|\s/gi, '').trim();
+  if (!s) return { monto: null, error: 'Falta el monto' };
+  if (/^\d+$/.test(s)) return { monto: Number(s), error: '' };
+  if (/^\d{1,3}([.,]\d{3})+$/.test(s)) return { monto: Number(s.replace(/[.,]/g, '')), error: '' };
+  if (/^\d+[.,]\d{1,2}$/.test(s)) return { monto: Math.round(Number(s.replace(',', '.'))), error: '' };
+  return { monto: null, error: 'Monto ilegible («' + bruto.trim() + '»)' };
+}
+
+function cantidadImportada_(valor) {
+  const s = String(valor === null || valor === undefined ? '' : valor).trim();
+  if (!s) return { n: null, error: '' };
+  if (/^\d+$/.test(s) && Number(s) >= 1 && Number(s) <= LIMITES.CANTIDAD) return { n: Number(s), error: '' };
+  return { n: null, error: 'Cantidad ilegible («' + s + '»)' };
+}
+
+function condicionImportada_(valor) {
+  const k = normalizar_(valor);
+  if (!k) return '';
+  if (/^cont/.test(k)) return 'CONTADO';
+  if (/^cred/.test(k)) return 'CRÉDITO';
+  return '?';
+}
+
+function tipoItemImportado_(valor) {
+  const k = normalizar_(valor);
+  if (!k) return '';
+  if (/^prod/.test(k)) return 'PRODUCTO';
+  if (/^serv/.test(k)) return 'SERVICIO';
+  return '?';
+}
+
+function agregarIndice_(indice, clave, valor) {
+  if (!clave) return;
+  const l = indice[clave] || (indice[clave] = []);
+  if (l.indexOf(valor) < 0) l.push(valor);
+}
+
+/** Único candidato activo de una lista (si hay activos, los inactivos no cuentan). null si no hay; 'AMBIGUO' si hay varios. */
+function unicoCandidato_(lista) {
+  if (!lista || !lista.length) return null;
+  const activos = lista.filter(function (f) { return esActivo_(f.activo) && !marcasCliente_(f.observacion).unificadaEn; });
+  const l = activos.length ? activos : lista;
+  return l.length === 1 ? l[0] : 'AMBIGUO';
+}
+
+/**
+ * Todo lo necesario para evaluar filas (una sola lectura por hoja): clientes, catálogo, líneas ya cargadas en Ventas y
+ * Servicios realizados (para DUPLICADO) y saldos HISTÓRICOS por clienta (para las ventas a crédito).
+ */
+function contextoImportacion_(ss, tz) {
+  const base = baseClientes_(ss, tz);
+  const cli = { porCodigo: {}, exacto: {}, normal: {} };
+  base.filas.forEach(function (x) {
+    const f = x.fila;
+    cli.porCodigo[clave_(f.codigo)] = f;
+    [f.nombre].concat(String(f.alias || '').split(/\s*;\s*/)).forEach(function (n) {
+      const t = textoClienteServicio_(n);
+      if (!t) return;
+      agregarIndice_(cli.exacto, t, f);
+      agregarIndice_(cli.normal, normalizar_(t), f);
+    });
+  });
+  const catalogo = function (filas) {
+    const c = { porCodigo: {}, exacto: {}, normal: {} };
+    filas.forEach(function (p) {
+      if (!clave_(p.codigo)) return;
+      c.porCodigo[clave_(p.codigo)] = p;
+      agregarIndice_(c.exacto, textoClienteServicio_(p.nombre), p);
+      agregarIndice_(c.normal, normalizar_(p.nombre), p);
+    });
+    return c;
+  };
+  const prod = catalogo(leerTabla_(ss, 'productos', tz).filas);
+  const serv = catalogo(leerTabla_(ss, 'servicios', tz).filas);
+  const existentes = {};
+  const registrar = function (hoja, f, fecha, codCli, nomCli, codItem, nomItem, monto, etiqueta) {
+    if (!fecha) return;
+    const ref = { id: hoja + '|' + f._fila, etiqueta: etiqueta };
+    const clis = (clave_(codCli) ? ['C:' + clave_(codCli)] : []).concat(['N:' + normalizar_(nomCli)]);
+    const items = (clave_(codItem) ? ['I:' + clave_(codItem)] : []).concat(['J:' + normalizar_(nomItem)]);
+    clis.forEach(function (a) { items.forEach(function (b) { agregarIndice_(existentes, fecha + '|' + a + '|' + b + '|' + Math.round(Number(monto) || 0), ref); }); });
+  };
+  leerTabla_(ss, 'ventas', tz).filas.forEach(function (v) {
+    if (clave_(v.id)) registrar('V', v, v.fecha, v.codigoCliente, v.cliente, v.codigo, v.producto, v.subtotal, 'Ventas ' + v.id + (v.estado === 'Anulada' ? ' (anulada)' : ''));
+  });
+  leerTabla_(ss, 'realizados', tz).filas.forEach(function (s) {
+    if (clave_(s.id)) registrar('S', s, s.fecha, s.codigoCliente, s.cliente, s.codigoServicio, s.servicio, s.precio, 'Servicios realizados ' + s.id + (s.estado === 'Anulado' ? ' (anulado)' : ''));
+  });
+  const historicos = {};
+  if (ss.getSheetByName(ESQUEMA.creditos.hoja)) {
+    try {
+      leerTabla_(ss, 'creditos', tz).filas.forEach(function (c) {
+        if (clave_(c.origen) !== 'HISTÓRICO' || clave_(c.estadoPlan) === 'ANULADO' || !clave_(c.codigoCliente)) return;
+        (historicos[clave_(c.codigoCliente)] = historicos[clave_(c.codigoCliente)] || []).push(c);
+      });
+    } catch (e) { /* cartera no instalada */ }
+  }
+  return { base: base, cli: cli, prod: prod, serv: serv, existentes: existentes, usados: {}, historicos: historicos, hoy: hoy_(tz), P: leerParametros_(ss, tz) };
+}
+
+/** Busca la línea ya cargada (Ventas / Servicios realizados) con la misma fecha, cliente, ítem y monto; cada una se usa una sola vez. */
+function buscarDuplicadoImportacion_(cx, fecha, cli, textoCli, item, textoItem, codItem, monto) {
+  const clis = [];
+  if (cli) clis.push('C:' + clave_(cli.codigo), 'N:' + normalizar_(cli.nombre));
+  clis.push('N:' + normalizar_(textoCli));
+  const items = [];
+  if (item) items.push('I:' + clave_(item.codigo), 'J:' + normalizar_(item.nombre));
+  if (clave_(codItem)) items.push('I:' + clave_(codItem));
+  items.push('J:' + normalizar_(textoItem));
+  for (let i = 0; i < clis.length; i++) {
+    for (let j = 0; j < items.length; j++) {
+      const l = cx.existentes[fecha + '|' + clis[i] + '|' + items[j] + '|' + monto] || [];
+      for (let k = 0; k < l.length; k++) {
+        if (!cx.usados[l[k].id]) { cx.usados[l[k].id] = true; return l[k].etiqueta; }
+      }
+    }
+  }
+  return '';
+}
+
+function buscarEnCatalogo_(c, codigo, texto) {
+  if (clave_(codigo)) return c.porCodigo[clave_(codigo)] ? { fila: c.porCodigo[clave_(codigo)], aproximado: false } : null;
+  const t = textoClienteServicio_(texto);
+  if (!t) return null;
+  const exacto = unicoCandidato_(c.exacto[t]);
+  if (exacto) return exacto === 'AMBIGUO' ? 'AMBIGUO' : { fila: exacto, aproximado: false };
+  const normal = unicoCandidato_(c.normal[normalizar_(t)]);
+  if (normal) return normal === 'AMBIGUO' ? 'AMBIGUO' : { fila: normal, aproximado: true };
+  return null;
+}
+
+/**
+ * Normaliza y clasifica UNA fila (sin escribir). o = { fecha, cliente, codigoCliente, tipo, codigoItem, item, cantidad,
+ * monto, condicion, confianza (de la fuente) }. Devuelve la fila normalizada con confianza (ALTA / MEDIA / BAJA),
+ * estado (DUPLICADO si ya está cargado; REVISAR si algo no se pudo leer o no coincide; LISTO) y motivo.
+ */
+function evaluarFilaImportacion_(cx, o) {
+  const motivos = [];
+  let confianza = 'ALTA';
+  const baja = function (m) { motivos.push(m); confianza = 'BAJA'; };
+  const media = function (m) { if (m) motivos.push(m); if (confianza === 'ALTA') confianza = 'MEDIA'; };
+  const f = fechaImportada_(o.fecha, cx.hoy);
+  if (f.error) baja(f.error);
+  const mm = montoImportado_(o.monto);
+  if (mm.error) baja(mm.error);
+  else if (!(mm.monto > 0)) baja('Monto en cero');
+  // Cliente
+  const textoCli = textoClienteServicio_(o.cliente);
+  let cli = null;
+  if (clave_(o.codigoCliente)) {
+    cli = cx.cli.porCodigo[clave_(o.codigoCliente)] || null;
+    if (!cli) baja('El código de cliente ' + clave_(o.codigoCliente) + ' no existe en la base');
+  } else if (textoCli) {
+    const exacto = unicoCandidato_(cx.cli.exacto[textoCli]);
+    const normal = exacto ? null : unicoCandidato_(cx.cli.normal[normalizar_(textoCli)]);
+    if (exacto === 'AMBIGUO' || normal === 'AMBIGUO') baja('Hay más de una ficha con ese nombre: indique el código de cliente');
+    else if (exacto) cli = exacto;
+    else if (normal) { cli = normal; media('Cliente por nombre aproximado (mayúsculas o tildes): ' + normal.codigo); }
+    else baja('Cliente sin ficha en la base: créelo en Base de datos o corrija el nombre');
+  } else baja('Falta el cliente');
+  // Ítem
+  let tipo = tipoItemImportado_(o.tipo);
+  if (tipo === '?') { baja('Tipo de ítem ilegible (use PRODUCTO o SERVICIO)'); tipo = ''; }
+  const textoItem = textoClienteServicio_(o.item);
+  let item = null;
+  if (clave_(o.codigoItem) || textoItem) {
+    const p = tipo === 'SERVICIO' ? null : buscarEnCatalogo_(cx.prod, o.codigoItem, textoItem);
+    const s = tipo === 'PRODUCTO' ? null : buscarEnCatalogo_(cx.serv, o.codigoItem, textoItem);
+    const encontrados = [p, s].filter(Boolean);
+    if (encontrados.some(function (x) { return x === 'AMBIGUO'; }) || encontrados.length > 1) baja('El ítem coincide con más de un producto o servicio: indique el código');
+    else if (encontrados.length === 1) {
+      const e = encontrados[0];
+      item = e.fila;
+      tipo = p ? 'PRODUCTO' : 'SERVICIO';
+      if (e.aproximado) media('Ítem por nombre aproximado: ' + item.codigo);
+    } else baja(clave_(o.codigoItem) ? 'El código de ítem ' + clave_(o.codigoItem) + ' no existe' : 'Ítem sin coincidencia en el catálogo');
+  } else baja('Falta el ítem');
+  // Cantidad
+  const q = cantidadImportada_(o.cantidad);
+  if (q.error) baja(q.error);
+  let cantidad = q.n;
+  if (!cantidad && !q.error) {
+    if (tipo === 'SERVICIO') cantidad = 1;
+    else baja('Falta la cantidad');
+  }
+  if (tipo === 'PRODUCTO' && mm.monto > 0 && cantidad && mm.monto % cantidad) baja('El monto no se divide exacto por la cantidad: revise el monto total de la línea');
+  // Condición
+  const cond = condicionImportada_(o.condicion);
+  if (!cond) baja('Falta la condición (CONTADO o CRÉDITO)');
+  else if (cond === '?') baja('Condición ilegible (use CONTADO o CRÉDITO)');
+  // Confianza de la fuente (lo transcripto de imágenes)
+  const cf = normalizar_(o.confianza);
+  if (cf === 'baja') baja('Ilegible o dudoso en la fuente');
+  else if (cf === 'media') media('Confianza MEDIA según la fuente');
+  // Venta a crédito: se concilia con el saldo HISTÓRICO de la clienta (9001–9020), nunca se suma aparte.
+  let credito = '';
+  if (cond === 'CRÉDITO' && cli) {
+    if (tipo === 'SERVICIO') baja('Servicio a crédito: no previsto (cárguelo como CONTADO o revíselo)');
+    else {
+      const hs = (cx.historicos[clave_(cli.codigo)] || []).filter(function (c) { return !f.fecha || !c.fecha || f.fecha <= c.fecha; });
+      if (!hs.length) baja('Venta a crédito sin saldo HISTÓRICO de la clienta a esa fecha: si ya está pagada, cámbiela a CONTADO; si no, regístrela como venta a crédito nueva');
+      else credito = hs[0].id;
+    }
+  }
+  const duplicado = f.fecha && mm.monto !== null && (item || textoItem || clave_(o.codigoItem))
+    ? buscarDuplicadoImportacion_(cx, f.fecha, cli, textoCli, item, textoItem, o.codigoItem, mm.monto) : '';
+  return {
+    fecha: f.fecha, codigoCliente: cli ? cli.codigo : '', cliente: cli ? cli.nombre : textoCli, tipoItem: tipo, codigoItem: item ? item.codigo : clave_(o.codigoItem),
+    item: item ? item.nombre : textoItem, cantidad: cantidad || '', monto: mm.monto === null ? '' : mm.monto, condicion: cond === '?' ? '' : cond, confianza: confianza,
+    estado: duplicado ? 'DUPLICADO' : (confianza === 'BAJA' ? 'REVISAR' : 'LISTO'), motivo: duplicado ? 'Ya está cargado: ' + duplicado : motivos.join(' · '),
+    credito: credito, fila: { cliente: cli, item: item },
+  };
+}
+
+/** Huella de una fila de la FUENTE (idempotencia: reimportar el mismo archivo no duplica). ocurrencia = N° de la fila idéntica en el archivo. */
+function huellaImportacion_(o, ocurrencia) {
+  const f = fechaImportada_(o.fecha, '').fecha || normalizar_(o.fecha);
+  const m = montoImportado_(o.monto);
+  return md5Hex_(['v1', f, normalizar_(o.cliente), clave_(o.codigoCliente), tipoItemImportado_(o.tipo), clave_(o.codigoItem), normalizar_(o.item),
+    String(o.cantidad === undefined ? '' : o.cantidad).trim(), m.monto === null ? normalizar_(o.monto) : m.monto, condicionImportada_(o.condicion), ocurrencia].join('|'));
+}
+
+function lotesImportacion_() {
+  try {
+    const v = JSON.parse(PropertiesService.getScriptProperties().getProperty(IMPORTACION_.PROP_LOTES) || '{}');
+    return v && typeof v === 'object' ? v : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function guardarLoteImportacion_(lote, datos) {
+  const todos = lotesImportacion_();
+  todos[lote] = datos;
+  const claves = Object.keys(todos).sort();
+  while (claves.length > IMPORTACION_.MAX_LOTES_GUARDADOS) delete todos[claves.shift()];
+  PropertiesService.getScriptProperties().setProperty(IMPORTACION_.PROP_LOTES, JSON.stringify(todos));
+}
+
+/**
+ * Lee la fuente (texto CSV/TSV pegado o el contenido de un .csv) y evalúa cada fila SIN escribir.
+ * Devuelve { filas: [{ entrada, ev, huella, original, ubicacion, yaEnBandeja }], encabezados, faltanColumnas, separador }.
+ */
+function leerFuenteImportacion_(ctx, cx) {
+  const d = ctx.datos;
+  const texto = String(d.texto || '');
+  if (!texto.trim()) throw errorUsuario_('Pegue las filas (con la fila de títulos) o elija un archivo .csv.');
+  const p = parsearCsv_(texto);
+  if (p.filas.length < 2) throw errorUsuario_('La fuente necesita una fila de títulos y al menos una fila de datos.');
+  if (p.filas.length - 1 > IMPORTACION_.MAX_FILAS) throw errorUsuario_('Hasta ' + miles_(IMPORTACION_.MAX_FILAS) + ' filas por carga: divida la fuente en partes.');
+  const encabezados = p.filas[0].map(function (h) { return String(h).trim(); });
+  const claves = encabezados.map(claveColumnaImportacion_);
+  const faltan = [['fecha', 'Fecha'], ['monto', 'Monto (Gs.)']].filter(function (c) { return claves.indexOf(c[0]) < 0; }).map(function (c) { return c[1]; });
+  if (claves.indexOf('cliente') < 0 && claves.indexOf('codigoCliente') < 0) faltan.push('Cliente o Código cliente');
+  if (claves.indexOf('item') < 0 && claves.indexOf('codigoItem') < 0) faltan.push('Ítem o Código ítem');
+  if (faltan.length) throw errorUsuario_('Faltan columnas en la fuente: ' + faltan.join(', ') + '. Use la plantilla (títulos: ' + IMPORTACION_.PLANTILLA.join(' · ') + ').');
+  const enBandeja = {};
+  if (ctx.ss.getSheetByName(ESQUEMA.importacion.hoja)) leerTabla_(ctx.ss, 'importacion', ctx.tz).filas.forEach(function (x) { if (x.huella) enBandeja[x.huella] = x.id; });
+  const vistas = {};
+  const filas = p.filas.slice(1).map(function (celdas, i) {
+    const entrada = {};
+    const partes = [];
+    encabezados.forEach(function (h, j) {
+      const v = String(celdas[j] === undefined ? '' : celdas[j]).trim();
+      if (claves[j] && entrada[claves[j]] === undefined) entrada[claves[j]] = v;
+      if (v) partes.push((h || 'Columna ' + (j + 1)) + ': ' + v);
+    });
+    const base = huellaImportacion_(entrada, 0);
+    vistas[base] = (vistas[base] || 0) + 1;
+    const huella = vistas[base] === 1 ? base : huellaImportacion_(entrada, vistas[base]);
+    const ya = enBandeja[huella] || '';
+    return {
+      entrada: entrada, huella: huella, yaEnBandeja: ya, original: partes.join(' · ').slice(0, 1000),
+      ubicacion: entrada.ubicacion || ('Fila ' + (i + 2)), ev: ya ? null : evaluarFilaImportacion_(cx, entrada),
+    };
+  });
+  return { filas: filas, encabezados: encabezados, reconocidas: encabezados.filter(function (h, j) { return claves[j]; }), separador: p.separador };
+}
+
+function resumenFuente_(filas, totalFuente) {
+  const r = { leidas: filas.length, nuevas: 0, yaEnBandeja: 0, montoLeido: 0, porEstado: {}, totalFuente: totalFuente, diferencia: null };
+  filas.forEach(function (x) {
+    const monto = x.ev ? (Number(x.ev.monto) || 0) : (montoImportado_(x.entrada.monto).monto || 0);
+    r.montoLeido += monto;
+    if (x.yaEnBandeja) { r.yaEnBandeja++; return; }
+    r.nuevas++;
+    const e = r.porEstado[x.ev.estado] || (r.porEstado[x.ev.estado] = { n: 0, monto: 0 });
+    e.n++;
+    e.monto += monto;
+  });
+  if (totalFuente !== null && totalFuente !== undefined && totalFuente !== '') r.diferencia = r.montoLeido - totalFuente;
+  return r;
+}
+
+function vistaPreviaImportacion(req) { return ejecutar_('vistaPreviaImportacion', req, 'lectura', vistaPreviaImportacion_); }
+
+/** Vista previa (no escribe nada): cómo queda cada fila, totales y conciliación contra el total de la fuente. */
+function vistaPreviaImportacion_(ctx) {
+  const d = ctx.datos;
+  const cx = contextoImportacion_(ctx.ss, ctx.tz);
+  const r = leerFuenteImportacion_(ctx, cx);
+  const totalFuente = d.totalFuente === '' || d.totalFuente === null || d.totalFuente === undefined ? null : requerirEntero_(d.totalFuente, 'Total según la fuente', 0, 1e12);
+  const res = resumenFuente_(r.filas, totalFuente);
+  return {
+    ok: true,
+    vista: {
+      encabezados: r.encabezados, reconocidas: r.reconocidas, resumen: res, huella: md5Hex_(r.filas.map(function (x) { return x.huella + ':' + (x.ev ? x.ev.estado : 'YA'); }).join('\n')),
+      filas: r.filas.slice(0, 300).map(function (x) {
+        const e = x.ev || {};
+        return { ubicacion: x.ubicacion, original: x.original, yaEnBandeja: x.yaEnBandeja, fecha: e.fecha, codigoCliente: e.codigoCliente, cliente: e.cliente, tipoItem: e.tipoItem,
+          codigoItem: e.codigoItem, item: e.item, cantidad: e.cantidad, monto: e.monto, condicion: e.condicion, confianza: e.confianza, estado: x.yaEnBandeja ? 'YA EN LA BANDEJA' : e.estado, motivo: e.motivo };
+      }),
+    },
+  };
+}
+
+function cargarImportacion(req) { return ejecutar_('cargarImportacion', req, 'escritura', cargarImportacion_); }
+
+/**
+ * Carga confirmada a «Importación · Historial» (R1.6): solo las filas cuya huella no está en la bandeja (idempotente).
+ * Si se adjunta el archivo o imagen de la fuente, se guarda en «Distribuidora MB/Importaciones» y su enlace queda como
+ * referencia de cada fila. Nada pasa a Ventas: eso lo hace aprobarImportacion.
+ */
+function cargarImportacion_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  if (d.confirmado !== true) throw errorUsuario_('Revise la vista previa y confirme la carga.');
+  const fuente = requerirTexto_(d.fuente, 'Fuente (por ejemplo: planilla de ventas de la asistente)', 150);
+  const cx = contextoImportacion_(ctx.ss, tz);
+  const r = leerFuenteImportacion_(ctx, cx);
+  const huella = md5Hex_(r.filas.map(function (x) { return x.huella + ':' + (x.ev ? x.ev.estado : 'YA'); }).join('\n'));
+  if (String(d.huella || '') !== huella) throw errorUsuario_('La fuente o la base cambiaron desde la vista previa. Vuelva a generarla, revísela y confirme.');
+  const totalFuente = d.totalFuente === '' || d.totalFuente === null || d.totalFuente === undefined ? null : requerirEntero_(d.totalFuente, 'Total según la fuente', 0, 1e12);
+  const nuevas = r.filas.filter(function (x) { return !x.yaEnBandeja; });
+  if (!nuevas.length) return { mensaje: 'Todas las filas ya estaban en la bandeja (misma huella): no se cargó nada.', lote: '' };
+  let referencia = texto_(d.referencia, 300);
+  if (d.archivo && d.archivo.base64) {
+    const a = d.archivo;
+    const bytes = Utilities.base64Decode(String(a.base64));
+    if (bytes.length > IMPORTACION_.MAX_ARCHIVO_BYTES) throw errorUsuario_('El archivo supera los 10 MB: súbalo a Drive y pegue el enlace como referencia.');
+    const nombreArchivo = texto_(a.nombre, 120) || 'Fuente de importación';
+    const guardado = guardarArchivoSistema_(Utilities.newBlob(bytes, String(a.tipo || 'application/octet-stream'), nombreArchivo), 'Importaciones',
+      Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HHmm') + ' ' + nombreArchivo);
+    referencia = guardado.url || guardado.nombre;
+  }
+  const tabla = leerTabla_(ctx.ss, 'importacion', tz);
+  const lote = siguienteCodigo_(unicos_(tabla.filas.map(function (x) { return x.lote; })), 'L-', 4);
+  let n = siguienteNumero_(tabla.filas.map(function (x) { return x.id; }), 'IM-');
+  const ahora = new Date();
+  const filas = nuevas.map(function (x) {
+    const e = x.ev;
+    return {
+      id: formatoCodigo_('IM-', n++, 6), lote: lote, fuente: fuente, referencia: referencia, ubicacion: texto_(x.ubicacion, 120), original: x.original,
+      fecha: e.fecha, codigoCliente: e.codigoCliente, cliente: e.cliente, tipoItem: e.tipoItem, codigoItem: e.codigoItem, item: e.item, cantidad: e.cantidad,
+      monto: e.monto, condicion: e.condicion, confianza: e.confianza, huella: x.huella, estado: e.estado, motivo: e.motivo,
+      ventaHistorica: '', aprobadoPor: '', aprobado: '', usuario: ctx.email, registrado: ahora,
+    };
+  });
+  agregarFilas_(tabla, filas, tz);
+  const res = resumenFuente_(r.filas, totalFuente);
+  guardarLoteImportacion_(lote, { fuente: fuente, referencia: referencia, totalFuente: totalFuente, fecha: Utilities.formatDate(ahora, tz, 'yyyy-MM-dd HH:mm'),
+    usuario: ctx.email, filas: filas.length, leidas: res.leidas, montoLeido: res.montoLeido });
+  anotarAuditoria_(ESQUEMA.importacion.hoja, lote, 'Lote ' + lote + ' («' + fuente + '»): ' + filas.length + ' filas nuevas, ' + res.yaEnBandeja + ' ya estaban; total leído Gs. ' +
+    miles_(res.montoLeido) + (totalFuente !== null ? '; total de la fuente Gs. ' + miles_(totalFuente) : '') + '.', '');
+  const pe = function (k) { return res.porEstado[k] ? res.porEstado[k].n : 0; };
+  return {
+    mensaje: 'Lote ' + lote + ' cargado en «Importación · Historial»: ' + cantidadTexto_(filas.length, 'fila', 'filas') + ' (LISTO ' + pe('LISTO') + ', REVISAR ' + pe('REVISAR') +
+      ', DUPLICADO ' + pe('DUPLICADO') + ')' + (res.yaEnBandeja ? '; ' + res.yaEnBandeja + ' ya estaban en la bandeja' : '') + '. Total leído Gs. ' + miles_(res.montoLeido) +
+      (totalFuente !== null ? ' · fuente Gs. ' + miles_(totalFuente) + ' (diferencia Gs. ' + miles_(res.diferencia) + ')' : '') + '. Nada pasó a Ventas: revise y apruebe en lote.',
+    lote: lote, resumen: res,
+  };
+}
+
+/** Totales por lote y por estado de la bandeja (para la app y el panel de pendientes). */
+function resumenImportacion_(ss, tz) {
+  const r = { lotes: [], porEstado: {}, total: 0 };
+  if (!ss.getSheetByName(ESQUEMA.importacion.hoja)) return r;
+  const meta = lotesImportacion_();
+  const porLote = {};
+  const orden = [];
+  leerTabla_(ss, 'importacion', tz).filas.forEach(function (x) {
+    if (!clave_(x.id)) return;
+    r.total++;
+    r.porEstado[x.estado] = (r.porEstado[x.estado] || 0) + 1;
+    const k = x.lote || '(sin lote)';
+    if (!porLote[k]) {
+      const m = meta[k] || {};
+      porLote[k] = { lote: k, fuente: x.fuente, referencia: x.referencia, fecha: m.fecha || String(x.registrado || '').slice(0, 16), totalFuente: m.totalFuente === undefined ? null : m.totalFuente,
+        filas: 0, monto: 0, porEstado: {} };
+      orden.push(k);
+    }
+    const l = porLote[k];
+    l.filas++;
+    l.monto += Number(x.monto) || 0;
+    const e = l.porEstado[x.estado] || (l.porEstado[x.estado] = { n: 0, monto: 0 });
+    e.n++;
+    e.monto += Number(x.monto) || 0;
+  });
+  r.lotes = orden.map(function (k) {
+    const l = porLote[k];
+    l.diferencia = l.totalFuente === null ? null : l.monto - l.totalFuente;
+    return l;
+  }).reverse();
+  return r;
+}
+
+function obtenerImportacion(req) { return ejecutar_('obtenerImportacion', req, 'lectura', obtenerImportacion_); }
+
+/** Filas de la bandeja (filtro por lote, estado y texto; hasta 500) + resumen por lote + plantilla. */
+function obtenerImportacion_(ctx) {
+  const d = ctx.datos;
+  const lote = clave_(d.lote);
+  const estado = clave_(d.estado);
+  const q = normalizar_(d.texto);
+  let filas = [];
+  if (ctx.ss.getSheetByName(ESQUEMA.importacion.hoja)) {
+    filas = leerTabla_(ctx.ss, 'importacion', ctx.tz).filas.filter(function (x) {
+      if (!clave_(x.id)) return false;
+      if (lote && clave_(x.lote) !== lote) return false;
+      if (estado && clave_(x.estado) !== estado) return false;
+      if (q && normalizar_([x.id, x.cliente, x.codigoCliente, x.item, x.codigoItem, x.original, x.motivo, x.ventaHistorica].join(' ')).indexOf(q) < 0) return false;
+      return true;
+    });
+  }
+  return {
+    ok: true, total: filas.length, plantilla: IMPORTACION_.PLANTILLA.slice(), resumen: resumenImportacion_(ctx.ss, ctx.tz),
+    filas: filas.slice(0, 500).map(function (x) {
+      return { id: x.id, lote: x.lote, fuente: x.fuente, referencia: x.referencia, ubicacion: x.ubicacion, original: x.original, fecha: x.fecha, codigoCliente: x.codigoCliente,
+        cliente: x.cliente, tipoItem: x.tipoItem, codigoItem: x.codigoItem, item: x.item, cantidad: x.cantidad, monto: x.monto, condicion: x.condicion, confianza: x.confianza,
+        estado: x.estado, motivo: x.motivo, ventaHistorica: x.ventaHistorica, aprobadoPor: x.aprobadoPor, aprobado: x.aprobado };
+    }),
+  };
+}
+
+/** Fila de la bandeja → entrada para volver a evaluarla (con lo corregido por la administradora). */
+function filaComoEntrada_(x) {
+  return {
+    fecha: x.fecha, codigoCliente: x.codigoCliente, cliente: x.codigoCliente ? '' : x.cliente, tipo: x.tipoItem, codigoItem: x.codigoItem, item: x.codigoItem ? '' : x.item,
+    cantidad: x.cantidad === '' || x.cantidad === 0 ? '' : x.cantidad, monto: x.monto, condicion: x.condicion,
+    confianza: /ilegible o dudoso en la fuente/i.test(String(x.motivo || '')) ? 'BAJA' : (/MEDIA según la fuente/.test(String(x.motivo || '')) ? 'MEDIA' : ''),
+  };
+}
+
+function editarImportacion(req) { return ejecutar_('editarImportacion', req, 'escritura', editarImportacion_); }
+
+/**
+ * Revisión de la bandeja (solo administradoras): accion 'editar' (corrige campos y vuelve a evaluar), 'confirmar' (la
+ * administradora confirma una lectura dudosa de la fuente y se vuelve a evaluar), 'rechazar' (RECHAZADO con motivo) o
+ * 'reabrir' (vuelve a evaluar una fila rechazada). El «Dato original» y la huella nunca cambian.
+ * En varias filas a la vez solo se cambian cliente, condición o tipo.
+ */
+function editarImportacion_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const tabla = leerTabla_(ctx.ss, 'importacion', tz);
+  const ids = unicos_((Array.isArray(d.ids) ? d.ids : []).map(clave_)).map(clave_);
+  if (!ids.length) throw errorUsuario_('Elija las filas.');
+  if (ids.length > 500) throw errorUsuario_('Hasta 500 filas por vez.');
+  const porId = {};
+  tabla.filas.forEach(function (x) { porId[clave_(x.id)] = x; });
+  const filas = ids.map(function (id) {
+    const x = porId[id];
+    if (!x) throw errorUsuario_('No se encontró la fila ' + id + '.');
+    if (x.estado === 'APROBADO') throw errorUsuario_('La fila ' + id + ' ya está APROBADA (en Ventas como ' + x.ventaHistorica + '): no se edita aquí.');
+    return x;
+  });
+  if (d.accion === 'rechazar') {
+    const motivo = requerirTexto_(d.motivo, 'Motivo del rechazo', 300);
+    const n = actualizarFilas_(tabla, filas.map(function (x) {
+      return { fila: x._fila, valores: { estado: 'RECHAZADO', motivo: 'RECHAZADO (' + ctx.email + '): ' + motivo } };
+    }), tz);
+    return 'Se rechazaron ' + cantidadTexto_(n, 'fila', 'filas') + ' (no pasan a Ventas; se pueden reabrir).';
+  }
+  if (['editar', 'confirmar', 'reabrir'].indexOf(d.accion) < 0) throw errorUsuario_('Acción no válida.');
+  const cambios = d.accion === 'editar' && d.cambios && typeof d.cambios === 'object' ? d.cambios : {};
+  const claves = Object.keys(cambios).filter(function (k) { return ['fecha', 'codigoCliente', 'cliente', 'tipoItem', 'codigoItem', 'item', 'cantidad', 'monto', 'condicion'].indexOf(k) >= 0; });
+  if (d.accion === 'editar' && !claves.length) throw errorUsuario_('No hay cambios para guardar.');
+  if (filas.length > 1 && claves.some(function (k) { return ['codigoCliente', 'condicion', 'tipoItem'].indexOf(k) < 0; })) {
+    throw errorUsuario_('En varias filas a la vez solo se cambian el cliente, la condición o el tipo.');
+  }
+  const cx = contextoImportacion_(ctx.ss, tz);
+  const resultado = { LISTO: 0, REVISAR: 0, DUPLICADO: 0 };
+  const lote = filas.map(function (x) {
+    const e = filaComoEntrada_(x);
+    if (d.accion !== 'reabrir') e.confianza = ''; // la administradora revisó la fila: la duda de la fuente queda resuelta
+    claves.forEach(function (k) {
+      const v = cambios[k];
+      if (k === 'tipoItem') e.tipo = v;
+      else if (k === 'fecha') e.fecha = String(v || '').trim();
+      else e[k] = v;
+      if (k === 'codigoCliente' && clave_(v)) e.cliente = '';
+      if (k === 'cliente') e.codigoCliente = '';
+      if (k === 'codigoItem' && clave_(v)) e.item = '';
+      if (k === 'item') e.codigoItem = '';
+    });
+    const ev = evaluarFilaImportacion_(cx, e);
+    resultado[ev.estado] = (resultado[ev.estado] || 0) + 1;
+    return { fila: x._fila, valores: {
+      fecha: ev.fecha, codigoCliente: ev.codigoCliente, cliente: ev.cliente, tipoItem: ev.tipoItem, codigoItem: ev.codigoItem, item: ev.item, cantidad: ev.cantidad,
+      monto: ev.monto, condicion: ev.condicion, confianza: ev.confianza, estado: ev.estado,
+      motivo: ({ reabrir: 'Reabierta', confirmar: 'Lectura confirmada', editar: 'Corregida' })[d.accion] + ' (' + ctx.email + ')' + (ev.motivo ? ': ' + ev.motivo : '.'),
+    } };
+  });
+  actualizarFilas_(tabla, lote, tz);
+  return 'Filas ' + ({ reabrir: 'reabiertas', confirmar: 'confirmadas', editar: 'corregidas' })[d.accion] + ' y evaluadas de nuevo: LISTO ' + resultado.LISTO + ', REVISAR ' + resultado.REVISAR + ', DUPLICADO ' + resultado.DUPLICADO + '.';
+}
+
+/**
+ * Plan de aprobación (sin escribir): filas LISTO elegidas (ids, o todas las LISTO del lote), evaluadas de nuevo contra
+ * los datos de hoy; ventas «H-» agrupadas por lote, fecha, cliente y condición; servicios «H-» uno por fila.
+ */
+function planAprobacionImportacion_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  const cx = contextoImportacion_(ctx.ss, tz);
+  const tabla = leerTabla_(ctx.ss, 'importacion', tz);
+  const ids = Array.isArray(d.ids) && d.ids.length ? d.ids.map(clave_) : null;
+  const lote = clave_(d.lote);
+  if (!ids && !lote) throw errorUsuario_('Elija el lote o las filas a aprobar.');
+  const candidatas = tabla.filas.filter(function (x) {
+    return x.estado === 'LISTO' && (ids ? ids.indexOf(clave_(x.id)) >= 0 : clave_(x.lote) === lote);
+  }).sort(function (a, b) { return a.fecha < b.fecha ? -1 : (a.fecha > b.fecha ? 1 : (a.id < b.id ? -1 : 1)); });
+  const listas = [];
+  const cambian = [];
+  candidatas.forEach(function (x) {
+    const ev = evaluarFilaImportacion_(cx, filaComoEntrada_(x));
+    if (ev.estado !== 'LISTO') cambian.push({ x: x, ev: ev }); else listas.push({ x: x, ev: ev });
+  });
+  const tomadas = listas.slice(0, IMPORTACION_.MAX_APROBAR);
+  const ventasFilas = leerTabla_(ctx.ss, 'ventas', tz).filas;
+  const realFilas = leerTabla_(ctx.ss, 'realizados', tz).filas;
+  let sigH = siguienteNumero_(ventasFilas.map(function (v) { return v.id; }).concat(realFilas.map(function (s) { return s.id; })), 'H-');
+  const grupos = {};
+  const orden = [];
+  const servicios = [];
+  tomadas.forEach(function (t) {
+    if (t.ev.tipoItem === 'SERVICIO') { servicios.push(t); return; }
+    const k = [t.x.lote, t.ev.fecha, clave_(t.ev.codigoCliente), t.ev.condicion, t.ev.credito].join('|');
+    if (!grupos[k]) { grupos[k] = []; orden.push(k); }
+    grupos[k].push(t);
+  });
+  const ventas = orden.map(function (k) {
+    const g = grupos[k];
+    const ev = g[0].ev;
+    return { id: formatoCodigo_('H-', sigH++, 5), fecha: ev.fecha, codigoCliente: ev.codigoCliente, cliente: ev.cliente, condicion: ev.condicion, credito: ev.credito,
+      lote: g[0].x.lote, fuente: g[0].x.fuente, lineas: g, total: g.reduce(function (s, t) { return s + t.ev.monto; }, 0) };
+  });
+  const servs = servicios.map(function (t) { return { id: formatoCodigo_('H-', sigH++, 5), t: t }; });
+  const huella = md5Hex_(JSON.stringify([ventas.map(function (v) { return [v.id, v.lineas.map(function (t) { return t.x.id; })]; }),
+    servs.map(function (s) { return [s.id, s.t.x.id]; }), cambian.map(function (c) { return [c.x.id, c.ev.estado]; }), d.descontarStock === true]));
+  return { cx: cx, tabla: tabla, ventas: ventas, servicios: servs, cambian: cambian, resto: listas.length - tomadas.length, huella: huella,
+    total: ventas.reduce(function (s, v) { return s + v.total; }, 0) + servs.reduce(function (s, x) { return s + x.t.ev.monto; }, 0) };
+}
+
+function vistaPreviaAprobacion(req) { return ejecutar_('vistaPreviaAprobacion', req, 'lectura', vistaPreviaAprobacion_); }
+
+function vistaPreviaAprobacion_(ctx) {
+  const p = planAprobacionImportacion_(ctx);
+  return {
+    ok: true,
+    vista: {
+      huella: p.huella, total: p.total, resto: p.resto, descontarStock: ctx.datos.descontarStock === true,
+      ventas: p.ventas.map(function (v) {
+        return { id: v.id, fecha: v.fecha, codigoCliente: v.codigoCliente, cliente: v.cliente, condicion: v.condicion, credito: v.credito, total: v.total,
+          lineas: v.lineas.map(function (t) { return { fila: t.x.id, codigo: t.ev.codigoItem, item: t.ev.item, cantidad: t.ev.cantidad, monto: t.ev.monto }; }) };
+      }),
+      servicios: p.servicios.map(function (s) { return { id: s.id, fila: s.t.x.id, fecha: s.t.ev.fecha, cliente: s.t.ev.cliente, item: s.t.ev.item, monto: s.t.ev.monto }; }),
+      cambian: p.cambian.map(function (c) { return { fila: c.x.id, estado: c.ev.estado, motivo: c.ev.motivo }; }),
+    },
+  };
+}
+
+function aprobarImportacion(req) { return ejecutar_('aprobarImportacion', req, 'escritura', aprobarImportacion_); }
+
+/**
+ * Aprobación en lote (R1.6, solo administradoras), con vista previa confirmada (misma huella):
+ *  - productos → ventas «H-» (Origen HISTÓRICO), Contado = «Cobrada»; Crédito = «Pendiente» vinculada a su crédito
+ *    HISTÓRICO (no crea deuda nueva: el saldo ya está en 9001–9020); costo = costo actual del producto (no hay otro dato);
+ *  - servicios → «Servicios realizados» «H-» (Origen HISTÓRICO), sin profesional ni comisión (se pagaron fuera del sistema);
+ *  - stock: NO se descuenta, salvo descontarStock = true con motivo (y nunca por debajo de cero);
+ *  - hasta 300 filas por vez (reanudable: lo aprobado queda APROBADO y no se repite).
+ */
+function aprobarImportacion_(ctx) {
+  const d = ctx.datos;
+  const tz = ctx.tz;
+  if (d.confirmado !== true) throw errorUsuario_('Revise la vista previa y confirme la aprobación.');
+  const p = planAprobacionImportacion_(ctx);
+  if (String(d.huella || '') !== p.huella) throw errorUsuario_('Los datos cambiaron desde la vista previa. Vuelva a generarla, revísela y confirme.');
+  const ahora = new Date();
+  const actualizaciones = p.cambian.map(function (c) {
+    return { fila: c.x._fila, valores: { estado: c.ev.estado, confianza: c.ev.confianza, motivo: 'Al aprobar: ' + c.ev.motivo, codigoCliente: c.ev.codigoCliente, cliente: c.ev.cliente } };
+  });
+  if (!p.ventas.length && !p.servicios.length) {
+    actualizarFilas_(p.tabla, actualizaciones, tz);
+    return 'No hay filas LISTO para aprobar' + (p.cambian.length ? ' (' + cantidadTexto_(p.cambian.length, 'fila cambió', 'filas cambiaron') + ' de estado al evaluarlas de nuevo)' : '') + '.';
+  }
+  const descontar = d.descontarStock === true;
+  const motivoStock = descontar ? requerirTexto_(d.motivoStock, 'Motivo para descontar stock', 200) : '';
+  const P = p.cx.P;
+  const ventas = leerTabla_(ctx.ss, 'ventas', tz);
+  const filasVenta = [];
+  p.ventas.forEach(function (v) {
+    const contado = v.condicion === 'CONTADO';
+    v.lineas.forEach(function (t) {
+      const prod = t.ev.fila.item;
+      const tasa = tasaIva_(prod.iva, P);
+      const precio = Math.round(t.ev.monto / t.ev.cantidad);
+      const lista = Number(prod.precio) || 0;
+      filasVenta.push({
+        id: v.id, fecha: v.fecha, codigoCliente: v.codigoCliente, cliente: v.cliente, codigo: prod.codigo, producto: prod.nombre, cantidad: t.ev.cantidad, precio: precio,
+        subtotal: t.ev.monto, costoUnitario: prod.costo, condicion: contado ? 'Contado' : 'Crédito', estado: contado ? 'Cobrada' : 'Pendiente', fechaCobro: contado ? v.fecha : '',
+        nota: 'Venta histórica · importación ' + v.lote + ' (' + v.fuente + ')', usuario: ctx.email, registrado: ahora, ticket: '', unidad: 'DISTRIBUIDORA', origen: 'HISTÓRICO',
+        precioLista: lista || '', descuento: Math.round(descuentoLinea_(precio, lista) * 10000) / 100, iva: textoTasa_(tasa), ivaMonto: ivaIncluido_(t.ev.monto, tasa),
+        linea: prod.linea || lineaPropuesta_(prod.categoria, false), nroCredito: contado ? '' : v.credito,
+      });
+    });
+  });
+  const realizados = leerTabla_(ctx.ss, 'realizados', tz);
+  const filasServ = p.servicios.map(function (s) {
+    const sv = s.t.ev.fila.item;
+    const tasa = tasaIva_(sv.iva, P);
+    const lista = Number(sv.precio) || 0;
+    return {
+      id: s.id, fecha: s.t.ev.fecha, codigoProfesional: '', profesional: 'Sin profesional (histórico)', codigoServicio: sv.codigo, servicio: sv.nombre, cliente: s.t.ev.cliente,
+      precio: s.t.ev.monto, porcentaje: 0, comision: 0, estado: 'Realizado', liquidado: '',
+      nota: 'Servicio histórico · importación ' + s.t.x.lote + ' (' + s.t.x.fuente + '): la comisión se pagó fuera del sistema', usuario: ctx.email, registrado: ahora,
+      codigoCliente: s.t.ev.codigoCliente, unidad: 'SALÓN', origen: 'HISTÓRICO', precioLista: lista || '', descuento: Math.round(descuentoLinea_(s.t.ev.monto, lista) * 10000) / 100,
+      iva: textoTasa_(tasa), ivaMonto: ivaIncluido_(s.t.ev.monto, tasa),
+    };
+  });
+  let movs = null;
+  let filasMov = [];
+  let productos = null;
+  let stock = null;
+  if (descontar && filasVenta.length) {
+    productos = leerTabla_(ctx.ss, 'productos', tz);
+    movs = leerTabla_(ctx.ss, 'movimientos', tz);
+    stock = calcularStock_(movs.filas);
+    const pedido = {};
+    filasVenta.forEach(function (l) { pedido[clave_(l.codigo)] = (pedido[clave_(l.codigo)] || 0) + l.cantidad; });
+    const faltan = Object.keys(pedido).filter(function (k) { return (stock[k] || 0) < pedido[k]; });
+    if (faltan.length) {
+      throw errorUsuario_('Stock insuficiente para descontar: ' + faltan.map(function (k) { return k + ' (hay ' + miles_(stock[k] || 0) + ', se pide ' + miles_(pedido[k]) + ')'; }).join(', ') +
+        '. Apruebe sin descontar stock (lo habitual: el stock inicial ya lo refleja).');
+    }
+    let sig = siguienteNumero_(movs.filas.map(function (m) { return m.id; }), 'M-');
+    filasMov = filasVenta.map(function (l) {
+      stock[clave_(l.codigo)] = (stock[clave_(l.codigo)] || 0) - l.cantidad;
+      return { id: formatoCodigo_('M-', sig++, 6), fecha: l.fecha, tipo: 'Venta', codigo: l.codigo, producto: l.producto, cantidad: -l.cantidad, costoUnitario: l.costoUnitario,
+        referencia: l.id, nota: 'Venta histórica (importación): ' + motivoStock, usuario: ctx.email, registrado: ahora, unidad: 'DISTRIBUIDORA', ticket: '' };
+    });
+  }
+  agregarFilas_(ventas, filasVenta, tz);
+  agregarFilas_(realizados, filasServ, tz);
+  if (filasMov.length) {
+    agregarFilas_(movs, filasMov, tz);
+    escribirStock_(productos, stock);
+  }
+  p.ventas.forEach(function (v) {
+    v.lineas.forEach(function (t) { actualizaciones.push({ fila: t.x._fila, valores: { estado: 'APROBADO', ventaHistorica: v.id, aprobadoPor: ctx.email, aprobado: ahora } }); });
+  });
+  p.servicios.forEach(function (s) { actualizaciones.push({ fila: s.t.x._fila, valores: { estado: 'APROBADO', ventaHistorica: s.id, aprobadoPor: ctx.email, aprobado: ahora } }); });
+  actualizarFilas_(p.tabla, actualizaciones, tz);
+  if (typeof recalcularCartera_ === 'function') recalcularCartera_(ctx.ss, tz);
+  const creditos = p.ventas.filter(function (v) { return v.condicion === 'CRÉDITO'; });
+  return {
+    mensaje: 'Aprobado: ' + cantidadTexto_(p.ventas.length, 'venta histórica', 'ventas históricas') + (p.ventas.length ? ' (' + p.ventas[0].id + (p.ventas.length > 1 ? '…' + p.ventas[p.ventas.length - 1].id : '') + ')' : '') +
+      ' y ' + cantidadTexto_(p.servicios.length, 'servicio histórico', 'servicios históricos') + ' por Gs. ' + miles_(p.total) + ', Origen HISTÓRICO.' +
+      (creditos.length ? ' ' + cantidadTexto_(creditos.length, 'venta a crédito quedó vinculada', 'ventas a crédito quedaron vinculadas') + ' a su saldo HISTÓRICO (no se sumó deuda).' : '') +
+      (descontar ? ' Stock descontado (' + motivoStock + ').' : ' Sin movimiento de stock.') +
+      (p.cambian.length ? ' ' + cantidadTexto_(p.cambian.length, 'fila cambió', 'filas cambiaron') + ' de estado al evaluarla de nuevo (no se aprobaron).' : '') +
+      (p.resto ? ' Quedan ' + cantidadTexto_(p.resto, 'fila LISTO', 'filas LISTO') + ': vuelva a aprobar para continuar.' : ''),
+    ventas: p.ventas.map(function (v) { return v.id; }), servicios: p.servicios.map(function (s) { return s.id; }), resto: p.resto,
+  };
+}
+
+function plantillaImportacion(req) { return ejecutar_('plantillaImportacion', req, 'escritura', plantillaImportacion_); }
+
+/** Plantilla vacía (solo títulos) en «Distribuidora MB/Importaciones». */
+function plantillaImportacion_(ctx) {
+  const nombre = 'Plantilla importación del historial (vacía).csv';
+  const archivo = guardarArchivoSistema_(Utilities.newBlob(csvDe_([IMPORTACION_.PLANTILLA.slice()]), 'text/csv', nombre), 'Importaciones', nombre);
+  return { mensaje: 'Plantilla lista en «' + CONFIG.CARPETA_SISTEMA + '/Importaciones».', url: archivo.url, nombre: nombre, titulos: IMPORTACION_.PLANTILLA.slice() };
+}
+
+// ─────────────────────── 10. Paquete «v23-f3-clientes» ───────────────────────
+
+/**
+ * Paquete de la Fase 3 (una vez por libro, con respaldo previo): tipo PELUQUERÍA para las filas cargadas en la v2.1
+ * desde «Nueva peluquería» (las 41 clientas del xlsx, con código legado, quedan sin tipo: el xlsx no lo dice), celular
+ * normalizado desde «Teléfono» cuando es un celular, «Completitud» y «Campos faltantes» de las dos hojas, y estado de
+ * los acuerdos de proveedores. Las clientas de «Servicios realizados» (R1.5) se pasan con la migración (vista previa).
+ */
+function aplicarPaqueteClientes_(ss, email, tz) {
+  respaldoUnaVez_(ss, tz, 'paquete v23-f3-clientes');
+  asegurarEstructura_(ss);
+  const propia = !AUDITORIA_;
+  if (propia) iniciarAuditoria_({ email: email || CONFIG.CORREO_ADMIN, rol: ROLES.ADMIN, metodo: 'INSTALACIÓN' }, 'Paquete v23-f3-clientes', '', '');
+  try {
+    let tipos = 0;
+    let celulares = 0;
+    tablasBaseClientes_(ss, tz).forEach(function (tc) {
+      const lote = [];
+      tc.tabla.filas.forEach(function (f) {
+        if (!clave_(f.codigo)) return;
+        const v = {};
+        const reconocido = tipoCliente_(f.tipo);
+        if (reconocido && reconocido !== f.tipo) v.tipo = reconocido;
+        if (!texto_(f.tipo)) {
+          if (tc.clave === 'clientasSalon') v.tipo = CLIENTES_.SALON;
+          else if (!clave_(f.legado)) v.tipo = CLIENTES_.PELUQUERIA;
+        }
+        if (v.tipo) tipos++;
+        if (!texto_(f.celular) && normalizarCelular_(f.telefono)) { v.celular = normalizarCelular_(f.telefono); celulares++; }
+        if (Object.keys(v).length) lote.push({ fila: f._fila, valores: v });
+      });
+      actualizarFilas_(tc.tabla, lote, tz);
+    });
+    if (tipos || celulares) {
+      anotarAuditoria_(ESQUEMA.peluquerias.hoja, '', 'Paquete v23-f3-clientes: tipo de cliente en ' + tipos + (tipos === 1 ? ' fila' : ' filas') + ' (las cargadas desde «Nueva peluquería» → PELUQUERÍA) y celular 595… desde «Teléfono» en ' + celulares + '.', '');
+    }
+    const c = recalcularCompletitud_(ss, tz, null);
+    const prov = typeof revisarAcuerdos_ === 'function' ? revisarAcuerdos_(ss, tz, { sinAvisos: true }) : null;
+    return 'Base de clientes v' + CONFIG.VERSION + ': ' + c.completas + ' fichas COMPLETAS y ' + c.incompletas + ' INCOMPLETAS (con la lista de faltantes; no se les vende a crédito hasta completarlas); ' +
+      'tipo cargado en ' + tipos + ' y celular normalizado en ' + celulares + '.' + (prov ? ' Proveedores: ' + (prov.revisados === 1 ? '1 acuerdo revisado.' : prov.revisados + ' acuerdos revisados.') : '') +
+      ' PENDIENTE: «Migrar datos antiguos» (Sistema › Migración) para pasar las clientas de «Servicios realizados» a la base.';
+  } finally {
+    if (propia) volcarAuditoria_(ss, tz, '');
+  }
+}
+
+// ─────────────────────── 11. Pruebas (testSistema · Pruebas.gs) ───────────────────────
+
+/** Pruebas EN MEMORIA (sin hoja): obligatorios por tipo, RUC y celular, duplicados, variantes de nombres e importación. */
+function pruebasClientes_(t) {
+  const pelu = { codigo: 'C-9999', tipo: 'PELUQUERÍA', nombre: 'Prueba', razonSocial: 'Prueba S.A.', ruc: '1307114-9', contacto: 'Ana', direccion: 'Calle 1', celular: '0981123456', ciudad: 'Asunción' };
+  const con = function (cambios) { return Object.assign({}, pelu, cambios); };
+  t.igual('Clientes: peluquería con todos los obligatorios = sin faltantes', faltantesCliente_(pelu, 'peluquerias', true), []);
+  t.igual('Clientes: peluquería sin RUC ni celular → faltan exactamente «RUC» y «Celular»', faltantesCliente_(con({ ruc: '', celular: '' }), 'peluquerias', true), ['RUC', 'Celular']);
+  t.igual('Clientes: OTRO exige lo mismo que PELUQUERÍA', faltantesCliente_(con({ tipo: 'OTRO', razonSocial: '', direccion: '' }), 'peluquerias', true), ['Razón social', 'Dirección']);
+  t.igual('Clientes: RUC con dígito verificador incorrecto → «RUC válido»', faltantesCliente_(con({ ruc: '1307114-8' }), 'peluquerias', true), ['RUC válido']);
+  t.igual('Clientes: con «Validar dígito verificador» = No, el mismo RUC pasa (solo formato)', faltantesCliente_(con({ ruc: '1307114-8' }), 'peluquerias', false), []);
+  t.igual('Clientes: celular que no es paraguayo → «Celular válido»', faltantesCliente_(con({ celular: '12345' }), 'peluquerias', true), ['Celular válido']);
+  t.igual('Clientes: sin «Celular» pero con un celular en «Teléfono» → completo', faltantesCliente_(con({ celular: '', telefono: '0981 123 456' }), 'peluquerias', true), []);
+  t.igual('Clientes: clienta del salón con nombre y celular = completa (RUC o CI solo si pide factura)',
+    faltantesCliente_({ codigo: 'CS-0001', tipo: 'CLIENTA DEL SALÓN', nombre: 'Ana', celular: '595981123456' }, 'clientasSalon', true), []);
+  t.igual('Clientes: clienta del salón sin celular → «Celular»', faltantesCliente_({ codigo: 'CS-0001', tipo: 'CLIENTA DEL SALÓN', nombre: 'Julieta' }, 'clientasSalon', true), ['Celular']);
+  t.igual('Clientes: clienta del salón con RUC mal escrito → «RUC válido»', faltantesCliente_({ codigo: 'CS-0001', tipo: 'CLIENTA DEL SALÓN', nombre: 'Ana', celular: '0981123456', ruc: 'ABC' }, 'clientasSalon', true), ['RUC válido']);
+  t.igual('Clientes: clienta migrada del xlsx (sin tipo) → «Tipo de cliente» + obligatorios de su hoja',
+    faltantesCliente_({ codigo: 'C-0005', nombre: 'Sonia del Pilar', contacto: 'Sonia del Pilar' }, 'peluquerias', true), ['Tipo de cliente', 'Razón social', 'RUC', 'Dirección', 'Celular', 'Ciudad']);
+  t.igual('Clientes: CI con letras → «CI válida»', faltantesCliente_(con({ ci: '12A45' }), 'peluquerias', true), ['CI válida']);
+  t.igual('Clientes: completitud', [completitudDe_([]), completitudDe_(['RUC'])], ['COMPLETA', 'INCOMPLETA']);
+  t.igual('Clientes: tipos aceptados', ['peluqueria', 'Clienta del salón', 'OTRO', 'salón'].map(tipoCliente_), ['PELUQUERÍA', 'CLIENTA DEL SALÓN', 'OTRO', '']);
+  t.igual('Clientes: hoja por prefijo (CS- = Clientas salón)', [hojaDeCodigo_('CS-0003'), hojaDeCodigo_('C-0003')], ['clientasSalon', 'peluquerias']);
+  t.lanza('Clientes: tipo inválido rechazado', function () { tipoClienteValido_('Mayorista'); }, /no válido/);
+  t.igual('Clientes: zona normalizada', zonaCliente_('gran asuncion'), 'GRAN ASUNCIÓN');
+  t.lanza('Clientes: correo inválido rechazado', function () { correoCliente_('ana@'); }, /no es válido/);
+  // Duplicados en las dos hojas (R1.2 / R1.3)
+  const filas = [{ hoja: 'peluquerias', fila: { codigo: 'C-0001', nombre: 'INA STYLE', ruc: '1307114-9', activo: 'Sí' } },
+    { hoja: 'clientasSalon', fila: { codigo: 'CS-0001', nombre: 'Ana Pérez', ci: '4581379', celular: '595981000111', activo: 'Sí' } }];
+  t.igual('Duplicados: mismo RUC → rechazo', revisarDuplicadosCliente_(filas, { nombre: 'Otra', ruc: '1307114-9' }, 'peluquerias', '').errores.length, 1);
+  t.igual('Duplicados: misma CI en la otra hoja → rechazo (nadie se duplica entre hojas)', revisarDuplicadosCliente_(filas, { nombre: 'Otra', ci: '4.581.379' }, 'peluquerias', '').errores.length, 1);
+  const cruce = revisarDuplicadosCliente_(filas, { nombre: 'Otra', ruc: '4581379-5' }, 'peluquerias', '');
+  t.igual('Duplicados: RUC cuya base es la CI de otra ficha → aviso, no rechazo', [cruce.errores.length, cruce.avisos.length], [0, 1]);
+  t.igual('Duplicados: mismo nombre en «Peluquerías» → rechazo (como en la v2.1)', revisarDuplicadosCliente_(filas, { nombre: 'Ina Style' }, 'peluquerias', '').errores.length, 1);
+  const homonima = revisarDuplicadosCliente_(filas, { nombre: 'ANA PÉREZ' }, 'clientasSalon', '');
+  t.igual('Duplicados: mismo nombre en «Clientas salón» → solo aviso (puede haber homónimas)', [homonima.errores.length, homonima.avisos.length], [0, 1]);
+  t.igual('Duplicados: editar la propia ficha no es duplicado', revisarDuplicadosCliente_(filas, { nombre: 'INA STYLE', ruc: '1307114-9' }, 'peluquerias', 'C-0001').errores.length, 0);
+  t.igual('Duplicados: mismo celular → aviso', revisarDuplicadosCliente_(filas, { nombre: 'Otra', celular: '0981 000 111' }, 'peluquerias', '').avisos.length, 1);
+  // Variantes de nombres (R1.5): los tres grupos del libro vivo y ningún falso positivo
+  const nombres = ['Julieta Alhelí Caballero Colman', 'JULIETA ALHELÌ CABALLERO COLMAN', 'Melisa Coeffier', 'Melissa Coeffier', 'María Pia', 'María Pia Garcia',
+    'María Pia Garcia Bobadilla', 'Clienta Sintética 01', 'Clienta Sintética 02', 'Laura Rojas', 'Laura Maldonado', 'Lolet', 'Lolet Ruiz', 'Erika Segovia', 'Erika Oviedo'];
+  const registros = nombres.map(function (n, i) { return { codigo: formatoCodigo_('CS-', i + 1, 4), nombre: n, servicios: i === 3 ? 2 : 1 }; });
+  const grupos = gruposVariantes_(registros, {});
+  t.igual('Variantes: 3 propuestas (Julieta ×2, Melisa / Melissa, María Pia ×3) y ninguna más',
+    grupos.map(function (g) { return g.miembros.map(function (m) { return m.codigo; }).join('+'); }), ['CS-0001+CS-0002', 'CS-0003+CS-0004', 'CS-0005+CS-0006+CS-0007']);
+  t.ok('Variantes: «Espinosa» / «Espinoza» se proponen (una letra)', !!similitudNombres_('Magdalena Espinosa', 'Magdalena Espinoza'));
+  t.ok('Variantes: números distintos no son una letra («Clienta 01» / «Clienta 02»)', !similitudNombres_('Clienta Sintética 01', 'Clienta Sintética 02'));
+  t.igual('Variantes: un par marcado como «personas distintas» no se vuelve a proponer', gruposVariantes_(registros.slice(2, 4), { 'CS-0003|CS-0004': true }).length, 0);
+  t.igual('Variantes: principal sugerido = nombre más completo y no todo en mayúsculas; a igualdad, más servicios',
+    grupos.map(function (g) { return principalSugerido_(g.miembros).codigo; }), ['CS-0001', 'CS-0004', 'CS-0007']);
+  t.ok('«Sin nombre» y vacíos no identifican a nadie', esSinNombre_('Sin nombre') && esSinNombre_('SIN NOMBRE') && esSinNombre_('') && esSinNombre_(' — ') && !esSinNombre_('Ana'));
+  t.igual('Marcas de Observación', marcasCliente_('[UNIFICADA EN CS-0001] x [DISTINTA DE CS-0004]'), { unificadaEn: 'CS-0001', distintas: ['CS-0004'], revisar: false });
+  t.igual('Quitar la marca de propuesta', sinMarcaRevisar_('Creada desde servicios. [REVISAR UNIFICACIÓN: posible misma clienta que CS-0002 «X»; propuesta de unificación, no se fusiona sola]'), 'Creada desde servicios.');
+  t.igual('Distancia de edición con tope', [distanciaEdicion_('melisa', 'melissa', 1), distanciaEdicion_('segovia', 'oviedo', 1)], [1, 2]);
+  // Importación (R1.6)
+  const csv = parsearCsv_('Fecha;Cliente;Ítem;Monto (Gs.)\r\n01/09/2026;"Pérez; Ana";Corte;"150.000"\r\n');
+  t.igual('Importación: CSV con «;», comillas y separador dentro de comillas', [csv.separador, csv.filas.length, csv.filas[1][1], csv.filas[1][3]], [';', 2, 'Pérez; Ana', '150.000']);
+  t.igual('Importación: pegado desde una planilla (tabulaciones)', parsearCsv_('Fecha\tCliente\n1/9/26\tAna').filas[1], ['1/9/26', 'Ana']);
+  t.igual('Importación: títulos reconocidos (plantilla y sinónimos; «Profesional» se guarda solo en el dato original)',
+    ['Fecha', 'Código cliente', 'Monto (Gs.)', 'Condición (CONTADO / CRÉDITO)', 'Ítem', 'Producto', 'Tipo (PRODUCTO / SERVICIO)', 'Profesional', 'Confianza (ALTA / MEDIA / BAJA)'].map(claveColumnaImportacion_),
+    ['fecha', 'codigoCliente', 'monto', 'condicion', 'item', 'item', 'tipo', '', 'confianza']);
+  t.igual('Importación: fechas de la fuente (día/mes/año)', ['01/09/2026', '1/9/26', '2026-09-01', '31/02/2026', '15/13/2026', 'ayer'].map(function (x) { return fechaImportada_(x, '2026-10-11').fecha; }),
+    ['2026-09-01', '2026-09-01', '2026-09-01', '', '', '']);
+  t.ok('Importación: fecha futura → error', !!fechaImportada_('12/10/2026', '2026-10-11').error);
+  t.igual('Importación: montos', ['Gs. 1.234.000', '1234000', '1,234,000', '150.000', '150,50', 'mil'].map(function (x) { return montoImportado_(x).monto; }), [1234000, 1234000, 1234000, 150000, 151, null]);
+  t.igual('Importación: condición y tipo', [condicionImportada_('Contado'), condicionImportada_('crédito'), condicionImportada_('fiado'), tipoItemImportado_('servicio'), tipoItemImportado_('')],
+    ['CONTADO', 'CRÉDITO', '?', 'SERVICIO', '']);
+  const fila = { fecha: '01/09/2026', cliente: 'Ana', item: 'Corte', monto: '150.000', cantidad: '', condicion: 'Contado' };
+  t.ok('Importación: huella estable (misma fila = misma huella) y distinta para la 2.ª fila idéntica del mismo archivo',
+    huellaImportacion_(fila, 0) === huellaImportacion_(Object.assign({}, fila, { fecha: '2026-09-01', monto: 'Gs. 150.000' }), 0) && huellaImportacion_(fila, 0) !== huellaImportacion_(fila, 2));
+  t.igual('CSV de exportación para Excel en español: BOM, «;» y comillas (sin fórmulas)', csvDe_([['a', 'b;c', '=1']]), '﻿a;"b;c";"\'=1"');
+}
+
+/**
+ * Escenarios sobre la COPIA temporal del libro (nunca el vivo): altas y obligatorios por tipo, duplicados, edición
+ * rápida, bloqueo de crédito de una ficha INCOMPLETA, clientas de servicios (R1.5) con unificación, importación del
+ * historial (R1.6: DUPLICADO de lo ya cargado, reimportación sin duplicar, aprobación «H-» sin stock, crédito
+ * conciliado con su saldo HISTÓRICO), exportación CSV y permisos de una operativa.
+ */
+function escenariosClientes_(t, c) {
+  const ss = c.ss;
+  const tz = c.tz;
+  reiniciarMemoriaEjecucion_();
+  const hoy = hoy_(tz);
+  const sufijo = Utilities.getUuid().replace(/-/g, '').slice(0, 6).toUpperCase();
+  const letras = sufijo.replace(/[0-9]/g, function (d) { return 'ghijklmnop'.charAt(Number(d)); }).toLowerCase();
+  const apellido = 'Prueba' + letras.charAt(0).toUpperCase() + letras.slice(1);
+  const admin = { email: CONFIG.CORREO_ADMIN, rol: ROLES.ADMIN, nombre: 'Administradora (prueba)', metodo: 'PRUEBA' };
+  const oper = { email: CORREO_OPERATIVA_PRUEBA, rol: ROLES.OPERATIVO, nombre: 'Operativa de prueba', metodo: 'PRUEBA' };
+  const ctx = function (u, datos) { return { ss: ss, tz: tz, usuario: u, email: u.email, datos: datos || {}, mes: hoy.slice(0, 7), unidad: '', idSolicitud: '' }; };
+  const error = function (fn) { try { fn(); return ''; } catch (e) { return String(e && e.message ? e.message : e); } };
+  const base = parseInt(sufijo.slice(0, 5), 16) % 900000;
+  const ruc = function (i) { const b = String(80000000 + base * 10 + i); return b + '-' + dvRuc_(b); };
+  const cel = function (i) { return '0985' + String(100000 + (base * 7 + i) % 900000); };
+  let omitido = '';
+  const paso = function (nombre, fn) {
+    if (omitido) return;
+    if (tiempoRestante_() < 40000) { omitido = nombre; t.ok('Clientes: escenarios omitidos por tiempo desde «' + nombre + '» (se prueban en la próxima corrida)', true); return; }
+    t.seccion('Escenarios · clientes · ' + nombre, fn);
+  };
+  const usuarios = leerTabla_(ss, 'usuarios', tz);
+  if (!usuarios.filas.some(function (u) { return u.correo === CORREO_OPERATIVA_PRUEBA; })) {
+    agregarFilas_(usuarios, [{ correo: CORREO_OPERATIVA_PRUEBA, activo: 'Sí', rol: ROLES.OPERATIVO, nombre: 'Operativa de prueba', notas: 'Solo en la copia de prueba' }], tz);
+    olvidarUsuariosEnCache_(ss);
+  }
+  const tokOper = sesionPrueba_(c, CORREO_OPERATIVA_PRUEBA);
+  const fila = function (codigo) { reiniciarMemoriaEjecucion_(); return buscarClienteEnBase_(ss, tz, codigo); };
+  const completa = { tipo: 'PELUQUERÍA', nombre: 'PRUEBA Peluquería ' + sufijo, razonSocial: 'Prueba ' + sufijo + ' S.A.', ruc: ruc(1), contacto: 'Contacto prueba',
+    direccion: 'Calle de prueba 123', celular: cel(1), ciudad: 'Asunción', zona: 'ASUNCIÓN', observacion: 'Solo en la copia de prueba' };
+  let cliCompleta = '';
+  let cliSalon = '';
+  let cliIncompleta = '';
+
+  paso('altas y obligatorios', function () {
+    t.ok('Alta de peluquería SIN RUC rechazada (con la lista de faltantes)', /Faltan datos obligatorios.*RUC/.test(error(function () { guardarCliente_(ctx(admin, Object.assign({}, completa, { ruc: '' })), ''); })));
+    t.ok('Alta de peluquería SIN celular rechazada', /Faltan datos obligatorios.*Celular/.test(error(function () { guardarCliente_(ctx(admin, Object.assign({}, completa, { celular: '' })), ''); })));
+    if (configSi_(ss, CFG.RUC_DV)) {
+      t.ok('Alta con RUC de dígito verificador incorrecto rechazada', /dígito verificador/.test(error(function () {
+        guardarCliente_(ctx(admin, Object.assign({}, completa, { ruc: completa.ruc.replace(/-(\d)$/, function (m, d) { return '-' + ((Number(d) + 1) % 10); }) })), '');
+      })));
+    } else {
+      t.ok('RUC: «Validar dígito verificador» está en No en este libro (se valida solo el formato)', true);
+    }
+    t.ok('Alta con celular inválido rechazada', /no es válido/.test(error(function () { guardarCliente_(ctx(admin, Object.assign({}, completa, { celular: '12345' })), ''); })));
+    const r = guardarCliente_(ctx(oper, completa), '');
+    cliCompleta = r.codigo;
+    const f = fila(cliCompleta);
+    t.igual('Alta completa (operativa): C-xxxx COMPLETA, celular 595…, tipo PELUQUERÍA', [/^C-\d{4}$/.test(cliCompleta), f.completitud, f.celular, f.tipo, f.faltantes],
+      [true, 'COMPLETA', normalizarCelular_(completa.celular), 'PELUQUERÍA', '']);
+    t.ok('Mismo RUC en otra ficha rechazado (sin duplicados)', /Ya existe un cliente con el RUC/.test(error(function () {
+      guardarCliente_(ctx(admin, Object.assign({}, completa, { nombre: 'PRUEBA Otra ' + sufijo })), '');
+    })));
+    t.ok('Una operativa no asigna categoría de crédito', /se necesita una administradora/.test(error(function () {
+      guardarCliente_(ctx(oper, { codigoOriginal: cliCompleta, categoria: 'B' }), '');
+    })));
+    t.ok('Alta de clienta del salón SIN celular rechazada', /Celular/.test(error(function () { guardarCliente_(ctx(oper, { tipo: 'CLIENTA DEL SALÓN', nombre: 'PRUEBA Clienta ' + sufijo }), ''); })));
+    const s = guardarCliente_(ctx(oper, { tipo: 'CLIENTA DEL SALÓN', nombre: 'PRUEBA Clienta ' + sufijo, celular: cel(2) }), '');
+    cliSalon = s.codigo;
+    t.igual('Clienta del salón con nombre y celular: CS-xxxx COMPLETA en «Clientas salón»', [/^CS-\d{4}$/.test(cliSalon), fila(cliSalon).completitud], [true, 'COMPLETA']);
+    t.ok('Misma CI en las dos hojas rechazada', (function () {
+      guardarCliente_(ctx(admin, { codigoOriginal: cliSalon, ci: String(70000000 + base) }), '');
+      return /Ya existe un cliente con la CI/.test(error(function () { guardarCliente_(ctx(admin, { codigoOriginal: cliCompleta, ci: String(70000000 + base) }), ''); }));
+    })());
+  });
+
+  paso('edición rápida de incompletas (R1.4)', function () {
+    const tabla = leerTabla_(ss, 'peluquerias', tz);
+    cliIncompleta = siguienteCodigo_(tabla.filas.map(function (p) { return p.codigo; }), 'C-', 4);
+    agregarFilas_(tabla, [{ codigo: cliIncompleta, nombre: 'PRUEBA Importada ' + sufijo, contacto: 'PRUEBA Importada ' + sufijo, activo: 'Sí', legado: 'P' + sufijo, alta: hoy,
+      actualizado: new Date(), usuario: 'Prueba', observacion: 'Simula un registro importado incompleto (solo en la copia)' }], tz);
+    recalcularCompletitud_(ss, tz, null);
+    const f0 = fila(cliIncompleta);
+    t.igual('Registro importado incompleto: queda INCOMPLETA con la lista exacta (no se rechaza ni se pierde)', [f0.completitud, f0.faltantes],
+      ['INCOMPLETA', 'Tipo de cliente, Razón social, RUC, Dirección, Celular, Ciudad']);
+    const r1 = guardarCliente_(ctx(oper, { codigoOriginal: cliIncompleta, celular: cel(3) }), '');
+    t.ok('Edición rápida: se guarda solo el celular y sigue INCOMPLETA', r1.completitud === 'INCOMPLETA' && r1.faltantes.indexOf('Celular') < 0 && /Queda INCOMPLETA/.test(r1.mensaje));
+    t.ok('No se puede borrar un obligatorio que ya estaba (celular)', /No se puede borrar/.test(error(function () { guardarCliente_(ctx(oper, { codigoOriginal: cliIncompleta, celular: '' }), ''); })));
+    const r2 = guardarCliente_(ctx(oper, { codigoOriginal: cliIncompleta, tipo: 'OTRO', razonSocial: 'Prueba Importada ' + sufijo, ruc: ruc(4), direccion: 'Ruta 1 km 20', ciudad: 'Luque' }), '');
+    t.igual('Completada en la edición rápida: COMPLETA y sin faltantes', [r2.completitud, fila(cliIncompleta).faltantes], ['COMPLETA', '']);
+  });
+
+  paso('crédito bloqueado para INCOMPLETA (R1.4)', function () {
+    if (typeof vistaPreviaPlan_ !== 'function') { t.ok('Crédito: módulo de cartera no instalado (se omite)', true); return; }
+    const prod = guardarProducto_(ctx(admin, { nombre: 'PRUEBA clientes ' + sufijo, marca: 'Prueba automática', categoria: 'Capilar', costo: 150000, precio: 345000, stockInicial: 20, stockMinimo: 0 })).codigo;
+    const tabla = leerTabla_(ss, 'peluquerias', tz);
+    const cod = siguienteCodigo_(tabla.filas.map(function (p) { return p.codigo; }), 'C-', 4);
+    agregarFilas_(tabla, [{ codigo: cod, nombre: 'PRUEBA Sin datos ' + sufijo, contacto: 'Prueba', tipo: 'PELUQUERÍA', activo: 'Sí', categoria: 'B', alta: hoy, actualizado: new Date(), usuario: 'Prueba' }], tz);
+    if (typeof recalcularCartera_ === 'function') recalcularCartera_(ss, tz);
+    const datos = { fecha: hoy, codigoCliente: cod, condicion: 'Crédito', items: [{ codigo: prod, cantidad: 2, precio: 345000 }], plan: { entrega: 210000, cuotas: 6, frecuencia: 'SEMANAL' } };
+    const vp = vistaPreviaPlan_(ctx(oper, datos));
+    const inc = vp.problemas.filter(function (p) { return p.codigo === 'CLIENTA INCOMPLETA'; })[0];
+    t.ok('Vista previa: CLIENTA INCOMPLETA (RECHAZO, con los faltantes)', !!inc && inc.severidad === 'RECHAZO' && /Razón social/.test(inc.mensaje));
+    const antes = leerTabla_(ss, 'creditos', tz).filas.length;
+    t.ok('Venta a crédito a una ficha INCOMPLETA rechazada por el servidor, ni con «autorizar»', /CLIENTA INCOMPLETA/.test(error(function () {
+      registrarVentaCredito_(ctx(admin, Object.assign({ autorizar: true, motivoAutorizacion: 'Prueba' }, datos)));
+    })) && leerTabla_(ss, 'creditos', tz).filas.length === antes);
+    const h0 = clienteHabilitado_(ss, tz, cod, 'factura');
+    t.ok('clienteHabilitado_ (factura electrónica y WhatsApp, Fase 6): INCOMPLETA no habilitada', !h0.ok && /CLIENTA INCOMPLETA/.test(h0.mensaje) && h0.faltantes.length > 0);
+    guardarCliente_(ctx(oper, { codigoOriginal: cod, razonSocial: 'Prueba Sin datos ' + sufijo, ruc: ruc(5), direccion: 'Calle 2', celular: cel(5), ciudad: 'Asunción' }), '');
+    t.ok('Completada la ficha, la misma venta ya no tiene CLIENTA INCOMPLETA', !vistaPreviaPlan_(ctx(oper, datos)).problemas.some(function (p) { return p.codigo === 'CLIENTA INCOMPLETA'; }));
+    t.ok('clienteHabilitado_: completa = habilitada', clienteHabilitado_(ss, tz, cod, 'whatsapp').ok);
+  });
+
+  paso('clientas de Servicios realizados (R1.5)', function () {
+    const realizados = leerTabla_(ss, 'realizados', tz);
+    const personal = leerTabla_(ss, 'personal', tz).filas.filter(function (p) { return esActivo_(p.activo); })[0] || { codigo: '', nombre: '' };
+    const servicio = leerTabla_(ss, 'servicios', tz).filas[0] || { codigo: '', nombre: '' };
+    let n = siguienteNumero_(realizados.filas.map(function (s) { return s.id; }), 'S-');
+    const nombres = ['Melisa ' + apellido, 'Melissa ' + apellido, 'Ana ' + apellido + ' Gómez', 'Ana ' + apellido, 'Sin nombre', 'Melisa ' + apellido];
+    agregarFilas_(realizados, nombres.map(function (nom, i) {
+      return { id: formatoCodigo_('S-', n++, 5), fecha: hoy, codigoProfesional: personal.codigo, profesional: personal.nombre, codigoServicio: servicio.codigo, servicio: servicio.nombre,
+        cliente: nom, precio: 100000 + i * 1000, porcentaje: 0, comision: 0, estado: 'Realizado', liquidado: '', nota: 'Prueba (solo en la copia)', usuario: 'Prueba', registrado: new Date(), unidad: 'SALÓN', origen: 'NUEVO' };
+    }), tz);
+    const conteo = function () { return [leerTabla_(ss, 'clientasSalon', tz).filas.length, leerTabla_(ss, 'realizados', tz).filas.filter(function (s) { return clave_(s.codigoCliente); }).length]; };
+    const antes = conteo();
+    const vista = migrarClientasServicios_(ss, tz, admin.email, { simular: true });
+    t.igual('R1.5: la vista previa no escribe nada', conteo(), antes);
+    const crear = vista.acciones.filter(function (a) { return a.tipo === 'CREAR' && /Prueba/.test(a.detalle) && a.detalle.indexOf(apellido) >= 0; });
+    t.igual('R1.5: un registro por texto distinto (4: Melisa, Melissa, Ana … Gómez y Ana …; «Sin nombre» no)', crear.length, 4);
+    const prop = vista.acciones.filter(function (a) { return a.tipo === 'PROPUESTA · REVISAR' && a.detalle.indexOf(apellido) >= 0; });
+    t.igual('R1.5: variantes propuestas como REVISAR (Melisa / Melissa y Ana / Ana … Gómez), nunca fusionadas', prop.length, 2);
+    const r = migrarClientasServicios_(ss, tz, admin.email, { simular: false });
+    reiniciarMemoriaEjecucion_();
+    const salon = leerTabla_(ss, 'clientasSalon', tz).filas.filter(function (f) { return f.nombre.indexOf(apellido) >= 0; });
+    t.igual('R1.5: clientas nuevas INCOMPLETA (falta el celular), activas y marcadas REVISAR', salon.map(function (f) { return [f.completitud, f.faltantes, f.activo, marcasCliente_(f.observacion).revisar]; }),
+      salon.map(function () { return ['INCOMPLETA', 'Celular', 'Sí', true]; }));
+    const reales = leerTabla_(ss, 'realizados', tz).filas.filter(function (s) { return s.nota === 'Prueba (solo en la copia)'; });
+    t.ok('R1.5: «Código cliente» solo por coincidencia exacta («Sin nombre» queda vacío)', reales.every(function (s) {
+      const f = salon.filter(function (x) { return x.nombre === s.cliente; })[0];
+      return s.cliente === 'Sin nombre' ? !s.codigoCliente : (f && s.codigoCliente === f.codigo);
+    }));
+    t.igual('R1.5: repetir la migración no crea ni vincula nada', migrarClientasServicios_(ss, tz, admin.email, { simular: true }).acciones.filter(function (a) {
+      return !/^YA /.test(a.tipo) && !/clienta del xlsx/.test(a.detalle);
+    }).length, 0);
+    t.ok('R1.5: controles del paso', r.controles.length === 3 && r.controles.every(function (x) { return x.ok; }));
+    const prin = salon.filter(function (f) { return f.nombre === 'Melissa ' + apellido; })[0];
+    const vari = salon.filter(function (f) { return f.nombre === 'Melisa ' + apellido; })[0];
+    const propuestas = propuestasUnificacion_(baseClientes_(ss, tz), null).filter(function (g) { return g.miembros.some(function (m) { return m.codigo === prin.codigo; }); });
+    t.igual('Unificación: la propuesta figura en Base de datos', propuestas.length, 1);
+    t.ok('Unificación: una operativa no puede resolverla', /solo para administradoras/.test(error(function () {
+      llamarPrueba_(resolverUnificacion, tokOper, { accion: 'unificar', principal: prin.codigo, variantes: [vari.codigo] });
+    })));
+    resolverUnificacion_(ctx(admin, { accion: 'unificar', principal: prin.codigo, variantes: [vari.codigo] }));
+    reiniciarMemoriaEjecucion_();
+    const v2 = fila(vari.codigo);
+    const p2 = fila(prin.codigo);
+    const movidos = leerTabla_(ss, 'realizados', tz).filas.filter(function (s) { return s.cliente === 'Melisa ' + apellido; });
+    t.ok('Unificar: la variante queda inactiva con «[UNIFICADA EN …]», sus servicios pasan a la principal y su nombre queda como alias',
+      !esActivo_(v2.activo) && marcasCliente_(v2.observacion).unificadaEn === prin.codigo && movidos.length === 2 && movidos.every(function (s) { return s.codigoCliente === prin.codigo; }) &&
+      String(p2.alias).indexOf('Melisa ' + apellido) >= 0 && !marcasCliente_(p2.observacion).revisar);
+    const anas = salon.filter(function (f) { return f.nombre.indexOf('Ana ' + apellido) === 0; }).map(function (f) { return f.codigo; });
+    resolverUnificacion_(ctx(admin, { accion: 'distintas', miembros: anas }));
+    t.igual('«Son personas distintas»: no se vuelven a proponer', propuestasUnificacion_(baseClientes_(ss, tz), null).filter(function (g) {
+      return g.miembros.some(function (m) { return anas.indexOf(m.codigo) >= 0; });
+    }).length, 0);
+    const sinNombre = leerTabla_(ss, 'realizados', tz).filas.filter(function (s) { return s.nota === 'Prueba (solo en la copia)' && s.cliente === 'Sin nombre'; })[0];
+    vincularClienteServicio_(ctx(admin, { ids: [sinNombre.id], codigo: anas[0] }));
+    t.igual('Vínculo aprobado por una administradora (servicio «Sin nombre» → una ficha)', leerTabla_(ss, 'realizados', tz).filas.filter(function (s) { return s.id === sinNombre.id; })[0].codigoCliente, anas[0]);
+    t.ok('Una ficha nueva con el nombre exacto vincula sus servicios sueltos', (function () {
+      const sueltos = leerTabla_(ss, 'realizados', tz);
+      agregarFilas_(sueltos, [{ id: formatoCodigo_('S-', siguienteNumero_(sueltos.filas.map(function (s) { return s.id; }), 'S-'), 5), fecha: hoy, codigoServicio: servicio.codigo, servicio: servicio.nombre,
+        cliente: 'Lu ' + apellido, precio: 90000, estado: 'Realizado', nota: 'Prueba (solo en la copia)', usuario: 'Prueba', registrado: new Date(), unidad: 'SALÓN', origen: 'NUEVO' }], tz);
+      const rr = guardarCliente_(ctx(oper, { tipo: 'CLIENTA DEL SALÓN', nombre: 'Lu ' + apellido, celular: cel(9) }), '');
+      return /Se vincularon 1 servicio realizado/.test(rr.mensaje);
+    })());
+  });
+
+  paso('importación del historial (R1.6)', function () {
+    const v = leerTabla_(ss, 'ventas', tz).filas;
+    const s = leerTabla_(ss, 'realizados', tz).filas;
+    const enc = 'Fecha;Cliente;Código cliente;Tipo;Código ítem;Ítem;Cantidad;Monto (Gs.);Condición;Ubicación en la fuente';
+    const lineaCsv = function (x) { return x.map(function (y) { return '"' + String(y === null || y === undefined ? '' : y).replace(/"/g, '""') + '"'; }).join(';'); };
+    // Solo lo importable: fecha entre 2015 y hoy (una fila de la hoja con fecha futura o mal escrita queda REVISAR, no DUPLICADO).
+    const importable = function (x) { return clave_(x.id) && !!x.fecha && String(x.fecha) <= hoy && String(x.fecha) >= '2015-01-01'; };
+    const ya = v.filter(importable).map(function (x, i) {
+      return lineaCsv([formatoFecha_(x.fecha), x.cliente, x.codigoCliente, 'PRODUCTO', x.codigo, x.producto, x.cantidad, x.subtotal, x.condicion, 'Ventas fila ' + (i + 2)]);
+    }).concat(s.filter(importable).map(function (x, i) {
+      return lineaCsv([formatoFecha_(x.fecha), x.cliente, '', 'SERVICIO', x.codigoServicio, x.servicio, 1, x.precio, 'Contado', 'Servicios fila ' + (i + 2)]);
+    })).slice(0, IMPORTACION_.MAX_FILAS);
+    const texto = [enc].concat(ya).join('\n');
+    const filasAntes = leerTabla_(ss, 'importacion', tz).filas.length;
+    const ventasAntes = leerTabla_(ss, 'ventas', tz).filas.length;
+    const vp = vistaPreviaImportacion_(ctx(admin, { texto: texto }));
+    const dup = vp.vista.resumen.porEstado.DUPLICADO ? vp.vista.resumen.porEstado.DUPLICADO.n : 0;
+    t.ok('Importación: TODO lo ya cargado (Ventas y Servicios realizados) se detecta como DUPLICADO por fecha, cliente, ítem y monto',
+      ya.length > 0 && dup === vp.vista.resumen.nuevas && vp.vista.resumen.nuevas + vp.vista.resumen.yaEnBandeja === ya.length);
+    t.igual('Importación: la vista previa no escribe', leerTabla_(ss, 'importacion', tz).filas.length, filasAntes);
+    cargarImportacion_(ctx(admin, { texto: texto, fuente: 'PRUEBA lo ya cargado', confirmado: true, huella: vp.vista.huella }));
+    t.igual('Importación: carga confirmada (filas DUPLICADO en la bandeja, nada en Ventas)', [leerTabla_(ss, 'importacion', tz).filas.length - filasAntes, leerTabla_(ss, 'ventas', tz).filas.length],
+      [vp.vista.resumen.nuevas, ventasAntes]);
+    t.ok('Importación: sin confirmar o con otra huella no carga', /confirme/.test(error(function () { cargarImportacion_(ctx(admin, { texto: texto, fuente: 'x' })); })) &&
+      /cambiaron/.test(error(function () { cargarImportacion_(ctx(admin, { texto: texto, fuente: 'x', confirmado: true, huella: 'otra' })); })));
+    const vp2 = vistaPreviaImportacion_(ctx(admin, { texto: texto }));
+    t.igual('Importación: reimportar el mismo archivo no duplica nada (todas las huellas ya están en la bandeja)', [vp2.vista.resumen.nuevas, vp2.vista.resumen.yaEnBandeja], [0, ya.length]);
+    // Historial nuevo (sintético, solo en la copia): contado, servicio, cliente desconocido y crédito
+    const codProd = guardarProducto_(ctx(admin, { nombre: 'PRUEBA historial ' + sufijo, marca: 'Prueba automática', categoria: 'Capilar', costo: 100000, precio: 200000, stockInicial: 5, stockMinimo: 0 })).codigo;
+    const prodFila = buscarPorCodigo_(leerTabla_(ss, 'productos', tz).filas, codProd);
+    const servFila = leerTabla_(ss, 'servicios', tz).filas.filter(function (x) { return esActivo_(x.activo) && x.precio > 0; })[0] || leerTabla_(ss, 'servicios', tz).filas[0];
+    const cliF = fila(cliCompleta);
+    const historico = (leerTabla_(ss, 'creditos', tz).filas || []).filter(function (x) { return clave_(x.origen) === 'HISTÓRICO' && clave_(x.estadoPlan) !== 'ANULADO' && x.codigoCliente; })[0];
+    const nuevas = [
+      lineaCsv(['05/08/2026', cliF.nombre, '', 'PRODUCTO', prodFila.codigo, '', 2, (Number(prodFila.precio) || 1000) * 2, 'CONTADO', 'Hoja 1 fila 3']),
+      lineaCsv(['06/08/2026', cliF.nombre.toUpperCase(), '', '', servFila.codigo, '', '', 150000, 'Contado', 'Hoja 1 fila 4']),
+      lineaCsv(['07/08/2026', 'PRUEBA Desconocida ' + sufijo, '', 'PRODUCTO', prodFila.codigo, '', 1, Number(prodFila.precio) || 1000, 'Contado', 'Hoja 1 fila 5']),
+      lineaCsv(['08/08/2026', cliF.nombre, '', 'PRODUCTO', prodFila.codigo, '', 1, Number(prodFila.precio) || 1000, 'Crédito', 'Hoja 1 fila 6']),
+    ];
+    if (historico) nuevas.push(lineaCsv([formatoFecha_(sumarDias_(historico.fecha, -10)), '', historico.codigoCliente, 'PRODUCTO', prodFila.codigo, '', 1, Number(prodFila.precio) || 1000, 'Crédito', 'Hoja 2 fila 2']));
+    const texto2 = [enc].concat(nuevas).join('\n');
+    const vp3 = vistaPreviaImportacion_(ctx(admin, { texto: texto2, totalFuente: 1 }));
+    const est = vp3.vista.filas.map(function (x) { return x.estado; });
+    t.igual('Importación: contado LISTO, servicio (cliente en mayúsculas: MEDIA) LISTO, cliente desconocido REVISAR, crédito sin saldo HISTÓRICO REVISAR' + (historico ? ', crédito con saldo HISTÓRICO LISTO' : ''),
+      est, ['LISTO', 'LISTO', 'REVISAR', 'REVISAR'].concat(historico ? ['LISTO'] : []));
+    t.ok('Importación: conciliación contra el total de la fuente', vp3.vista.resumen.totalFuente === 1 && vp3.vista.resumen.diferencia === vp3.vista.resumen.montoLeido - 1);
+    const c2 = cargarImportacion_(ctx(admin, { texto: texto2, fuente: 'PRUEBA planilla ' + sufijo, referencia: 'Prueba', confirmado: true, huella: vp3.vista.huella, totalFuente: 1 }));
+    const bandeja = function () { return leerTabla_(ss, 'importacion', tz).filas.filter(function (x) { return x.lote === c2.lote; }); };
+    const desconocida = bandeja().filter(function (x) { return /Desconocida/.test(x.original); })[0];
+    editarImportacion_(ctx(admin, { ids: [desconocida.id], accion: 'editar', cambios: { codigoCliente: cliCompleta } }));
+    t.igual('Revisión: con el cliente corregido la fila queda LISTO', bandeja().filter(function (x) { return x.id === desconocida.id; })[0].estado, 'LISTO');
+    const sinHist = bandeja().filter(function (x) { return x.condicion === 'CRÉDITO' && x.estado === 'REVISAR'; })[0];
+    editarImportacion_(ctx(admin, { ids: [sinHist.id], accion: 'rechazar', motivo: 'Prueba: ya estaba pagada' }));
+    t.igual('Revisión: rechazada con motivo', bandeja().filter(function (x) { return x.id === sinHist.id; })[0].estado, 'RECHAZADO');
+    const m0 = typeof modeloCartera_ === 'function' ? modeloCartera_(ss, tz).totales.cartera : 0;
+    const movs0 = leerTabla_(ss, 'movimientos', tz).filas.length;
+    const plan = vistaPreviaAprobacion_(ctx(admin, { lote: c2.lote }));
+    t.ok('Aprobación: vista previa sin escribir (ventas «H-» y servicios «H-»)', plan.vista.ventas.length >= 1 && plan.vista.servicios.length === 1 && plan.vista.ventas.every(function (x) { return /^H-\d{5}$/.test(x.id); }));
+    t.ok('Aprobación: una operativa no puede aprobar', /solo para administradoras/.test(error(function () { llamarPrueba_(aprobarImportacion, tokOper, { lote: c2.lote, confirmado: true, huella: plan.vista.huella }); })));
+    const ap = aprobarImportacion_(ctx(admin, { lote: c2.lote, confirmado: true, huella: plan.vista.huella }));
+    const hv = leerTabla_(ss, 'ventas', tz).filas.filter(function (x) { return ap.ventas.indexOf(x.id) >= 0; });
+    const hs = leerTabla_(ss, 'realizados', tz).filas.filter(function (x) { return ap.servicios.indexOf(x.id) >= 0; });
+    t.ok('Aprobación: ventas «H-» con Origen HISTÓRICO (no V-) y servicio «H-»', hv.length >= 2 && hv.every(function (x) { return x.origen === 'HISTÓRICO' && /^H-/.test(x.id); }) &&
+      hs.length === 1 && hs[0].origen === 'HISTÓRICO' && hs[0].comision === 0);
+    t.igual('Aprobación: no descuenta stock (sin decisión explícita)', leerTabla_(ss, 'movimientos', tz).filas.length, movs0);
+    if (historico) {
+      const hc = hv.filter(function (x) { return x.condicion === 'Crédito'; })[0];
+      t.ok('Aprobación: la venta histórica a crédito queda vinculada a su saldo HISTÓRICO y la cartera no cambia', !!hc && hc.nroCredito === historico.id && modeloCartera_(ss, tz).totales.cartera === m0);
+    }
+    t.ok('Aprobación: las filas quedan APROBADO con su N° «H-»', bandeja().filter(function (x) { return x.estado === 'APROBADO'; }).every(function (x) { return /^H-/.test(x.ventaHistorica) && x.aprobadoPor === admin.email; }));
+    const otra = vistaPreviaAprobacion_(ctx(admin, { lote: c2.lote }));
+    t.igual('Aprobación: repetirla no crea nada (idempotente)', [otra.vista.ventas.length, otra.vista.servicios.length], [0, 0]);
+    t.igual('Importación: reimportar la planilla aprobada no duplica', vistaPreviaImportacion_(ctx(admin, { texto: texto2 })).vista.resumen.nuevas, 0);
+    // Descontar stock: decisión explícita con motivo
+    const texto3 = [enc, lineaCsv(['09/08/2026', cliF.nombre, '', 'PRODUCTO', prodFila.codigo, '', 1, Number(prodFila.precio) || 1000, 'Contado', 'Hoja 3'])].join('\n');
+    const vp4 = vistaPreviaImportacion_(ctx(admin, { texto: texto3 }));
+    const c3 = cargarImportacion_(ctx(admin, { texto: texto3, fuente: 'PRUEBA stock ' + sufijo, confirmado: true, huella: vp4.vista.huella }));
+    const plan2 = vistaPreviaAprobacion_(ctx(admin, { lote: c3.lote, descontarStock: true }));
+    t.ok('Descontar stock exige motivo', /Motivo/.test(error(function () { aprobarImportacion_(ctx(admin, { lote: c3.lote, descontarStock: true, confirmado: true, huella: plan2.vista.huella })); })));
+    aprobarImportacion_(ctx(admin, { lote: c3.lote, descontarStock: true, motivoStock: 'Prueba', confirmado: true, huella: plan2.vista.huella }));
+    t.igual('Con decisión explícita (y motivo) sí descuenta stock', leerTabla_(ss, 'movimientos', tz).filas.length, movs0 + 1);
+  });
+
+  paso('exportación y permisos', function () {
+    const n0 = MODO_PRUEBA_ ? MODO_PRUEBA_.archivos.length : 0;
+    const e1 = exportarClientesCsv_(ctx(admin, { tipo: 'base' }));
+    const e2 = exportarClientesCsv_(ctx(admin, { tipo: 'faltantes' }));
+    t.ok('Exportación CSV de la base y de los faltantes (Drive › Exportaciones)', e1.filas > 0 && e2.filas >= 0 && (!MODO_PRUEBA_ || MODO_PRUEBA_.archivos.slice(n0).filter(function (a) { return a.carpeta === 'Exportaciones'; }).length === 2));
+    t.ok('Una operativa no exporta la base', /solo para administradoras/.test(error(function () { llamarPrueba_(exportarClientesCsv, tokOper, { tipo: 'base' }); })));
+    t.ok('Una operativa no ve la bandeja de importación', /solo para administradoras/.test(error(function () { llamarPrueba_(obtenerImportacion, tokOper, {}); })));
+    const d = llamarPrueba_(obtenerDatos, tokOper).datos;
+    t.ok('Operativa: ve la base (identificación y completitud), sin unificaciones ni importación', !!d.clientes && d.clientes.lista.length > 0 && d.clientes.unificaciones === undefined &&
+      d.clientes.importacion === undefined && d.clientes.lista.every(function (x) { return x.sugerencia === undefined; }));
+    const h = llamarPrueba_(obtenerClientes, tokOper, { codigo: cliCompleta });
+    t.ok('Historial del cliente (operativa): ventas y servicios sin comisiones', Array.isArray(h.ventas) && h.servicios.every(function (x) { return x.comision === undefined; }));
+  });
+}

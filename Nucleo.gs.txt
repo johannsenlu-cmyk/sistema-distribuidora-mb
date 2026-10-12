@@ -1,0 +1,842 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Núcleo v2.3
+ *  Configuración, política (Parámetros de crédito), redondeos como el xlsx, IVA,
+ *  controles de precio, identificación (RUC, CI, celular), unidades de negocio,
+ *  carpeta del sistema en Drive, respaldos y correo saliente.
+ * =====================================================================
+ *  Regla de oro: NINGUNA cifra de política se usa desde el código. Las semillas de
+ *  abajo son la copia literal de la hoja PARAMETROS del xlsx (10/2026) y solo se
+ *  escriben si la fila falta; a partir de ahí manda «Parámetros de crédito».
+ *  Si un parámetro necesario está vacío o es inválido, la operación se detiene con
+ *  un mensaje claro (nunca se reemplaza en silencio por un valor del código).
+ * =====================================================================
+ */
+
+/** Modo prueba de testSistema(): libro temporal + servicios externos simulados. null = operación normal. */
+let MODO_PRUEBA_ = null;
+
+// ─────────────────────── Configuración (hoja «Configuración») ───────────────────────
+
+const CFG = Object.freeze({
+  VERSION: 'Versión del sistema',
+  RUC_DV: 'Validar dígito verificador del RUC',
+  FACTURACION: 'Modo de facturación',
+  MODO_SIFEN: 'Modo SIFEN',
+  MODO_WA: 'Modo WhatsApp',
+  CARPETA: 'Carpeta del sistema',
+  TRANSFERENCIA: 'Precio de transferencia (uso en salón)',
+  COMISION_PRODUCTOS: 'Comisión por venta de productos en el salón (%)',
+  CONSUMIDOR_FINAL: 'RUC de consumidor final',
+  AG_DIAS: 'Agenda: días de atención',
+  AG_APERTURA: 'Agenda: hora de apertura',
+  AG_CIERRE: 'Agenda: hora de cierre',
+  AG_PAUSA: 'Agenda: pausa (HH:MM-HH:MM)',
+  AG_PUESTOS: 'Agenda: puestos',
+  AG_SENA_ACTIVA: 'Agenda: seña obligatoria (servicios de más de 2 horas)',
+  AG_SENA_PCT: 'Agenda: porcentaje de la seña',
+  AG_CANCEL_ACTIVA: 'Agenda: exigir aviso de cancelación',
+  AG_CANCEL_HORAS: 'Agenda: horas de aviso de cancelación',
+  AG_CALENDARIO: 'Agenda: calendario de Google (ID)',
+  AG_COMPARTIR_RAQUEL: 'Agenda: compartir el calendario con Raquel',
+  AG_RECORDATORIOS: 'Agenda: recordatorios por WhatsApp (24 h antes)',
+  WA_DIAS_ENTRE: 'WhatsApp: días entre recordatorios de cobranza a la misma clienta',
+  WA_MAX_DIA: 'WhatsApp: máximo de mensajes por día',
+  KUDE_AUTOMATICO: 'Envío automático del KuDE a la clienta',
+  AVISOS_ACUERDOS: 'Proveedores: avisos de vencimiento por correo',
+});
+
+/**
+ * Filas de «Configuración» de la v2.3: [etiqueta, valor inicial, lista de valores o null, descripción].
+ * Es una función (no una constante) para no depender del orden de carga de los archivos.
+ * Se agregan solo las filas que faltan; nunca se cambia un valor existente.
+ */
+function filasConfiguracion_() {
+  return [
+    [CFG_CLIENT_ID, '', null, 'Identidad del proyecto «MB Acceso». Se completa sola en el primer ingreso de la cuenta propietaria con «Ingresar con Google» (o péguela desde MB Acceso ?config=1). No la comparta.'],
+    [CFG_ENLACE_ACCESO, '', null, 'Enlace /exec de la implementación de «MB Acceso». Se completa solo en el primer ingreso de la propietaria.'],
+    [CFG_CODIGO_CORREO, 'No', LISTAS.SI_NO, 'Respaldo si Google no responde: «Sí» ofrece además un código de 6 dígitos por correo (más lento). Por defecto «No».'],
+    [CFG.RUC_DV, 'Sí', LISTAS.SI_NO, 'Sí: el RUC debe tener el dígito verificador correcto (módulo 11 de la SET). Póngalo en «No» solo si un RUC real es rechazado (se validará solo el formato).'],
+    [CFG.FACTURACION, 'UNIFICADO', ['UNIFICADO', 'SEPARADO'], 'UNIFICADO: la entidad fiscal de DISTRIBUIDORA emite todo. SEPARADO: cada unidad usa su fila de «Entidades fiscales». Lo define el contador.'],
+    [CFG.MODO_SIFEN, 'SIMULACIÓN', ['SIMULACIÓN', 'PRODUCCIÓN', 'APAGADO'], 'SIMULACIÓN: registra en «SIFEN registro» sin enviar ni numerar. PRODUCCIÓN: envía al middleware (credenciales en Sistema › Integraciones). Requiere integrador con firma electrónica (puede tener costo).'],
+    [CFG.MODO_WA, 'SIMULACIÓN', ['SIMULACIÓN', 'PRODUCCIÓN', 'APAGADO'], 'SIMULACIÓN: anota en «WhatsApp log» lo que se enviaría. PRODUCCIÓN: envía plantillas aprobadas por Meta (WhatsApp Cloud API; puede tener costo).'],
+    [CFG.CARPETA, '', null, 'Carpeta «' + CONFIG.CARPETA_SISTEMA + '» de la cuenta propietaria (la crea la instalación). Ahí se guarda todo archivo que genera el sistema.'],
+    [CFG.TRANSFERENCIA, 'COSTO MB', null, 'Valor con el que el salón toma productos de la distribuidora («Uso en salón»): por defecto el costo MB. La separación legal y tributaria la define el contador.'],
+    [CFG.COMISION_PRODUCTOS, '', null, 'PENDIENTE de confirmar con Mirian (propuesta del tarifario: 10%). Vacío = sin comisión por venta de productos en el salón.'],
+    [CFG.CONSUMIDOR_FINAL, '', null, 'PENDIENTE (contador): RUC genérico de consumidor final para clientas que no piden factura con RUC o CI.'],
+    [CFG.AG_DIAS, 'MAR, MIE, JUE, VIE, SAB', null, 'Estimado de «Salón · Supuestos» (martes a sábado y algunos lunes): PENDIENTE confirmar. Use LUN, MAR, MIE, JUE, VIE, SAB, DOM separados por coma.'],
+    [CFG.AG_APERTURA, '09:00', null, 'Estimado de «Salón · Supuestos»: PENDIENTE confirmar.'],
+    [CFG.AG_CIERRE, '19:00', null, 'Estimado de «Salón · Supuestos»: PENDIENTE confirmar.'],
+    [CFG.AG_PAUSA, '', null, '«Salón · Supuestos» menciona una pausa sin horario: PENDIENTE confirmar (ej.: 12:00-13:00).'],
+    [CFG.AG_PUESTOS, '', null, 'Opcional: nombres de puestos separados por coma. Vacío = la agenda no controla puestos.'],
+    [CFG.AG_SENA_ACTIVA, 'No', LISTAS.SI_NO, 'Política sugerida en «Salón · Tarifario» (seña del 30% para servicios de más de 2 horas): PENDIENTE confirmar.'],
+    [CFG.AG_SENA_PCT, '30%', null, 'Sugerencia de «Salón · Tarifario». Solo se aplica si la fila anterior está en «Sí».'],
+    [CFG.AG_CANCEL_ACTIVA, 'No', LISTAS.SI_NO, 'Política sugerida en «Salón · Tarifario» (aviso de cancelación con 24 h): PENDIENTE confirmar.'],
+    [CFG.AG_CANCEL_HORAS, '24', null, 'Sugerencia de «Salón · Tarifario». Solo se aplica si la fila anterior está en «Sí».'],
+    [CFG.AG_CALENDARIO, '', null, 'Lo completa el sistema al crear el calendario «Agenda Salón MB» en la cuenta propietaria.'],
+    [CFG.AG_COMPARTIR_RAQUEL, 'No', LISTAS.SI_NO, 'El calendario se comparte con edición con Mirian. «Sí» lo comparte también con Raquel (decisión de la dueña).'],
+    [CFG.AG_RECORDATORIOS, 'Sí', LISTAS.SI_NO, 'Recordatorio de turno 24 h antes (en SIMULACIÓN solo se anota en «WhatsApp log»).'],
+    [CFG.WA_DIAS_ENTRE, '1', null, 'Mínimo de días entre dos recordatorios de cobranza a la misma clienta (nunca dos el mismo día).'],
+    [CFG.WA_MAX_DIA, '40', null, 'Tope de seguridad de mensajes de WhatsApp por día.'],
+    [CFG.KUDE_AUTOMATICO, 'Sí', LISTAS.SI_NO, 'Al aprobarse un comprobante, enviar el KuDE por correo o WhatsApp (nunca en SIMULACIÓN ni a clientes INCOMPLETA).'],
+    [CFG.AVISOS_ACUERDOS, 'Sí', LISTAS.SI_NO, 'Aviso por correo a las administradoras a 60, 30, 15 y 7 días y el día del vencimiento de un acuerdo.'],
+  ];
+}
+
+/** Agrega las filas que falten en «Configuración» (sin tocar valores existentes) y actualiza la versión. */
+function asegurarFilasConfiguracion_(ss) {
+  const hoja = ss.getSheetByName(HOJA_CONFIG);
+  if (!hoja) return;
+  const ultima = Math.max(hoja.getLastRow(), 1);
+  const valores = hoja.getRange(1, 1, ultima, 3).getValues();
+  const filaDe = {};
+  valores.forEach(function (f, i) { filaDe[String(f[0]).trim()] = i + 1; });
+  if (filaDe[PARAM_REGISTRO]) hoja.getRange(filaDe[PARAM_REGISTRO], 3).setValue(DESCRIPCION_REGISTRO);
+  const nuevas = [];
+  filasConfiguracion_().forEach(function (f) {
+    if (!filaDe[f[0]]) nuevas.push(f);
+  });
+  if (nuevas.length) {
+    const inicio = ultima + 1;
+    const fin = inicio + nuevas.length - 1;
+    if (fin > hoja.getMaxRows()) hoja.insertRowsAfter(hoja.getMaxRows(), fin - hoja.getMaxRows() + 5);
+    hoja.getRange(inicio, 1, nuevas.length, 3).setValues(nuevas.map(function (f) { return [f[0], celdaTexto_(f[1]), f[3]]; }));
+    hoja.getRange(inicio, 3, nuevas.length, 1).setWrap(true);
+    nuevas.forEach(function (f, i) {
+      if (f[2]) hoja.getRange(inicio + i, 2).setDataValidation(reglaLista_(f[2]));
+    });
+  }
+  memoria_.config = null;
+  return nuevas.length;
+}
+
+function leerConfig_(ss, etiqueta) {
+  if (!memoria_.config) {
+    const mapa = {};
+    const hoja = ss.getSheetByName(HOJA_CONFIG);
+    if (hoja && hoja.getLastRow() >= 1) {
+      hoja.getRange(1, 1, hoja.getLastRow(), 2).getValues().forEach(function (f) {
+        const v = f[1] instanceof Date ? Utilities.formatDate(f[1], CONFIG.ZONA_HORARIA, 'yyyy-MM-dd') : f[1];
+        mapa[String(f[0]).trim()] = typeof v === 'number' ? v : String(v).trim();
+      });
+    }
+    memoria_.config = mapa;
+  }
+  return memoria_.config[etiqueta] === undefined ? '' : memoria_.config[etiqueta];
+}
+
+function escribirConfig_(ss, etiqueta, valor) {
+  const hoja = ss.getSheetByName(HOJA_CONFIG);
+  if (!hoja) throw errorUsuario_('Falta la pestaña «Configuración».');
+  const v = hoja.getRange(1, 1, Math.max(hoja.getLastRow(), 1), 1).getValues();
+  for (let i = 0; i < v.length; i++) {
+    if (String(v[i][0]).trim() === etiqueta) {
+      hoja.getRange(i + 1, 2).setValue(typeof valor === 'number' ? valor : celdaTexto_(valor));
+      memoria_.config = null;
+      return;
+    }
+  }
+  throw errorUsuario_('Falta la fila «' + etiqueta + '» en «Configuración». Ejecute la instalación (instalarActualizacionMB) para crearla.');
+}
+
+/** «Sí» → true (acepta Si, SÍ, sí). */
+function configSi_(ss, etiqueta) {
+  return /^s[ií]/i.test(String(leerConfig_(ss, etiqueta) || '').trim());
+}
+
+/** Número de una fila de «Configuración» (acepta «30%» → 30). Vacío o inválido → null. */
+function configNumero_(ss, etiqueta) {
+  const v = leerConfig_(ss, etiqueta);
+  if (v === '' || v === null || v === undefined) return null;
+  if (typeof v === 'number') return v < 1 && /%/.test(String(etiqueta)) ? v * 100 : v;
+  const n = decimal_(String(v).replace('%', ''));
+  return isNaN(n) ? null : n;
+}
+
+/** 'SIMULACIÓN' (por defecto, ante cualquier duda) | 'PRODUCCIÓN' | 'APAGADO'. cual: 'sifen' | 'whatsapp'. */
+function modoIntegracion_(ss, cual) {
+  let v = '';
+  try { v = String(leerConfig_(ss, cual === 'sifen' ? CFG.MODO_SIFEN : CFG.MODO_WA) || ''); } catch (e) { v = ''; }
+  if (/^prod/i.test(v)) return 'PRODUCCIÓN';
+  if (/^apag/i.test(v)) return 'APAGADO';
+  return 'SIMULACIÓN';
+}
+
+// ─────────────────────── Parámetros de crédito (R0.1) ───────────────────────
+
+/**
+ * Copia literal de PARAMETROS del xlsx «MB_Control_Ventas_Creditos_Cobranzas» (octubre 2026):
+ * [clave del sistema, Parámetro (texto de la columna B), Valor, Unidad, Fuente / nota].
+ * Los % se guardan como fracción (0,3 = 30%), igual que en el xlsx.
+ */
+function semillaParametros_() {
+  return [
+    ['P_EMPRESA', 'Empresa', 'Distribuidora MB', 'texto', 'xlsx PARAMETROS!C5 (P_EMPRESA).'],
+    ['P_CF', 'Costos fijos mensuales (Gs.)', 15000000, 'Gs./mes', 'xlsx C9 (P_CF). Dato informado por la empresa: aprox. Gs. 15 millones por mes.'],
+    ['P_MARGEN_MIN', 'Margen bruto mínimo por producto (sobre precio sin IVA)', 0.3, '%', 'xlsx C10 (P_MARGEN_MIN). Por debajo, la venta se marca MARGEN BAJO MÍNIMO y requiere autorización.'],
+    ['P_MARGEN_OBJ', 'Margen bruto objetivo de la mezcla de ventas', 0.4, '%', 'xlsx C11 (P_MARGEN_OBJ). Base del precio sugerido.'],
+    ['P_PROV_INCOB', 'Provisión para incobrables (% de la venta neta)', 0.02, '%', 'xlsx C12 (sin nombre). Propuesta prudente; ajustar con la experiencia real.'],
+    ['P_COMIS_VENTA', 'Comisiones de venta (% de la venta neta)', 0, '%', 'xlsx C13 (sin nombre). Completar si se pagan comisiones.'],
+    ['P_COSTO_COBROS', 'Costo de cobros con tarjeta o QR (% de la venta neta)', 0, '%', 'xlsx C14 (sin nombre). Completar con la tarifa del procesador, si se usa.'],
+    ['P_DIAS_VENTA', 'Días de venta por mes', 24, 'días', 'xlsx C16 (P_DIAS_VENTA). Propuesta; ajustar al calendario real.'],
+    ['P_IVA', 'Tasa general de IVA', 0.1, '%', 'xlsx C17 (P_IVA). Tasa general vigente (La Nación, 17/07/2026). Los precios se cargan con IVA incluido.'],
+    ['P_RED_PRECIO', 'Redondeo de precios sugeridos (Gs.)', 1000, 'Gs.', 'xlsx C18 (P_RED_PRECIO).'],
+    ['P_DESC_VEND', 'Descuento máximo que puede dar la vendedora', 0.05, '%', 'xlsx C28 (P_DESC_VEND). Más que esto: DESCUENTO REQUIERE AUTORIZACIÓN.'],
+    ['P_DESC_MAX', 'Descuento máximo con autorización de la propietaria', 0.1, '%', 'xlsx C29 (P_DESC_MAX). Más de este porcentaje se marca DESCUENTO FUERA DE POLÍTICA.'],
+    ['P_MIN_CREDITO', 'Monto mínimo para vender a crédito (Gs.)', 200000, 'Gs.', 'xlsx C32 (P_MIN_CREDITO).'],
+    ['P_CUOTA_MIN', 'Cuota mínima (Gs.)', 50000, 'Gs.', 'xlsx C33 (P_CUOTA_MIN).'],
+    ['P_MAX_CUOTAS', 'Máximo de cuotas, además de la entrega', 6, 'cuotas', 'xlsx C34 (P_MAX_CUOTAS).'],
+    ['P_GRACIA', 'Días de gracia', 2, 'días', 'xlsx C35 (P_GRACIA).'],
+    ['P_DIAS_BLOQUEO', 'Bloquear nuevos créditos con atraso mayor a (días)', 7, 'días', 'xlsx C36 (P_DIAS_BLOQUEO).'],
+    ['P_ENTREGA_EQUIPO', 'Entrega mínima para equipamiento', 0.4, '%', 'xlsx C37 (P_ENTREGA_EQUIPO). Se aplica la mayor entre esta y la de la categoría de la clienta.'],
+    ['P_RED_CUOTA', 'Redondeo de cuotas (Gs.)', 1000, 'Gs.', 'xlsx C38 (P_RED_CUOTA).'],
+    ['P_PLAZO_SIN_REC', 'Plazo total sin recargo financiero (días)', 42, 'días', 'xlsx C39 (P_PLAZO_SIN_REC). Hasta 6 cuotas semanales van sin recargo.'],
+    ['P_TEA_FIN', 'Tasa anual de financiación para planes más largos', 0.24, '%', 'xlsx C40 (P_TEA_FIN). Propuesta. Nunca mayor al límite BCP.'],
+    ['P_TEA_MORA', 'Tasa anual de mora (solo si el plan firmado la prevé)', 0.24, '%', 'xlsx C41 (P_TEA_MORA). Sobre el monto vencido y los días de atraso, sin capitalizar.'],
+    ['P_LIMITE_BCP', 'Límite de tasa usuraria BCP, guaraníes', 0.2726, '%', 'xlsx C42 (P_LIMITE_BCP). Octubre de 2026 (La Nación, 01/10/2026). Actualizar cada mes.'],
+    ['P_LIMITE_BCP_MES', 'Mes en que se verificó el límite BCP (AAAA-MM)', '2026-10', 'AAAA-MM', 'Nota del xlsx C42 («Octubre de 2026»). Al cambiar de mes el sistema avisa hasta que se actualice.'],
+    ['P_COD_REC', 'Código del ítem de recargo financiero', 'REC-FIN', 'código', 'xlsx C44 (P_COD_REC). Línea de sistema: no mueve stock.'],
+    ['P_CONC_MORA', 'Concepto de cobro de recargos por mora', 'RECARGO POR MORA', 'texto', 'xlsx C45 (P_CONC_MORA). Estos cobros no amortizan el saldo.'],
+    ['P_LINEA_EQUIPO', 'Línea de equipamiento', 'EQUIPAMIENTO Y MOBILIARIO', 'texto', 'xlsx C46 (P_LINEA_EQUIPO).'],
+    ['P_LINEA_FIN', 'Línea de ingresos financieros', 'INGRESOS FINANCIEROS', 'texto', 'xlsx C47 (P_LINEA_FIN).'],
+    ['P_FREC_SEMANAL', 'Días entre cuotas: SEMANAL', 7, 'días', 'xlsx C58 (P_FREC_DIAS). Estándar.'],
+    ['P_FREC_QUINCENAL', 'Días entre cuotas: QUINCENAL', 14, 'días', 'xlsx C59 (P_FREC_DIAS). Solo categoría A o con autorización.'],
+    ['P_FREC_MENSUAL', 'Días entre cuotas: MENSUAL', 30, 'días', 'xlsx C60 (P_FREC_DIAS). Excepción autorizada por la propietaria.'],
+    ['P_IVA_RECARGO', 'IVA del recargo financiero y de la mora', '', '%', 'PENDIENTE (contador). Mientras esté vacío se usa la tasa general (P_IVA) y queda aviso en Pendientes.'],
+    ['P_COSTO_CON_IVA', '¿El «Costo unitario» de Productos incluye IVA?', 'NO', 'SÍ/NO', 'PENDIENTE de confirmar. El xlsx usa costo SIN IVA («NO»): así V-00002 (Ozonoterapia a 990.000 con costo 805.000) queda con margen 10,6%.'],
+    ['P_DIAS_ACTIVA', 'Clienta activa: compró en los últimos (días)', 90, 'días', 'Megaprompt R0.7 (clientas activas en el cierre mensual).'],
+    ['P_META_ASISTENTE', 'Meta mensual de la asistente', '', 'Gs.', 'PENDIENTE con Mirian: se menciona Gs. 25.000.000 (qué mide y en qué período). No se usa hasta confirmarla.'],
+    ['P_REPOSICION', 'Monto destinado a reposición', '', 'Gs.', 'PENDIENTE con Mirian: se menciona Gs. 12.500.000.'],
+    ['P_POLITICA_FIRMADA', 'Política de crédito firmada (fecha o enlace)', '', 'texto', 'PENDIENTE: sin la política firmada no se cobra mora.'],
+    ['P_CTA_CAJA', 'Cuenta contable: Caja y bancos', '', 'código', 'xlsx sección 7 (cuenta sugerida: Caja / Bancos). Código a completar con el contador.'],
+    ['P_CTA_DEUDORES', 'Cuenta contable: Deudores por ventas', '', 'código', 'xlsx sección 7 (cuenta sugerida: Deudores por ventas).'],
+    ['P_CTA_VENTAS_MERC', 'Cuenta contable: Ventas de mercaderías', '', 'código', 'xlsx sección 7 (cuenta sugerida: Ventas de mercaderías).'],
+    ['P_CTA_VENTAS_SERV', 'Cuenta contable: Ventas de servicios', '', 'código', 'xlsx sección 7 (cuenta sugerida: Ventas de servicios).'],
+    ['P_CTA_FINANCIEROS', 'Cuenta contable: Ingresos financieros y recargos', '', 'código', 'xlsx sección 7 (cuenta sugerida: Intereses y recargos ganados).'],
+    ['P_CTA_IVA_DEBITO', 'Cuenta contable: IVA débito fiscal', '', 'código', 'xlsx sección 7 (cuenta sugerida: IVA débito fiscal).'],
+    ['P_CTA_COSTO', 'Cuenta contable: Costo de mercaderías vendidas', '', 'código', 'xlsx sección 7 (cuenta sugerida: Costo de mercaderías vendidas).'],
+    ['P_CTA_MERCADERIAS', 'Cuenta contable: Mercaderías', '', 'código', 'xlsx sección 7 (cuenta sugerida: Mercaderías).'],
+  ];
+}
+
+/** Categorías NUEVA, C, B y A: copia literal de PARAMETROS!B51:G54 del xlsx. */
+function semillaCategorias_() {
+  return [
+    ['NUEVA', 1000000, 0.5, 4, 'SEMANAL', 'Primeras compras o menos de 3 meses con MB'],
+    ['C', 1500000, 0.4, 4, 'SEMANAL', 'Atrasos frecuentes o un atraso de más de 30 días en 6 meses'],
+    ['B', 3000000, 0.3, 6, 'SEMANAL', 'Paga en término, con atrasos menores a 8 días'],
+    ['A', 5000000, 0.2, 6, 'SEMANAL O QUINCENAL', '6 meses o más sin atrasos mayores a 7 días'],
+  ];
+}
+
+/** Claves que pueden quedar vacías sin aviso de error (son PENDIENTES o códigos a completar). */
+const PARAMETROS_OPCIONALES_ = ['P_IVA_RECARGO', 'P_META_ASISTENTE', 'P_REPOSICION', 'P_POLITICA_FIRMADA', 'P_CTA_CAJA', 'P_CTA_DEUDORES',
+  'P_CTA_VENTAS_MERC', 'P_CTA_VENTAS_SERV', 'P_CTA_FINANCIEROS', 'P_CTA_IVA_DEBITO', 'P_CTA_COSTO', 'P_CTA_MERCADERIAS'];
+
+/** Siembra las filas que falten (nunca modifica valores existentes). Devuelve { parametros, categorias }. */
+function sembrarParametros_(ss, tz, email) {
+  const tabla = leerTabla_(ss, 'parametros', tz);
+  const ya = {};
+  tabla.filas.forEach(function (f) { ya[clave_(f.clave)] = true; });
+  const ahora = new Date();
+  const nuevas = semillaParametros_().filter(function (p) { return !ya[p[0]]; }).map(function (p) {
+    return { clave: p[0], nombre: p[1], valor: p[2], unidad: p[3], fuente: p[4], actualizado: ahora, usuario: email || USUARIO_ACTUALIZACION };
+  });
+  if (nuevas.length) {
+    const desde = tabla.hoja.getLastRow() + 1;
+    agregarFilas_(tabla, nuevas, tz);
+    nuevas.forEach(function (p, i) {
+      if (p.unidad === '%' && typeof p.valor === 'number') tabla.hoja.getRange(desde + i, tabla.idx.valor + 1).setNumberFormat('0.00%');
+      if (/^Gs/.test(p.unidad) && typeof p.valor === 'number') tabla.hoja.getRange(desde + i, tabla.idx.valor + 1).setNumberFormat('#,##0');
+    });
+  }
+  const cats = leerTabla_(ss, 'categorias', tz);
+  let nCat = 0;
+  if (!cats.filas.length) {
+    const desde = cats.hoja.getLastRow() + 1;
+    agregarFilas_(cats, semillaCategorias_().map(function (c) {
+      return { nombre: c[0], limite: c[1], entrega: c[2], cuotas: c[3], frecuencia: c[4], criterio: c[5], activo: 'Sí' };
+    }), tz);
+    cats.hoja.getRange(desde, cats.idx.entrega + 1, 4, 1).setNumberFormat('0%');
+    nCat = 4;
+  }
+  memoria_.parametros = null;
+  memoria_.categorias = null;
+  return { parametros: nuevas.length, categorias: nCat };
+}
+
+/** Interpreta un valor de la hoja según su unidad. Devuelve { valor, ok }. */
+function interpretarParametro_(v, unidad) {
+  if (/^(texto|código|AAAA-MM)$/i.test(unidad)) {
+    const s = v instanceof Date ? Utilities.formatDate(v, CONFIG.ZONA_HORARIA, 'yyyy-MM') : String(v === null || v === undefined ? '' : v).trim();
+    return { valor: s, ok: s !== '' };
+  }
+  if (/^s[ií]\/no$/i.test(unidad)) {
+    const s = String(v || '').trim();
+    return { valor: /^s[ií]/i.test(s), ok: /^(s[ií]|no)$/i.test(s) };
+  }
+  if (v === '' || v === null || v === undefined) return { valor: null, ok: false };
+  let n;
+  if (typeof v === 'number') n = v;
+  else if (unidad === '%') n = decimal_(String(v).replace(/[^0-9,.\-%]/g, '').replace('%', ''));
+  else n = entero_(v); // Gs., días, cuotas: «15.000.000» → 15000000
+  if (isNaN(n) || n < 0) return { valor: null, ok: false };
+  if (unidad === '%') {
+    // En la hoja el % se guarda como fracción (0,3). Si alguien escribió «30» se interpreta como 30%.
+    if (typeof v !== 'number' && /%/.test(String(v))) n = n / 100;
+    else if (n >= 1) n = n / 100;
+  }
+  return { valor: n, ok: true };
+}
+
+/**
+ * Política vigente: { P_xxx: valor, _avisos: [...], _faltan: [...], _nombres: {clave: parámetro} }.
+ * % como fracción (0,3). Lo vacío o inválido NO se reemplaza: queda en _faltan y param_() lo exige.
+ */
+function leerParametros_(ss, tz) {
+  if (memoria_.parametros) return memoria_.parametros;
+  let filas = [];
+  try { filas = leerTabla_(ss, 'parametros', tz).filas; } catch (e) { filas = []; }
+  const P = { _avisos: [], _faltan: [], _nombres: {}, _unidades: {} };
+  const semilla = {};
+  semillaParametros_().forEach(function (p) { semilla[p[0]] = p; });
+  const vistos = {};
+  filas.forEach(function (f) {
+    const k = clave_(f.clave);
+    if (!k) return;
+    vistos[k] = true;
+    const unidad = String(f.unidad || (semilla[k] ? semilla[k][3] : 'texto')).trim();
+    const r = interpretarParametro_(f.valor, unidad);
+    P._nombres[k] = f.nombre || k;
+    P._unidades[k] = unidad;
+    if (r.ok) P[k] = r.valor;
+    else {
+      P[k] = null;
+      if (PARAMETROS_OPCIONALES_.indexOf(k) < 0) {
+        P._faltan.push(k);
+        P._avisos.push('Parámetro «' + (f.nombre || k) + '» vacío o inválido en «Parámetros de crédito».');
+      }
+    }
+  });
+  Object.keys(semilla).forEach(function (k) {
+    if (vistos[k]) return;
+    P[k] = null;
+    P._nombres[k] = semilla[k][1];
+    P._unidades[k] = semilla[k][3];
+    if (PARAMETROS_OPCIONALES_.indexOf(k) < 0) P._faltan.push(k);
+  });
+  if (P.P_TEA_FIN !== null && P.P_LIMITE_BCP !== null && P.P_TEA_MORA !== null &&
+      Math.max(P.P_TEA_FIN, P.P_TEA_MORA) > P.P_LIMITE_BCP + 1e-12) {
+    P._avisos.push('REVISAR: una tasa supera el límite BCP');
+  }
+  if (P.P_IVA_RECARGO === null) P._avisos.push('IVA del recargo financiero y de la mora: PENDIENTE (se usa la tasa general).');
+  memoria_.parametros = P;
+  return P;
+}
+
+/** Valor obligatorio de la política. Si falta, detiene la operación con un mensaje claro (nunca usa un valor del código). */
+function param_(P, clave) {
+  const v = P[clave];
+  if (v === null || v === undefined || (typeof v === 'number' && isNaN(v))) {
+    throw errorUsuario_('Falta el parámetro «' + (P._nombres[clave] || clave) + '» en «Parámetros de crédito». Complételo (Sistema › Parámetros) y vuelva a intentar.');
+  }
+  return v;
+}
+
+/** Tasa general de IVA en puntos (10). */
+function ivaGeneral_(P) {
+  return Math.round(param_(P, 'P_IVA') * 1000) / 10;
+}
+
+function leerCategorias_(ss, tz) {
+  if (memoria_.categorias) return memoria_.categorias;
+  let filas = [];
+  try { filas = leerTabla_(ss, 'categorias', tz).filas; } catch (e) { filas = []; }
+  const lista = filas.filter(function (c) { return clave_(c.nombre) && esActivo_(c.activo); }).map(function (c) {
+    const entrega = Number(c.entrega) || 0;
+    return {
+      nombre: clave_(c.nombre), limite: Number(c.limite) || 0, entrega: entrega >= 1 ? entrega / 100 : entrega, cuotas: Number(c.cuotas) || 0,
+      frecuencia: String(c.frecuencia || ''),
+      frecuencias: String(c.frecuencia || '').toUpperCase().split(/\s*(?:,|;|\/|\bO\b)\s*/).map(function (s) { return s.trim(); }).filter(String),
+      criterio: c.criterio,
+    };
+  });
+  memoria_.categorias = lista;
+  return lista;
+}
+
+const SIN_CATEGORIA = 'SIN CATEGORÍA';
+
+function categoriaPorNombre_(cats, nombre) {
+  const k = clave_(nombre);
+  if (!k || k === SIN_CATEGORIA) return null;
+  return cats.filter(function (c) { return c.nombre === k; })[0] || null;
+}
+
+function validarCategoria_(ss, tz, nombre) {
+  const k = clave_(nombre);
+  if (!k || k === SIN_CATEGORIA) return '';
+  const c = categoriaPorNombre_(leerCategorias_(ss, tz), k);
+  if (!c) throw errorUsuario_('La categoría «' + nombre + '» no existe en «Categorías de crédito».');
+  return c.nombre;
+}
+
+function normalizarFrecuencia_(f) {
+  const k = clave_(f || 'SEMANAL');
+  if (LISTAS.FRECUENCIAS.indexOf(k) < 0) throw errorUsuario_('Frecuencia de pago no válida: elija SEMANAL, QUINCENAL o MENSUAL.');
+  return k;
+}
+
+/** ¿La frecuencia está permitida por la categoría sin autorización? MENSUAL siempre es excepción. */
+function frecuenciaPermitida_(cat, frecuencia) {
+  if (frecuencia === 'MENSUAL') return false;
+  return !!cat && cat.frecuencias.indexOf(frecuencia) >= 0;
+}
+
+function diasFrecuencia_(P, frecuencia) {
+  return param_(P, frecuencia === 'QUINCENAL' ? 'P_FREC_QUINCENAL' : (frecuencia === 'MENSUAL' ? 'P_FREC_MENSUAL' : 'P_FREC_SEMANAL'));
+}
+
+// ─────────────────────── Redondeos (idénticos al xlsx) ───────────────────────
+
+/** Normaliza a 15 cifras significativas, como Excel, antes de redondear (evita 207.000,00000000003). */
+function excel15_(x) {
+  return Number(Number(x).toPrecision(15));
+}
+
+/** REDONDEAR.MAS / ROUNDUP al múltiplo indicado (↑1.000). */
+function redondearArriba_(x, multiplo) {
+  const m = multiplo || 1;
+  const q = excel15_(x / m);
+  return (q >= 0 ? Math.ceil(q) : -Math.ceil(-q)) * m;
+}
+
+/** REDONDEAR.MENOS / ROUNDDOWN al múltiplo indicado (↓1.000). */
+function redondearAbajo_(x, multiplo) {
+  const m = multiplo || 1;
+  const q = excel15_(x / m);
+  return (q >= 0 ? Math.floor(q) : -Math.floor(-q)) * m;
+}
+
+/** REDONDEAR / ROUND al múltiplo indicado (mitad hacia afuera, como Excel). */
+function redondear_(x, multiplo) {
+  const m = multiplo || 1;
+  const q = excel15_(x / m);
+  return (q >= 0 ? Math.floor(q + 0.5) : -Math.floor(-q + 0.5)) * m;
+}
+
+/** Guaraníes enteros, mitad hacia arriba (comisiones, como la liquidación vigente: Math.round). */
+function gsEnteros_(x) {
+  return Math.round(excel15_(x));
+}
+
+// ─────────────────────── IVA (10%, 5%, exenta; precios con IVA incluido) ───────────────────────
+
+/** Tasa en puntos (10, 5 o 0) desde la columna «Tasa IVA»; vacío → tasa general de la política. Acepta '10%', 0.1, 'Exenta'. */
+function tasaIva_(valor, P) {
+  const s = String(valor === null || valor === undefined ? '' : valor).trim().toLowerCase();
+  if (!s) return P ? ivaGeneral_(P) : 10;
+  if (/^ex/.test(s)) return 0;
+  const n = decimal_(s.replace('%', ''));
+  if (n === 0) return 0;
+  if (n === 5 || n === 0.05) return 5;
+  if (n === 10 || n === 0.1) return 10;
+  throw errorUsuario_('Tasa de IVA no válida («' + valor + '»): use 10, 5 o 0 (exenta).');
+}
+
+/** Texto para la columna «Tasa IVA». */
+function textoTasa_(n) {
+  return String(n === 0 ? 0 : (n === 5 ? 5 : 10));
+}
+
+/** IVA incluido en un importe: REDONDEAR(total × tasa ÷ (1 + tasa); 0) → 10% = ÷ 11, 5% = ÷ 21, exenta = 0. */
+function ivaIncluido_(total, tasa) {
+  if (!tasa) return 0;
+  return redondear_(Number(total) * tasa / (100 + tasa), 1);
+}
+
+/** Desglose fiscal de líneas { total (con IVA), tasa }: gravadas (con IVA), IVA por tasa, exenta y neto. */
+function desgloseIva_(lineas) {
+  const r = { total: 0, gravada10: 0, iva10: 0, gravada5: 0, iva5: 0, exenta: 0 };
+  lineas.forEach(function (l) {
+    const t = Number(l.total) || 0;
+    r.total += t;
+    if (l.tasa === 10) r.gravada10 += t;
+    else if (l.tasa === 5) r.gravada5 += t;
+    else r.exenta += t;
+  });
+  r.iva10 = ivaIncluido_(r.gravada10, 10);
+  r.iva5 = ivaIncluido_(r.gravada5, 5);
+  r.neto = r.total - r.iva10 - r.iva5;
+  return r;
+}
+
+// ─────────────────────── Precios: descuento, margen, mínimos (R0.2, R0.3, R4.7) ───────────────────────
+
+/** Descuento sobre el precio de lista (fracción). Sin lista o precio ≥ lista → 0. */
+function descuentoLinea_(precio, lista) {
+  if (!(lista > 0) || precio >= lista) return 0;
+  return 1 - precio / lista;
+}
+
+/** Margen = (neto − costo) ÷ neto, con neto = total − IVA incluido. Sin costo → null. */
+function margenLinea_(total, tasa, costoTotal, P) {
+  if (!(costoTotal > 0) || !(total > 0)) return null;
+  const neto = total - ivaIncluido_(total, tasa);
+  const costoSinIva = P && P.P_COSTO_CON_IVA === true ? costoTotal / (1 + tasa / 100) : costoTotal;
+  return (neto - costoSinIva) / neto;
+}
+
+/** Precio mínimo con IVA = ↑1.000 [costo ÷ (1 − P_MARGEN_MIN) × (1 + tasa)]. */
+function precioMinimo_(costo, tasa, P) {
+  if (!(costo > 0)) return null;
+  return redondearArriba_(costo / (1 - param_(P, 'P_MARGEN_MIN')) * (1 + tasa / 100), param_(P, 'P_RED_PRECIO'));
+}
+
+/** Precio sugerido = redondeo a 1.000 [costo ÷ (1 − P_MARGEN_OBJ) × (1 + tasa)]. */
+function precioSugerido_(costo, tasa, P) {
+  if (!(costo > 0)) return null;
+  return redondear_(costo / (1 - param_(P, 'P_MARGEN_OBJ')) * (1 + tasa / 100), param_(P, 'P_RED_PRECIO'));
+}
+
+function esEquipamiento_(item, P) {
+  const linea = normalizar_(item.linea || '');
+  if (linea && P && P.P_LINEA_EQUIPO && linea === normalizar_(P.P_LINEA_EQUIPO)) return true;
+  return /^equipo|equipamiento|mobiliario/.test(normalizar_(item.categoria || ''));
+}
+
+/**
+ * Controles de precio de TODA venta (mensajes literales del xlsx).
+ * lineas: [{ nombre, tipo: 'PRODUCTO'|'SERVICIO'|'SISTEMA', precio, lista, total, tasa, costoTotal }].
+ * Devuelve [{ codigo, mensaje, autorizable, linea }]: lo autorizable lo aprueba una administradora con motivo;
+ * lo no autorizable se rechaza siempre. Los mensajes no revelan costos (los ve también una operativa).
+ */
+function controlesPrecios_(lineas, P) {
+  const problemas = [];
+  const vend = param_(P, 'P_DESC_VEND');
+  const max = param_(P, 'P_DESC_MAX');
+  const margenMin = param_(P, 'P_MARGEN_MIN');
+  lineas.forEach(function (l, i) {
+    if (l.tipo === 'SISTEMA') return;
+    const desc = descuentoLinea_(l.precio, l.lista);
+    if (desc > max + 1e-9) {
+      problemas.push({ codigo: 'DESCUENTO FUERA DE POLÍTICA', autorizable: false, linea: i,
+        mensaje: 'DESCUENTO FUERA DE POLÍTICA: «' + l.nombre + '» tiene ' + porcentajeTexto_(desc) + ' (máximo ' + porcentajeTexto_(max) + ').' });
+    } else if (desc > vend + 1e-9) {
+      problemas.push({ codigo: 'DESCUENTO REQUIERE AUTORIZACIÓN', autorizable: true, linea: i,
+        mensaje: 'DESCUENTO REQUIERE AUTORIZACIÓN: «' + l.nombre + '» tiene ' + porcentajeTexto_(desc) + ' (la vendedora puede hasta ' + porcentajeTexto_(vend) + ').' });
+    }
+    if (l.tipo === 'PRODUCTO') {
+      const m = margenLinea_(l.total, l.tasa, l.costoTotal, P);
+      if (m !== null && m < margenMin - 1e-9) {
+        problemas.push({ codigo: 'MARGEN BAJO MÍNIMO', autorizable: true, linea: i, mensaje: 'MARGEN BAJO MÍNIMO: «' + l.nombre + '» (requiere administradora).' });
+      }
+    }
+  });
+  return problemas;
+}
+
+function porcentajeTexto_(fraccion) {
+  return numeroTexto_(Math.round(Number(fraccion) * 1000) / 10) + '%';
+}
+
+// ─────────────────────── Medios de pago ───────────────────────
+
+function normalizarMedioPago_(m) {
+  const k = normalizar_(m);
+  const encontrado = LISTAS.MEDIOS_PAGO.filter(function (x) { return normalizar_(x) === k; })[0];
+  if (!encontrado) throw errorUsuario_('FALTA MEDIO DE PAGO (opciones: ' + LISTAS.MEDIOS_PAGO.join(', ') + ').');
+  return encontrado;
+}
+
+/**
+ * Valida pagos de contado: [{ medio, monto, operacion, recibo }] → normalizados. Exige medio, N° de operación si no es
+ * efectivo y que la suma sea igual al total. Mensajes literales del xlsx.
+ */
+function validarPagos_(pagos, total) {
+  const lista = Array.isArray(pagos) ? pagos : [];
+  if (!lista.length) throw errorUsuario_('FALTA MEDIO DE PAGO');
+  let suma = 0;
+  const salida = lista.map(function (p, i) {
+    if (!p || !String(p.medio || '').trim()) throw errorUsuario_('FALTA MEDIO DE PAGO');
+    const medio = normalizarMedioPago_(p.medio);
+    const monto = requerirEntero_(p.monto, 'Monto del pago ' + (i + 1), 1, LIMITES.PRECIO_UNITARIO * 10);
+    const operacion = texto_(p.operacion, 40);
+    if (medio !== 'EFECTIVO' && !operacion) throw errorUsuario_('FALTA N° DE OPERACIÓN DEL PAGO (' + medio + ').');
+    suma += monto;
+    return { medio: medio, monto: monto, operacion: operacion, recibo: texto_(p.recibo, 30) };
+  });
+  if (suma !== total) {
+    throw errorUsuario_('Los pagos suman Gs. ' + miles_(suma) + ' y el total es Gs. ' + miles_(total) + ': deben coincidir.');
+  }
+  return salida;
+}
+
+// ─────────────────────── Identificación: RUC, CI, celular, correo ───────────────────────
+
+/**
+ * Dígito verificador del RUC (módulo 11 de la SET, base máxima 11): de derecha a izquierda se multiplica por 2, 3, … 11
+ * y se vuelve a 2; resto = suma mod 11; DV = resto > 1 ? 11 − resto : 0. Verificado con 1307114-9 y 4581379-5 (libro vivo).
+ */
+function dvRuc_(base) {
+  const s = String(base).toUpperCase().split('').map(function (ch) { return /\d/.test(ch) ? ch : String(ch.charCodeAt(0)); }).join('');
+  let k = 2;
+  let total = 0;
+  for (let i = s.length - 1; i >= 0; i--) {
+    total += Number(s.charAt(i)) * k;
+    k = k >= 11 ? 2 : k + 1;
+  }
+  const resto = total % 11;
+  return resto > 1 ? 11 - resto : 0;
+}
+
+/**
+ * RUC con formato 1234567-8 (sin puntos). Con «Validar dígito verificador del RUC» = Sí exige el DV correcto.
+ * Devuelve el RUC normalizado ('' si viene vacío). opciones.validarDv: boolean.
+ */
+function validarRuc_(valor, opciones) {
+  const s = texto_(valor, 20).toUpperCase().replace(/\s+/g, '').replace(/\./g, '');
+  if (!s) return '';
+  const m = s.match(/^(\d{3,9})-(\d)$/);
+  if (!m) throw errorUsuario_('El RUC «' + s + '» no es válido. Use el formato 1234567-8 (sin puntos), con el dígito verificador.');
+  const validar = !opciones || opciones.validarDv !== false;
+  if (validar && dvRuc_(m[1]) !== Number(m[2])) {
+    throw errorUsuario_('El dígito verificador del RUC «' + s + '» no coincide (debería ser ' + m[1] + '-' + dvRuc_(m[1]) + '). Revíselo en la constancia de RUC.');
+  }
+  return m[1] + '-' + m[2];
+}
+
+/** RUC del libro (sin lanzar): { ruc, error }. */
+function revisarRuc_(valor, validarDv) {
+  try { return { ruc: validarRuc_(valor, { validarDv: validarDv }), error: '' }; } catch (e) { return { ruc: '', error: e.message }; }
+}
+
+/** Celular paraguayo normalizado a 595 + 9 dígitos (5959XXXXXXXX). Acepta 0981…, 981…, +595 981…. Inválido → ''. */
+function normalizarCelular_(valor) {
+  let d = String(valor === null || valor === undefined ? '' : valor).replace(/\D/g, '');
+  if (!d) return '';
+  if (d.indexOf('00595') === 0) d = d.slice(2);
+  if (d.indexOf('595') === 0) d = d.slice(3);
+  if (d.charAt(0) === '0') d = d.slice(1);
+  return /^9\d{8}$/.test(d) ? '595' + d : '';
+}
+
+/** Compatibilidad con la v2.2 (Whatsapp.gs): mismo criterio. */
+function normalizarWhatsapp_(valor) {
+  return normalizarCelular_(valor);
+}
+
+function normalizarCi_(valor) {
+  const d = String(valor === null || valor === undefined ? '' : valor).replace(/[.\s]/g, '').trim();
+  if (!d) return '';
+  if (!/^\d{3,10}$/.test(d)) throw errorUsuario_('La CI «' + valor + '» no es válida: escriba solo números, sin puntos.');
+  return d;
+}
+
+function correoValido_(valor) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(valor || '').trim());
+}
+
+// ─────────────────────── Unidades de negocio y entidad fiscal (R4.1, R4.2) ───────────────────────
+
+function unidadValida_(u, porDefecto) {
+  const k = normalizar_(u);
+  if (!k) return porDefecto || '';
+  if (k === 'salon') return 'SALÓN';
+  if (k === 'distribuidora') return 'DISTRIBUIDORA';
+  throw errorUsuario_('Unidad de negocio no válida: use DISTRIBUIDORA o SALÓN.');
+}
+
+function modoFacturacion_(ss) {
+  return /^sep/i.test(String(leerConfig_(ss, CFG.FACTURACION) || '')) ? 'SEPARADO' : 'UNIFICADO';
+}
+
+/** Entidad fiscal que emite para una unidad: UNIFICADO → siempre DISTRIBUIDORA; SEPARADO → la de la unidad. */
+function entidadFiscalDe_(ss, tz, unidad) {
+  const modo = modoFacturacion_(ss);
+  const objetivo = modo === 'SEPARADO' ? unidadValida_(unidad, 'DISTRIBUIDORA') : 'DISTRIBUIDORA';
+  let filas = [];
+  try { filas = leerTabla_(ss, 'entidades', tz).filas; } catch (e) { filas = []; }
+  const fila = filas.filter(function (f) { return unidadValida_(f.unidad, '') === objetivo; })[0] || null;
+  const faltan = [];
+  if (!fila) faltan.push('fila de ' + objetivo);
+  else {
+    if (!fila.razonSocial) faltan.push('Razón social');
+    if (!fila.ruc) faltan.push('RUC');
+    if (!fila.timbrado) faltan.push('Timbrado');
+    if (!fila.establecimiento) faltan.push('Establecimiento');
+    if (!fila.punto) faltan.push('Punto de expedición');
+  }
+  return { modo: modo, unidad: objetivo, fila: fila, completa: !faltan.length, faltan: faltan };
+}
+
+// ─────────────────────── Línea / centro de costo propuesta (R4.4) ───────────────────────
+
+/** Propone la línea desde la «Categoría». Lo no mapeable (Blanqueria, CORPORAL, Saldos, Ocasional…) → REVISAR. */
+function lineaPropuesta_(categoria, esServicio) {
+  if (esServicio) return 'SERVICIOS Y CAPACITACIÓN';
+  const c = normalizar_(categoria);
+  if (/^herramienta/.test(c)) return 'HERRAMIENTAS Y ACCESORIOS';
+  if (c === 'capilar') return 'CAPILAR';
+  if (c === 'facial') return 'FACIAL Y ROSTRO';
+  if (/^equipo/.test(c)) return 'EQUIPAMIENTO Y MOBILIARIO';
+  return 'REVISAR';
+}
+
+// ─────────────────────── Correo saliente (respeta cuota y modo prueba) ───────────────────────
+
+function correosAdministradoras_() {
+  return CONFIG.ADMINS_FIJOS.slice();
+}
+
+/**
+ * Envía un correo con MailApp. En modo prueba no envía (lo anota). Si la cuota diaria no alcanza, no envía y lo informa.
+ * o: { to, subject, body, htmlBody, attachments }. Devuelve { ok, simulado, motivo }.
+ */
+function enviarCorreo_(o) {
+  const destinatarios = String(o.to || '').split(',').map(function (s) { return s.trim(); }).filter(String);
+  if (!destinatarios.length) return { ok: false, motivo: 'sin destinatario' };
+  if (MODO_PRUEBA_) {
+    MODO_PRUEBA_.correos.push({ to: destinatarios.join(','), subject: o.subject });
+    return { ok: true, simulado: true };
+  }
+  let cuota = 0;
+  try { cuota = MailApp.getRemainingDailyQuota(); } catch (e) { cuota = 0; }
+  if (cuota < destinatarios.length) {
+    console.warn('Cuota de MailApp insuficiente (' + cuota + '): no se envió «' + o.subject + '».');
+    return { ok: false, motivo: 'cuota de correo agotada por hoy (' + cuota + ')' };
+  }
+  MailApp.sendEmail(Object.assign({ name: 'Distribuidora MB' }, o, { to: destinatarios.join(',') }));
+  return { ok: true };
+}
+
+// ─────────────────────── Carpeta del sistema en Drive (R6.1 paso 3) ───────────────────────
+
+/** Carpeta «Distribuidora MB» de la cuenta propietaria (por ID guardado; si falta y crear = true, la crea en Mi unidad). */
+function carpetaSistema_(crear) {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('MB_ID_CARPETA');
+  if (id) {
+    try {
+      const c = DriveApp.getFolderById(id);
+      if (!c.isTrashed()) return c;
+    } catch (e) { /* se busca o se crea */ }
+  }
+  const raiz = DriveApp.getRootFolder();
+  const it = raiz.getFoldersByName(CONFIG.CARPETA_SISTEMA);
+  let carpeta = it.hasNext() ? it.next() : null;
+  if (!carpeta) {
+    if (!crear) return null;
+    carpeta = raiz.createFolder(CONFIG.CARPETA_SISTEMA);
+  }
+  props.setProperty('MB_ID_CARPETA', carpeta.getId());
+  return carpeta;
+}
+
+/** Subcarpeta (Respaldos, Proveedores, Importaciones, Comprobantes, Exportaciones). */
+function subcarpeta_(nombre, crear) {
+  const base = carpetaSistema_(crear !== false);
+  if (!base) return null;
+  const it = base.getFoldersByName(nombre);
+  if (it.hasNext()) return it.next();
+  return crear === false ? null : base.createFolder(nombre);
+}
+
+/** Guarda un archivo generado por el sistema en su subcarpeta. Devuelve { id, url, nombre }. */
+function guardarArchivoSistema_(blob, nombreSubcarpeta, nombre) {
+  if (MODO_PRUEBA_) {
+    MODO_PRUEBA_.archivos.push({ carpeta: nombreSubcarpeta, nombre: nombre });
+    return { id: 'prueba', url: '', nombre: nombre };
+  }
+  const carpeta = subcarpeta_(nombreSubcarpeta, true);
+  const archivo = carpeta.createFile(blob.setName(nombre));
+  return { id: archivo.getId(), url: archivo.getUrl(), nombre: nombre };
+}
+
+// ─────────────────────── Respaldos (antes de toda migración y diario) ───────────────────────
+
+/** Copia completa del libro en «Distribuidora MB/Respaldos» (las copias no heredan el compartido). */
+function respaldoAhora_(ss, tz, etiqueta) {
+  SpreadsheetApp.flush();
+  const carpeta = subcarpeta_('Respaldos', true);
+  const nombre = 'Respaldo MB ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HHmm') + (etiqueta ? ' (' + etiqueta + ')' : '');
+  const copia = DriveApp.getFileById(ss.getId()).makeCopy(nombre, carpeta);
+  const info = { nombre: nombre, id: copia.getId(), fecha: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm') };
+  PropertiesService.getScriptProperties().setProperty('MB_ULTIMO_RESPALDO', JSON.stringify(info));
+  return { nombre: nombre, id: copia.getId(), carpeta: carpeta.getName(), borrados: limpiarRespaldos_(carpeta) };
+}
+
+let RESPALDO_EJECUCION_ = null;
+
+/** Respaldo «antes de …» una sola vez por ejecución (lo usan los paquetes y las migraciones). */
+function respaldoUnaVez_(ss, tz, motivo) {
+  if (MODO_PRUEBA_) return { nombre: '(prueba: sin respaldo)', id: '' };
+  if (!RESPALDO_EJECUCION_) RESPALDO_EJECUCION_ = respaldoAhora_(ss, tz, 'antes de ' + motivo);
+  return RESPALDO_EJECUCION_;
+}
+
+/** Envía a la papelera los respaldos DIARIOS con más de 14 días. Los respaldos «(antes de …)» se conservan. */
+function limpiarRespaldos_(carpeta) {
+  const limite = Date.now() - CONFIG.RETENCION_RESPALDOS_DIAS * 86400000;
+  let n = 0;
+  const it = carpeta.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const nombre = f.getName();
+    if (nombre.indexOf('Respaldo MB ') !== 0 || /\(antes de/i.test(nombre)) continue;
+    if (f.getDateCreated().getTime() < limite) { f.setTrashed(true); n++; }
+  }
+  return n;
+}
+
+// ─────────────────────── Compartir sin invitación (servicio avanzado de Drive v3) ───────────────────────
+
+/**
+ * Comparte un archivo o carpeta con EDICIÓN sin enviar correo de invitación.
+ * Drive API v3: Permissions.create(recurso, fileId, { sendNotificationEmail: false }) — el servicio avanzado «Drive»
+ * debe estar activado (appsscript.json). DriveApp.addEditor no se usa porque puede notificar.
+ * Devuelve 'OK' | 'YA TENÍA' | 'ERROR: …'.
+ */
+function compartirSinAviso_(idArchivo, correo, rol) {
+  if (MODO_PRUEBA_) { MODO_PRUEBA_.compartidos.push({ id: idArchivo, correo: correo }); return 'OK'; }
+  if (typeof Drive === 'undefined' || !Drive.Permissions) {
+    return 'ERROR: el servicio avanzado «Drive» no está activado (Editor › Servicios › Drive API v3).';
+  }
+  const actuales = permisosDe_(idArchivo);
+  if (actuales.error) return 'ERROR: ' + actuales.error;
+  const ya = actuales.lista.filter(function (p) { return p.correo === correo; })[0];
+  if (ya && (ya.rol === 'writer' || ya.rol === 'owner' || ya.rol === 'organizer' || ya.rol === 'fileOrganizer')) return 'YA TENÍA';
+  try {
+    Drive.Permissions.create({ type: 'user', role: rol || 'writer', emailAddress: correo }, idArchivo, { sendNotificationEmail: false });
+    return 'OK';
+  } catch (e) {
+    return 'ERROR: ' + (e && e.message ? e.message : e);
+  }
+}
+
+/** Permisos reales de un archivo (relectura para verificar). { lista: [{ correo, rol }], error }. */
+function permisosDe_(idArchivo) {
+  if (MODO_PRUEBA_) return { lista: MODO_PRUEBA_.compartidos.filter(function (c) { return c.id === idArchivo; }).map(function (c) { return { correo: c.correo, rol: 'writer' }; }), error: '' };
+  try {
+    const r = Drive.Permissions.list(idArchivo, { fields: 'permissions(emailAddress,role,type)' });
+    const lista = (r && r.permissions ? r.permissions : []).filter(function (p) { return p.type === 'user'; }).map(function (p) {
+      return { correo: String(p.emailAddress || '').toLowerCase(), rol: p.role };
+    });
+    return { lista: lista, error: '' };
+  } catch (e) {
+    return { lista: [], error: String(e && e.message ? e.message : e) };
+  }
+}
+
+// ─────────────────────── Credenciales (PropertiesService; nunca en el código ni en la hoja) ───────────────────────
+
+function leerCredencial_(clave) {
+  return PropertiesService.getScriptProperties().getProperty(clave) || '';
+}
+
+function enmascarar_(valor, secreto) {
+  const s = String(valor || '');
+  if (!s) return '';
+  if (!secreto) return s;
+  return s.length <= 6 ? '••••' : '••••••' + s.slice(-4);
+}

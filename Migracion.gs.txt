@@ -1,0 +1,589 @@
+/**
+ * =====================================================================
+ *  DISTRIBUIDORA MB · Migración de datos antiguos (v2.3 · Fase 2 · R0.8)
+ * =====================================================================
+ *  migrarDatosAntiguos(): ordena lo ya cargado y la cartera manuscrita sin re-tipear.
+ *   a) «Saldos iniciales»: copia fiel de SALDOS_INICIALES!A4:K24 y del cuadro «Saldos a investigar» (M4:Q9).
+ *   b) 20 créditos HISTÓRICO (Código legado 9001–9020, nunca V-xxxxx), plan A CONFIRMAR, saldo = saldo a migrar y
+ *      un PLAN SUGERIDO según la categoría (cuando exista) que nunca se aplica solo.
+ *   c) Ventas a crédito ya cargadas («Pendiente», sin crédito: V-00003 y V-00005) → VIGENTE PREVIO, plan A CONFIRMAR.
+ *      Lo que sus notas mencionan (entregas, saldos) NO se registra: va a «Cobros a confirmar» y a «Alertas».
+ *   d) 41 clientas (C001…C041) → «Peluquerías» con el siguiente C-xxxx libre, su Código legado y los alias de OBS,
+ *      buscando antes coincidencias por nombre y contacto para NO duplicar. Categoría vacía = SIN CATEGORÍA.
+ *   e) Los ejemplos del xlsx (C999, ítems EJ-, ventas 1001 y 1002, filas «EJEMPLO») nunca se cargan; ignorarEjemplos().
+ *   f) Informe de conciliación: HISTÓRICO 17.000.500 · dudosas 7.434.000 · a investigar 1.610.000 (no suman).
+ *      El «17.480.500» del TABLERO incluye 480.000 del crédito EJEMPLO 1001 (C999): no se migra ni se «corrige».
+ *  Idempotente (busca por código legado / N° de venta / clave), con respaldo previo del libro, vista previa (dry-run)
+ *  y confirmación en la app (Sistema › Migración). Reversible: el respaldo previo queda en «Distribuidora MB/Respaldos»
+ *  y cada fila migrada lleva «Migración v2.3» en «Registrado por / Actualizado por» y su código legado.
+ *  Las fases siguientes suman sus pasos (R1.5 clientas de servicios, R4.9 tickets retroactivos) con
+ *  migrarClientasServicios_ y migrarTicketsRetroactivos_ si están instaladas.
+ * =====================================================================
+ */
+
+// ── Copia literal del xlsx «MB_Control_Ventas_Creditos_Cobranzas» (generada por tools/datos_xlsx.py; no editar a mano) ──
+/** SALDOS INICIALES — cartera leída de las hojas manuscritas (corte 25/09/2026) */
+const XLSX_SALDOS_TITULO_ = "SALDOS INICIALES — cartera leída de las hojas manuscritas (corte 25/09/2026)";
+/** CLIENTES!A:B y T (OBS): [Cod clienta, Nombre, OBS]. C999 (EJEMPLO) excluida. */
+const XLSX_CLIENTAS_ = [
+  ["C001", "Sonia del Pilar", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C002", "Beatriz Godoy", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C003", "Karina Sosa", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C004", "Lorena Romero", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C005", "Soledad Maldonado", "También anotada como 'Sole Maldonado'. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C006", "Cecilia Centurión", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C007", "Cinthia Peralta", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C008", "María Lucila", "¿Es la 'María Lu Villalba' de la hoja del 13/07? Confirmar. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C009", "Luz Britez", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C010", "Magdalena Espinosa", "También anotada como 'Espinoza' y 'Madalena'. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C011", "María Chávez", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C012", "Soledad del Valle", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C013", "Romina Castro", "También anotada como 'Romi Castro'. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C014", "Rocío Ozuna", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C015", "Liz Zarza", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C016", "Erika Segovia", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C017", "Jaqueline Riveros", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C018", "Laura Rojas", "Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C019", "Lolet", "Nombre incompleto en la hoja. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C020", "Brisa Giovanna", "En la hoja del 25/09 figura agrupada con Jessica Ramírez. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C021", "Jessica Ramírez", "En la hoja del 25/09 figura agrupada con Brisa Giovanna. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C022", "Leticia Galeano", "Saldo de 90.000 en la hoja del 04/08 que luego desaparece: investigar. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C023", "Laura Maldonado", "Saldo de 710.000 en la hoja del 04/08 que luego desaparece: investigar. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C024", "Liz Cardozo", "Saldo de 245.000 en la hoja del 04/08 que luego desaparece: investigar. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C025", "Verónica Gonzales", "También anotada como 'Vero Areguá'. Canceló en setiembre. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C026", "Erika Oviedo", "Canceló en setiembre. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C027", "Nancy Giménez", "Canceló en setiembre. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C028", "Celina Ullon", "Canceló en setiembre. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C029", "Lilian Ibarrola", "Canceló en setiembre. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C030", "Claudelina Valenzuela", "Canceló en agosto. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C031", "Dalma Celeste", "Canceló en agosto. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C032", "Gilda Ayala", "Canceló en agosto. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C033", "Tamara Bogado", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C034", "Yohana Díaz", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C035", "Yohana Benítez", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C036", "Mirian Armoa", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C037", "Naida Godoy", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C038", "Andrea Vera", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C039", "Flor Conde", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C040", "Giovana Franco", "Canceló en julio. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+  ["C041", "Anita", "Canceló en julio. Nombre incompleto. Cargada desde las hojas manuscritas (jul–set 2026): completar CI, RUC, WhatsApp y categoría."],
+];
+/** SALDOS_INICIALES!A5:K24: [N° venta (migración), Cod clienta, Clienta, Fecha de corte, Saldo según hoja, Lectura, Detalle, Estado, Obs.]. */
+const XLSX_SALDOS_ = [
+  [9001, "C001", "Sonia del Pilar", "2026-09-25", 1662000, "DUDOSA", "25/09: venta 1.662.000 sin saldo anotado; el 11/09 figuraba con saldo 1.662.000 y sin pagos.", "A CONFIRMAR", ""],
+  [9002, "C002", "Beatriz Godoy", "2026-09-25", 293000, "LEGIBLE", "25/09: venta 1.543.000; saldo 293.000.", "A CONFIRMAR", ""],
+  [9003, "C003", "Karina Sosa", "2026-09-25", 2800000, "LEGIBLE", "25/09: venta 3.800.000; saldo 2.800.000.", "A CONFIRMAR", ""],
+  [9004, "C004", "Lorena Romero", "2026-09-25", 245000, "LEGIBLE", "25/09: venta 245.000; saldo 245.000, sin pagos anotados desde el 13/07.", "A CONFIRMAR", ""],
+  [9005, "C005", "Soledad Maldonado", "2026-09-25", 392000, "LEGIBLE", "25/09: saldo 592.000 menos pago de 200.000 el 19/09.", "A CONFIRMAR", ""],
+  [9006, "C006", "Cecilia Centurión", "2026-09-25", 1357000, "DUDOSA", "Saldo mayor que la venta (1.235.000). El 11/09 pasó de 1.131.000 a 1.357.200 (+20%), posible recargo. Obs.: 2 meses y 17 días.", "A CONFIRMAR", ""],
+  [9007, "C007", "Cinthia Peralta", "2026-09-25", 380000, "LEGIBLE", "25/09: venta 780.000; saldo 380.000.", "A CONFIRMAR", ""],
+  [9008, "C008", "María Lucila", "2026-09-25", 1407000, "LEGIBLE", "25/09: venta 1.607.000; saldo 1.407.000.", "A CONFIRMAR", ""],
+  [9009, "C009", "Luz Britez", "2026-09-25", 290000, "LEGIBLE", "25/09: venta 390.000; saldo 290.000. Obs.: 40 días.", "A CONFIRMAR", ""],
+  [9010, "C010", "Magdalena Espinosa", "2026-09-25", 2250000, "DUDOSA", "Marcada con \"?\" en las hojas. 25/09: venta 2.350.000; saldo 2.250.000.", "A CONFIRMAR", ""],
+  [9011, "C011", "María Chávez", "2026-09-25", 249500, "LEGIBLE", "25/09: venta 299.500; saldo 249.500.", "A CONFIRMAR", ""],
+  [9012, "C012", "Soledad del Valle", "2026-09-25", 110000, "LEGIBLE", "25/09: venta 500.000; saldo 110.000.", "A CONFIRMAR", ""],
+  [9013, "C013", "Romina Castro", "2026-09-25", 300000, "LEGIBLE", "25/09: venta 1.095.000; saldo 300.000, el mismo desde julio.", "A CONFIRMAR", ""],
+  [9014, "C014", "Rocío Ozuna", "2026-09-25", 200000, "LEGIBLE", "25/09: venta 490.000; saldo 200.000.", "A CONFIRMAR", ""],
+  [9015, "C015", "Liz Zarza", "2026-09-25", 850000, "LEGIBLE", "25/09: saldo 950.000 menos pago de 100.000.", "A CONFIRMAR", ""],
+  [9016, "C016", "Erika Segovia", "2026-09-25", 950000, "LEGIBLE", "25/09: saldo 1.100.000 menos pago de 150.000.", "A CONFIRMAR", ""],
+  [9017, "C017", "Jaqueline Riveros", "2026-09-25", 1100000, "LEGIBLE", "25/09: saldo 1.306.000 menos pago de 206.000 el 20/09.", "A CONFIRMAR", ""],
+  [9018, "C018", "Laura Rojas", "2026-09-25", 750000, "DUDOSA", "Marcada con \"?\" en la hoja. Saldo 950.000 menos pago de 200.000 el 24/09.", "A CONFIRMAR", ""],
+  [9019, "C019", "Lolet", "2026-09-25", 865000, "DUDOSA", "Venta 990.000; saldo 865.000 con cifra sobrescrita; nombre incompleto.", "A CONFIRMAR", ""],
+  [9020, "C020", "Brisa Giovanna", "2026-09-25", 550000, "DUDOSA", "Anotada junto a Jessica Ramírez (C021): venta 1.300.000, saldo 650.000 menos pago de 100.000 el 18/09. Confirmar a quién corresponde.", "A CONFIRMAR", ""],
+];
+/** SALDOS_INICIALES!M5:Q8 «Saldos a investigar» (no suman): [Clienta, Cod, Último saldo visto, Hoja, Observación]. */
+const XLSX_A_INVESTIGAR_ = [
+  ["Leticia Galeano", "C022", 90000, "04/08/2026", "No aparece en setiembre ni figura \"canceló\"."],
+  ["Laura Maldonado", "C023", 710000, "04/08/2026", "No aparece en setiembre. En la hoja del 24–31/07 la resta da 910.000 y se anotó 710.000."],
+  ["Liz Cardozo", "C024", 245000, "04/08/2026", "No aparece en setiembre ni figura \"canceló\"."],
+  ["María Lu Villalba", "—", 565000, "13/07/2026", "No aparece en hojas posteriores; podría ser María Lucila (C008)."],
+];
+
+const MIGRACION_ = Object.freeze({
+  USUARIO: 'Migración v2.3 (xlsx, corte 25/09/2026)',
+  FUENTE: 'MB_Control_Ventas_Creditos_Cobranzas.xlsx',
+  FALTANTES: 'CI o RUC, WhatsApp (celular), Categoría de crédito, Tipo de cliente',
+});
+/** Identificadores de los EJEMPLOS del xlsx (nunca se cargan). */
+const EJEMPLOS_XLSX_ = Object.freeze({ CLIENTA: 'C999', PREFIJO_ITEM: 'EJ-', VENTAS: Object.freeze(['1001', '1002']) });
+
+// ─────────────────────── Entradas: editor y app ───────────────────────
+
+/** EDITOR (cuenta propietaria): migra con respaldo previo y deja el informe en «Estado de instalación». Re-ejecutable. */
+function migrarDatosAntiguos() {
+  exigirEditorOTrigger_(null);
+  reiniciarMemoriaEjecucion_();
+  return conBloqueo_(function () {
+    const ss = abrirHoja_();
+    const tz = zonaHoraria_(ss);
+    const email = correoPropietario_() || CONFIG.CORREO_ADMIN;
+    asegurarEstructura_(ss);
+    sembrarParametros_(ss, tz, email);
+    iniciarAuditoria_({ email: email, rol: ROLES.ADMIN, metodo: 'EDITOR' }, 'migrarDatosAntiguos', '', 'DISTRIBUIDORA');
+    let r;
+    try {
+      r = migrarDatosAntiguos_(ss, tz, email, { simular: false });
+    } catch (e) {
+      volcarAuditoria_(ss, tz, 'Migración incompleta: ' + (e && e.message ? e.message : e));
+      throw e;
+    }
+    volcarAuditoria_(ss, tz, '');
+    registrarInformeMigracion_(ss, tz, r, email);
+    SpreadsheetApp.flush();
+    console.log(textoInformeMigracion_(r));
+    return r;
+  });
+}
+
+/** EDITOR: revisa el sistema y deja inactivo / anulado cualquier dato de EJEMPLO del xlsx (nunca borra). Idempotente. */
+function ignorarEjemplos() {
+  exigirEditorOTrigger_(null);
+  reiniciarMemoriaEjecucion_();
+  return conBloqueo_(function () {
+    const ss = abrirHoja_();
+    const tz = zonaHoraria_(ss);
+    const email = correoPropietario_() || CONFIG.CORREO_ADMIN;
+    iniciarAuditoria_({ email: email, rol: ROLES.ADMIN, metodo: 'EDITOR' }, 'ignorarEjemplos', '', 'DISTRIBUIDORA');
+    const r = ignorarEjemplos_(ss, tz, email, false);
+    volcarAuditoria_(ss, tz, '');
+    console.log(r.resumen);
+    return r;
+  });
+}
+
+/** App › Sistema › Migración: vista previa (dry-run, no escribe nada). */
+function vistaPreviaMigracion(req) {
+  return ejecutar_('vistaPreviaMigracion', req, 'lectura', function (ctx) {
+    return { ok: true, vista: migrarDatosAntiguos_(ctx.ss, ctx.tz, ctx.email, { simular: true }) };
+  });
+}
+
+/** App › Sistema › Migración: ejecuta lo que mostró la vista previa (huella igual) o ignora los ejemplos. */
+function ejecutarMigracion(req) { return ejecutar_('ejecutarMigracion', req, 'escritura', ejecutarMigracion_); }
+
+function ejecutarMigracion_(ctx) {
+  const d = ctx.datos;
+  if (d.accion === 'ignorarEjemplos') {
+    const e = ignorarEjemplos_(ctx.ss, ctx.tz, ctx.email, false);
+    return { mensaje: e.resumen, ejemplos: e };
+  }
+  if (d.confirmado !== true) throw errorUsuario_('Revise la vista previa y confirme la migración.');
+  const previa = migrarDatosAntiguos_(ctx.ss, ctx.tz, ctx.email, { simular: true });
+  if (String(d.huella || '') !== previa.huella) throw errorUsuario_('Los datos cambiaron desde la vista previa. Vuelva a generarla, revísela y confirme.');
+  const r = migrarDatosAntiguos_(ctx.ss, ctx.tz, ctx.email, { simular: false });
+  registrarInformeMigracion_(ctx.ss, ctx.tz, r, ctx.email);
+  return { mensaje: r.resumen, informe: r };
+}
+
+/** ¿Ya se migró la cartera histórica? (hay créditos HISTÓRICO o filas en «Saldos iniciales») */
+function migracionAplicada_(ss, tz) {
+  try {
+    if (leerTabla_(ss, 'saldos', tz).filas.length) return true;
+    return leerTabla_(ss, 'creditos', tz).filas.some(function (c) { return clave_(c.origen) === ORIGEN_CREDITO_.HISTORICO; });
+  } catch (e) {
+    return false;
+  }
+}
+
+// ─────────────────────── Ayudantes ───────────────────────
+
+/** Alias escritos en la OBS del xlsx: «También anotada como 'X' y 'Y'.» → ['X', 'Y'] (las dudas «¿Es la …?» no son alias). */
+function aliasDeObs_(obs) {
+  const m = String(obs || '').match(/También anotada como (.+?)\.(?:\s|$)/);
+  if (!m) return [];
+  const salida = [];
+  const re = /'([^']+)'/g;
+  let x;
+  while ((x = re.exec(m[1])) !== null) salida.push(x[1].trim());
+  return salida;
+}
+
+function unirAlias_(actual, nuevos) {
+  const lista = String(actual || '').split(/\s*;\s*/).filter(String);
+  (nuevos || []).forEach(function (a) { if (lista.map(normalizar_).indexOf(normalizar_(a)) < 0) lista.push(a); });
+  return lista.join('; ');
+}
+
+/** Nombres conocidos de una fila de clientes: nombre, contacto y alias (normalizados). */
+function nombresDe_(p) {
+  return [p.nombre, p.contacto].concat(String(p.alias || '').split(/\s*;\s*/)).map(normalizar_).filter(function (s) { return s.length >= 3; });
+}
+
+/** ¿Una fila existente se parece a la clienta del xlsx (alias igual o un nombre contenido en el otro)? Solo avisa, nunca fusiona. */
+function clientaParecida_(p, nombre, alias) {
+  const propios = nombresDe_(p);
+  const candidatos = [nombre].concat(alias || []).map(normalizar_).filter(function (s) { return s.length >= 3; });
+  return candidatos.some(function (a) {
+    return propios.some(function (b) { return a === b || (a.length >= 6 && b.length >= 6 && (a.indexOf(b) >= 0 || b.indexOf(a) >= 0)); });
+  });
+}
+
+function huellaTexto_(texto) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, String(texto));
+  let h = '';
+  for (let i = 0; i < bytes.length; i++) h += ('0' + (bytes[i] & 0xff).toString(16)).slice(-2);
+  return h;
+}
+
+/** Montos con separador de miles paraguayo dentro de un texto («Gs. 390.000» → 390000). */
+function montoDeTexto_(s) {
+  const d = String(s || '').replace(/[^0-9]/g, '');
+  return d ? parseInt(d, 10) : NaN;
+}
+
+/**
+ * Lee lo que la nota de una venta a crédito cargada antes de la v2.3 dice (sin corregir nada):
+ *  - «entregó Gs. X» → cobro a confirmar + alerta si la entrega queda bajo el mínimo de la política;
+ *  - «saldo al D/M/AAAA Gs. Y» → alerta si no coincide con total − entrega mencionada;
+ *  - «Sin respaldo» → alerta para confirmar las condiciones.
+ * Devuelve { alertas: [texto], entregas: [{ monto }] }.
+ */
+function analizarNotaCredito_(nota, total, subtotal, cat, cats, equipamiento, P) {
+  const r = { alertas: [], entregas: [] };
+  const s = String(nota || '');
+  const me = s.match(/entreg[a-záéíóúñ]*\s+(?:de\s+)?Gs\.?\s*([\d.]+)/i);
+  let entrega = null;
+  if (me) {
+    entrega = montoDeTexto_(me[1]);
+    if (entrega > 0) {
+      r.entregas.push({ monto: entrega });
+      const min = entregaMinimaCredito_(subtotal, cat, cats, equipamiento, P);
+      if (entrega < min.monto) {
+        r.alertas.push('ENTREGA MENOR AL MÍNIMO: la nota menciona una entrega de Gs. ' + miles_(entrega) + ' (' + porcentajeTexto_(total ? entrega / total : 0) + ' de Gs. ' +
+          miles_(total) + '); la mínima según la política sería Gs. ' + miles_(min.monto) + ' (' + porcentajeTexto_(min.pct) + (cat ? ', categoría ' + cat.nombre : ', sin categoría = NUEVA') +
+          (min.equipamiento ? '; incluye equipamiento' : '') + '). No se corrigió nada.');
+      }
+    }
+  }
+  const ms = s.match(/saldo\s+al\s+(\d{1,2})\/(\d{1,2})\/(\d{4})\s*(?:de\s*)?Gs\.?\s*([\d.]+)/i);
+  if (ms) {
+    const anotado = montoDeTexto_(ms[4]);
+    const fecha = ('0' + ms[1]).slice(-2) + '/' + ('0' + ms[2]).slice(-2) + '/' + ms[3];
+    if (entrega !== null && anotado !== total - entrega) {
+      r.alertas.push('DIFERENCIA EN LA NOTA: saldo anotado al ' + fecha + ' Gs. ' + miles_(anotado) + '; total − entrega = Gs. ' + miles_(total - entrega) +
+        ' (diferencia Gs. ' + miles_(Math.abs(total - entrega - anotado)) + '). REVISAR: no se registró ningún pago por esa diferencia.');
+    }
+  }
+  if (/sin\s+respaldo/i.test(s)) r.alertas.push('SIN RESPALDO: la nota de la venta dice «Sin respaldo»; confirmar las condiciones del crédito (entrega, cuotas y frecuencia).');
+  return r;
+}
+
+// ─────────────────────── Migración (R0.8 a–f) ───────────────────────
+
+/**
+ * Calcula (op.simular = true) o aplica (op.simular = false) la migración. Devuelve el informe:
+ * { simular, respaldo, acciones: [{ paso, tipo, ref, detalle }], controles: [{ nombre, ok, detalle }], totales, huella, resumen }.
+ * La huella resume las acciones pendientes: la app solo ejecuta si coincide con la de la vista previa confirmada.
+ */
+function migrarDatosAntiguos_(ss, tz, email, op) {
+  const simular = !op || op.simular !== false;
+  const r = { simular: simular, respaldo: '', acciones: [], controles: [], totales: {}, huella: '', resumen: '', extras: [] };
+  const P = leerParametros_(ss, tz);
+  const cats = leerCategorias_(ss, tz);
+  const ahora = new Date();
+  const hoy = hoy_(tz);
+  const usuario = MIGRACION_.USUARIO;
+  function accion(paso, tipo, ref, detalle) { r.acciones.push({ paso: paso, tipo: tipo, ref: String(ref), detalle: detalle || '' }); }
+  if (!simular) r.respaldo = respaldoUnaVez_(ss, tz, 'migrar datos antiguos').nombre;
+
+  // d) Clientas → «Peluquerías» (o vínculo con la existente)
+  const tablas = tablasClientes_(ss, tz);
+  const pelu = tablas[0].tabla;
+  const existentes = [];
+  tablas.forEach(function (tc) { tc.tabla.filas.forEach(function (p) { existentes.push({ p: p, tabla: tc.tabla }); }); });
+  const porLegado = {};
+  existentes.forEach(function (x) { if (clave_(x.p.legado)) porLegado[clave_(x.p.legado)] = x; });
+  let siguiente = siguienteNumero_(pelu.filas.map(function (p) { return p.codigo; }), 'C-');
+  const codigoSistema = {};
+  const catDeLegado = {};
+  const nuevas = [];
+  const vinculos = [];
+  XLSX_CLIENTAS_.forEach(function (c) {
+    const legado = c[0];
+    const nombre = c[1];
+    const obs = c[2];
+    const alias = aliasDeObs_(obs);
+    const ya = porLegado[legado];
+    if (ya) {
+      codigoSistema[legado] = ya.p.codigo;
+      catDeLegado[legado] = categoriaPorNombre_(cats, ya.p.categoria);
+      accion('Clientas', 'YA MIGRADA', legado, ya.p.codigo + ' ' + ya.p.nombre);
+      return;
+    }
+    const n = normalizar_(nombre);
+    const igual = existentes.filter(function (x) { return !clave_(x.p.legado) && (normalizar_(x.p.nombre) === n || normalizar_(x.p.contacto) === n); })[0];
+    if (igual) {
+      vinculos.push({ tabla: igual.tabla, fila: igual.p._fila, valores: {
+        legado: legado, alias: unirAlias_(igual.p.alias, alias), observacion: [igual.p.observacion, 'Hojas manuscritas (' + legado + '): ' + obs].filter(String).join(' · '),
+        actualizado: ahora, usuario: usuario } });
+      codigoSistema[legado] = igual.p.codigo;
+      catDeLegado[legado] = categoriaPorNombre_(cats, igual.p.categoria);
+      accion('Clientas', 'VINCULAR', legado, nombre + ' = ' + igual.p.codigo + ' «' + igual.p.nombre + '» (mismo nombre o contacto)');
+      return;
+    }
+    const parecida = existentes.filter(function (x) { return clientaParecida_(x.p, nombre, alias); })[0];
+    const codigo = formatoCodigo_('C-', siguiente++, 4);
+    nuevas.push({
+      codigo: codigo, nombre: nombre, contacto: nombre, telefono: '', ciudad: '', direccion: '', ruc: '', activo: 'Sí', actualizado: ahora, usuario: usuario,
+      legado: legado, alias: alias.join('; '), categoria: '', completitud: 'INCOMPLETA', faltantes: MIGRACION_.FALTANTES, alta: hoy,
+      observacion: obs + (parecida ? ' · POSIBLE DUPLICADO de ' + parecida.p.codigo + ' «' + parecida.p.nombre + '»: verificar (no se fusionó).' : ''),
+    });
+    codigoSistema[legado] = codigo;
+    catDeLegado[legado] = null;
+    accion('Clientas', parecida ? 'CREAR · REVISAR' : 'CREAR', legado, codigo + ' ' + nombre + (alias.length ? ' (alias: ' + alias.join(', ') + ')' : '') +
+      (parecida ? ' · posible duplicado de ' + parecida.p.codigo + ' «' + parecida.p.nombre + '»' : ''));
+  });
+
+  // b) Créditos HISTÓRICO (9001–9020), plan A CONFIRMAR
+  const tCred = leerTabla_(ss, 'creditos', tz);
+  const histPorLegado = {};
+  tCred.filas.forEach(function (c) { if (clave_(c.origen) === ORIGEN_CREDITO_.HISTORICO && clave_(c.legado)) histPorLegado[clave_(c.legado)] = c; });
+  let sigCred = siguienteNumero_(tCred.filas.map(function (c) { return c.id; }), 'CR-');
+  const nuevosCred = [];
+  const creditoDeNumero = {};
+  XLSX_SALDOS_.forEach(function (s) {
+    const num = String(s[0]);
+    if (histPorLegado[num]) {
+      creditoDeNumero[num] = histPorLegado[num].id;
+      accion('Créditos HISTÓRICO', 'YA MIGRADO', num, histPorLegado[num].id + ' ' + histPorLegado[num].cliente);
+      return;
+    }
+    const id = formatoCodigo_('CR-', sigCred++, 5);
+    creditoDeNumero[num] = id;
+    nuevosCred.push({
+      id: id, venta: '', ticket: '', codigoCliente: codigoSistema[s[1]] || '', cliente: s[2], fecha: s[3], subtotal: s[4], recargo: 0, total: s[4],
+      entrega: '', cuotas: '', frecuencia: '', primerVto: '', montoCuota: '', ultimaCuota: '', saldo: s[4], estadoPlan: PLAN_.A_CONFIRMAR, estadoCredito: PLAN_.A_CONFIRMAR,
+      categoria: '', origen: ORIGEN_CREDITO_.HISTORICO, legado: num, autorizadoPor: '', motivoAutorizacion: '',
+      observacion: 'Saldo migrado de las hojas manuscritas (corte ' + formatoFecha_(s[3]) + ', clienta ' + s[1] + '): ' + s[6],
+      unidad: 'DISTRIBUIDORA', usuario: usuario, registrado: ahora, cobrado: 0, vencido: 0, atraso: 0, proximoVto: '', moraPactada: 'No',
+      planSugerido: planSugerido_(s[4], catDeLegado[s[1]] || null, P, hoy).texto, lectura: s[5],
+      alertas: s[5] === 'DUDOSA' ? 'LECTURA DUDOSA: confirmar el saldo con la clienta antes de acordar el plan.' : '',
+    });
+    accion('Créditos HISTÓRICO', 'CREAR', num, id + ' ' + s[2] + ' Gs. ' + miles_(s[4]) + ' (' + s[5] + ')');
+  });
+
+  // c) Ventas a crédito ya cargadas → VIGENTE PREVIO, plan A CONFIRMAR (sin registrar lo que la nota menciona)
+  const tVen = leerTabla_(ss, 'ventas', tz);
+  const productos = leerTabla_(ss, 'productos', tz).filas;
+  const codRec = clave_(P.P_COD_REC || '');
+  const conCredito = {};
+  tCred.filas.forEach(function (c) { if (clave_(c.venta) && clave_(c.estadoPlan) !== PLAN_.ANULADO) conCredito[clave_(c.venta)] = c.id; });
+  let tPorConfirmar;
+  try { tPorConfirmar = leerTabla_(ss, 'cobrosConfirmar', tz); } catch (e) { tPorConfirmar = null; }
+  const yaPorConfirmar = {};
+  if (tPorConfirmar) tPorConfirmar.filas.forEach(function (x) { yaPorConfirmar[clave_(x.venta) + '|' + x.monto] = true; });
+  let sigConf = tPorConfirmar ? siguienteNumero_(tPorConfirmar.filas.map(function (x) { return x.id; }), 'CC-') : 1;
+  const nuevosPrevios = [];
+  const lineasVenta = [];
+  const nuevosConfirmar = [];
+  agruparVentas_(tVen.filas).filter(function (v) { return v.condicion === 'Crédito' && v.estado === 'Pendiente'; }).forEach(function (v) {
+    if (conCredito[clave_(v.id)] || clave_(v.nroCredito)) {
+      accion('Créditos ya cargados', 'YA MIGRADO', v.id, conCredito[clave_(v.id)] || v.nroCredito);
+      return;
+    }
+    const id = formatoCodigo_('CR-', sigCred++, 5);
+    const cli = existentes.filter(function (x) { return clave_(x.p.codigo) === clave_(v.codigoCliente); })[0];
+    const cat = cli ? categoriaPorNombre_(cats, cli.p.categoria) : null;
+    const filas = tVen.filas.filter(function (f) { return clave_(f.id) === clave_(v.id); });
+    const recargo = filas.filter(function (f) { return codRec && clave_(f.codigo) === codRec; }).reduce(function (t, f) { return t + f.subtotal; }, 0);
+    const subtotal = v.total - recargo;
+    const equipamiento = filas.some(function (f) {
+      const p = buscarPorCodigo_(productos, f.codigo) || {};
+      return esEquipamiento_({ linea: f.linea || p.linea || lineaPropuesta_(p.categoria, false), categoria: p.categoria }, P);
+    });
+    const nota = analizarNotaCredito_(v.nota, v.total, subtotal, cat, cats, equipamiento, P);
+    nuevosPrevios.push({
+      id: id, venta: v.id, ticket: v.ticket || '', codigoCliente: v.codigoCliente, cliente: v.cliente, fecha: v.fecha, subtotal: subtotal, recargo: recargo, total: v.total,
+      entrega: '', cuotas: '', frecuencia: '', primerVto: '', montoCuota: '', ultimaCuota: '', saldo: v.total, estadoPlan: PLAN_.A_CONFIRMAR, estadoCredito: PLAN_.A_CONFIRMAR,
+      categoria: '', origen: ORIGEN_CREDITO_.PREVIO, legado: '', autorizadoPor: '', motivoAutorizacion: '',
+      observacion: 'Venta a crédito cargada antes de la v2.3' + (v.nota ? ' (nota: «' + v.nota + '»)' : '') + '. Plan A CONFIRMAR: no genera cuotas, atrasos ni alertas de cobranza hasta que una administradora lo confirme.',
+      unidad: v.unidad || 'DISTRIBUIDORA', usuario: usuario, registrado: ahora, cobrado: 0, vencido: 0, atraso: 0, proximoVto: '', moraPactada: 'No',
+      planSugerido: '', lectura: '', alertas: nota.alertas.join(' · '),
+    });
+    filas.forEach(function (f) { lineasVenta.push({ fila: f._fila, valores: { nroCredito: id } }); });
+    accion('Créditos ya cargados', 'CREAR', v.id, id + ' ' + v.cliente + ' Gs. ' + miles_(v.total) + ' (VIGENTE PREVIO, plan A CONFIRMAR)' + (nota.alertas.length ? ' · ' + nota.alertas.length + ' alerta(s)' : ''));
+    nota.entregas.forEach(function (e) {
+      if (yaPorConfirmar[clave_(v.id) + '|' + e.monto]) return;
+      const idc = formatoCodigo_('CC-', sigConf++, 4);
+      nuevosConfirmar.push({
+        id: idc, detectado: ahora, credito: id, venta: v.id, codigoCliente: v.codigoCliente, cliente: v.cliente, monto: e.monto,
+        fuente: 'Nota de la venta ' + v.id + ': «' + v.nota + '»', estado: 'PENDIENTE', cobro: '', resueltoPor: '', resuelto: '',
+        observacion: 'Falta la fecha, el medio de pago y el N° de recibo u operación: confírmelos antes de registrarlo. No mueve el saldo.',
+      });
+      accion('Cobros a confirmar', 'CREAR', idc, v.id + ' ' + v.cliente + ' Gs. ' + miles_(e.monto) + ' (mencionado en la nota; no se registra)');
+    });
+  });
+
+  // a) «Saldos iniciales»: copia fiel de SALDOS_INICIALES y del cuadro «a investigar»
+  const tSal = leerTabla_(ss, 'saldos', tz);
+  const salExist = {};
+  tSal.filas.forEach(function (x) { salExist[(x.tipo || '') + '|' + clave_(x.tipo === 'A INVESTIGAR' ? x.clienta : x.numero)] = x; });
+  const nuevosSal = [];
+  const enlacesSal = [];
+  XLSX_SALDOS_.forEach(function (s) {
+    const num = String(s[0]);
+    const ya = salExist['SALDO INICIAL|' + num];
+    if (ya) {
+      const faltaEnlace = (!ya.credito && creditoDeNumero[num]) || (!ya.codigoCliente && codigoSistema[s[1]]);
+      if (faltaEnlace) enlacesSal.push({ fila: ya._fila, valores: { credito: ya.credito || creditoDeNumero[num] || '', codigoCliente: ya.codigoCliente || codigoSistema[s[1]] || '' } });
+      accion('Saldos iniciales', faltaEnlace ? 'ENLAZAR' : 'YA COPIADO', num, s[2]);
+      return;
+    }
+    nuevosSal.push({
+      numero: num, legado: s[1], clienta: s[2], fechaCorte: s[3], saldoHoja: s[4], saldoConfirmado: '', saldoMigrar: s[4], lectura: s[5], detalle: s[6],
+      estado: s[7], observacion: s[8], tipo: 'SALDO INICIAL', ultimoVisto: '', hojaFecha: '', codigoCliente: codigoSistema[s[1]] || '', credito: creditoDeNumero[num] || '',
+      actualizado: ahora, usuario: usuario,
+    });
+    accion('Saldos iniciales', 'COPIAR', num, s[2] + ' Gs. ' + miles_(s[4]) + ' (' + s[5] + ')');
+  });
+  XLSX_A_INVESTIGAR_.forEach(function (i) {
+    if (salExist['A INVESTIGAR|' + clave_(i[0])]) { accion('Saldos a investigar', 'YA COPIADO', i[0], ''); return; }
+    nuevosSal.push({
+      numero: '', legado: i[1], clienta: i[0], fechaCorte: '', saldoHoja: '', saldoConfirmado: '', saldoMigrar: '', lectura: 'A INVESTIGAR', detalle: '',
+      estado: '', observacion: i[4], tipo: 'A INVESTIGAR', ultimoVisto: i[2], hojaFecha: i[3], codigoCliente: (i[1] && codigoSistema[i[1]]) || '', credito: '',
+      actualizado: ahora, usuario: usuario,
+    });
+    accion('Saldos a investigar', 'COPIAR', i[0], 'Gs. ' + miles_(i[2]) + ' (hoja ' + i[3] + '; no suma a la cartera)');
+  });
+
+  // e) Ejemplos del xlsx: nunca se cargan; se informa si apareciera alguno en el sistema.
+  const ejemplos = ignorarEjemplos_(ss, tz, email, true);
+
+  // Pasos de fases posteriores (si están instalados): R1.5 clientas de servicios, R4.9 tickets retroactivos.
+  if (typeof migrarClientasServicios_ === 'function') r.extras.push(migrarClientasServicios_(ss, tz, email, { simular: true }));
+  if (typeof migrarTicketsRetroactivos_ === 'function') r.extras.push(migrarTicketsRetroactivos_(ss, tz, email, { simular: true }));
+  r.extras.forEach(function (x) { (x.acciones || []).forEach(function (a) { r.acciones.push(a); }); });
+
+  const pendientes = r.acciones.filter(function (a) { return !/^YA /.test(a.tipo); });
+  r.huella = huellaTexto_(pendientes.map(function (a) { return a.paso + '|' + a.tipo + '|' + a.ref; }).join('\n'));
+
+  if (!simular) {
+    agregarFilas_(pelu, nuevas, tz);
+    vinculos.forEach(function (v) { actualizarFilas_(v.tabla, [{ fila: v.fila, valores: v.valores }], tz); });
+    agregarFilas_(tCred, nuevosCred.concat(nuevosPrevios), tz);
+    actualizarFilas_(tVen, lineasVenta, tz);
+    agregarFilas_(tSal, nuevosSal, tz);
+    actualizarFilas_(tSal, enlacesSal, tz);
+    if (tPorConfirmar) agregarFilas_(tPorConfirmar, nuevosConfirmar, tz);
+    r.extras = [];
+    if (typeof migrarClientasServicios_ === 'function') r.extras.push(migrarClientasServicios_(ss, tz, email, { simular: false }));
+    if (typeof migrarTicketsRetroactivos_ === 'function') r.extras.push(migrarTicketsRetroactivos_(ss, tz, email, { simular: false }));
+    recalcularCartera_(ss, tz);
+  }
+
+  // f) Informe de conciliación (sobre el estado resultante: lo existente + lo nuevo)
+  const historicos = tCred.filas.filter(function (c) { return clave_(c.origen) === ORIGEN_CREDITO_.HISTORICO && clave_(c.estadoPlan) !== PLAN_.ANULADO; })
+    .concat(simular ? nuevosCred : []);
+  const filasSal = tSal.filas.concat(simular ? nuevosSal : []);
+  const iniciales = filasSal.filter(function (s) { return s.tipo === 'SALDO INICIAL'; });
+  const investigar = filasSal.filter(function (s) { return s.tipo === 'A INVESTIGAR'; });
+  const sumar = function (lista, k) { return lista.reduce(function (t, x) { return t + (Number(x[k]) || 0); }, 0); };
+  const totalHoja = sumar(iniciales, 'saldoHoja');
+  const totalMigrar = sumar(iniciales, 'saldoMigrar');
+  const totalHistorico = sumar(historicos, 'subtotal');
+  const dudosas = sumar(iniciales.filter(function (s) { return s.lectura === 'DUDOSA'; }), 'saldoHoja');
+  const totalInvestigar = sumar(investigar, 'ultimoVisto');
+  const literalHoja = XLSX_SALDOS_.reduce(function (t, s) { return t + s[4]; }, 0);
+  const literalDudosas = XLSX_SALDOS_.filter(function (s) { return s[5] === 'DUDOSA'; }).reduce(function (t, s) { return t + s[4]; }, 0);
+  const literalInvestigar = XLSX_A_INVESTIGAR_.reduce(function (t, i) { return t + i[2]; }, 0);
+  const legadosEnSistema = {};
+  existentes.forEach(function (x) { if (clave_(x.p.legado)) legadosEnSistema[clave_(x.p.legado)] = true; });
+  nuevas.forEach(function (x) { legadosEnSistema[x.legado] = true; });
+  vinculos.forEach(function (x) { legadosEnSistema[x.valores.legado] = true; });
+  const conLegado = XLSX_CLIENTAS_.filter(function (c) { return legadosEnSistema[c[0]]; }).length;
+  const sinClienta = historicos.filter(function (c) { return !clave_(c.codigoCliente); }).length;
+  function control(nombre, ok, detalle) { r.controles.push({ nombre: nombre, ok: !!ok, detalle: detalle }); }
+  control('Saldos según hoja (copia fiel de SALDOS_INICIALES)', iniciales.length === XLSX_SALDOS_.length && totalHoja === literalHoja,
+    iniciales.length + ' filas · total Gs. ' + miles_(totalHoja) + ' (xlsx: Gs. ' + miles_(literalHoja) + ').');
+  control('Créditos HISTÓRICO = saldos a migrar', historicos.length === XLSX_SALDOS_.length && totalHistorico === totalMigrar,
+    historicos.length + ' créditos HISTÓRICO por Gs. ' + miles_(totalHistorico) + ' · saldo a migrar Gs. ' + miles_(totalMigrar) + '.');
+  control('Saldos DUDOSOS (lectura a confirmar)', dudosas === literalDudosas, 'Gs. ' + miles_(dudosas) + ' (xlsx: Gs. ' + miles_(literalDudosas) + '); quedan A CONFIRMAR.');
+  control('Saldos a investigar (no suman a la cartera)', investigar.length === XLSX_A_INVESTIGAR_.length && totalInvestigar === literalInvestigar &&
+    investigar.every(function (s) { return !s.credito && s.saldoMigrar === ''; }), investigar.length + ' casos por Gs. ' + miles_(totalInvestigar) + ' fuera de la cartera.');
+  control('Clientas con código legado (C001…C041)', conLegado === XLSX_CLIENTAS_.length, conLegado + ' de ' + XLSX_CLIENTAS_.length + '.');
+  control('Créditos HISTÓRICO vinculados a su clienta', sinClienta === 0, sinClienta ? sinClienta + ' sin clienta: revisar.' : 'Todos vinculados.');
+  control('Sin datos de EJEMPLO del xlsx', ejemplos.encontrados.length === 0, ejemplos.resumen);
+  r.extras.forEach(function (x) { (x.controles || []).forEach(function (c) { r.controles.push(c); }); });
+  r.totales = { historico: totalHistorico, saldoHoja: totalHoja, dudosas: dudosas, investigar: totalInvestigar, clientasNuevas: nuevas.length, clientasVinculadas: vinculos.length,
+    creditosHistoricos: nuevosCred.length, creditosPrevios: nuevosPrevios.length, cobrosAConfirmar: nuevosConfirmar.length,
+    montoAConfirmar: nuevosConfirmar.reduce(function (t, x) { return t + x.monto; }, 0), filasSaldos: nuevosSal.length, pendientes: pendientes.length };
+  const ok = r.controles.filter(function (c) { return c.ok; }).length;
+  // v2.3 · Fase 3: los pasos de fases posteriores (R1.5, R4.9) suman su propio resumen; si la cartera ya estaba migrada, se dice.
+  const pasosExtra = {};
+  r.extras.forEach(function (x) { (x.acciones || []).forEach(function (a) { pasosExtra[a.paso] = true; }); });
+  const propios = pendientes.filter(function (a) { return !pasosExtra[a.paso]; });
+  const textoExtras = pendientes.length > propios.length ? r.extras.map(function (x) { return x.resumen || ''; }).filter(String).join(' ') : '';
+  r.resumen = (simular ? 'Vista previa de la migración: ' : 'Migración aplicada: ') +
+    (!propios.length && pendientes.length ? 'la cartera ya estaba migrada (sin cambios).' : '') +
+    (propios.length ? plural_(nuevas.length, 'clienta nueva', 'clientas nuevas') + ', ' + vinculos.length + ' vinculada(s), ' +
+      plural_(nuevosCred.length, 'crédito HISTÓRICO', 'créditos HISTÓRICO') + ', ' + plural_(nuevosPrevios.length, 'crédito VIGENTE PREVIO', 'créditos VIGENTE PREVIO') +
+      (nuevosPrevios.length ? ' (' + nuevosPrevios.map(function (x) { return x.venta; }).join(', ') + ')' : '') + ', ' +
+      plural_(nuevosConfirmar.length, 'cobro a confirmar', 'cobros a confirmar') + (nuevosConfirmar.length ? ' (Gs. ' + miles_(r.totales.montoAConfirmar) + ')' : '') + ', ' +
+      plural_(nuevosSal.length, 'fila', 'filas') + ' de «Saldos iniciales».' : (pendientes.length ? '' : 'no hay nada pendiente: todo ya estaba migrado.')) +
+    (textoExtras ? ' ' + textoExtras : '') +
+    ' Cartera HISTÓRICA Gs. ' + miles_(totalHistorico) + ' · dudosas Gs. ' + miles_(dudosas) + ' · a investigar Gs. ' + miles_(totalInvestigar) + ' (no suman).' +
+    ' Controles: ' + ok + '/' + r.controles.length + ' OK.' + (r.respaldo ? ' Respaldo previo: «' + r.respaldo + '».' : '');
+  return r;
+}
+
+/**
+ * Busca datos de EJEMPLO del xlsx en el sistema (C999, ítems EJ-, ventas 1001 y 1002, filas con «EJEMPLO») y, si no es
+ * simulación, deja inactivas las clientas y productos y ANULA los créditos de ejemplo. Nunca borra. Idempotente.
+ */
+function ignorarEjemplos_(ss, tz, email, simular) {
+  const r = { encontrados: [], cambios: 0, resumen: '' };
+  const ejemplo = function (s) { return /EJEMPLO/i.test(String(s || '')); };
+  const marca = 'EJEMPLO del xlsx: ignorado (ignorarEjemplos)';
+  tablasClientes_(ss, tz).forEach(function (tc) {
+    const lote = [];
+    tc.tabla.filas.forEach(function (p) {
+      if (clave_(p.legado) !== EJEMPLOS_XLSX_.CLIENTA && !ejemplo(p.nombre)) return;
+      r.encontrados.push('Clienta ' + p.codigo + ' «' + p.nombre + '»');
+      if (esActivo_(p.activo) || String(p.observacion || '').indexOf(marca) < 0) {
+        lote.push({ fila: p._fila, valores: { activo: 'No', observacion: [p.observacion, marca].filter(String).join(' · '), actualizado: new Date(), usuario: email } });
+      }
+    });
+    if (!simular) r.cambios += actualizarFilas_(tc.tabla, lote, tz);
+  });
+  const prod = leerTabla_(ss, 'productos', tz);
+  const loteP = [];
+  prod.filas.forEach(function (p) {
+    if (String(p.codigo || '').toUpperCase().indexOf(EJEMPLOS_XLSX_.PREFIJO_ITEM) !== 0 && !ejemplo(p.nombre)) return;
+    r.encontrados.push('Producto ' + p.codigo + ' «' + p.nombre + '»');
+    if (esActivo_(p.activo)) loteP.push({ fila: p._fila, valores: { activo: 'No', actualizado: new Date(), usuario: email } });
+  });
+  if (!simular) r.cambios += actualizarFilas_(prod, loteP, tz);
+  const cred = leerTabla_(ss, 'creditos', tz);
+  const loteC = [];
+  cred.filas.forEach(function (c) {
+    if (EJEMPLOS_XLSX_.VENTAS.indexOf(clave_(c.legado)) < 0 && !ejemplo(c.observacion)) return;
+    r.encontrados.push('Crédito ' + c.id + (c.legado ? ' (N° ' + c.legado + ')' : ''));
+    if (clave_(c.estadoPlan) !== PLAN_.ANULADO) loteC.push({ fila: c._fila, valores: { estadoPlan: PLAN_.ANULADO, motivoAnulacion: marca } });
+  });
+  if (!simular) r.cambios += actualizarFilas_(cred, loteC, tz);
+  leerTabla_(ss, 'ventas', tz).filas.forEach(function (v) {
+    if (ejemplo(v.nota) || String(v.codigo || '').toUpperCase().indexOf(EJEMPLOS_XLSX_.PREFIJO_ITEM) === 0) r.encontrados.push('Venta ' + v.id + ' (revisar y anular con motivo si corresponde)');
+  });
+  if (!simular && loteC.length) recalcularCartera_(ss, tz);
+  r.resumen = r.encontrados.length
+    ? r.encontrados.length + ' dato(s) de EJEMPLO encontrados: ' + unicos_(r.encontrados).slice(0, 10).join('; ') + (simular ? '.' : '. Se dejaron inactivos o anulados (' + r.cambios + ' fila(s)); nada se borró.')
+    : 'No hay datos de EJEMPLO del xlsx en el sistema (C999, ítems EJ-, ventas 1001 y 1002 no se cargan).';
+  return r;
+}
+
+function textoInformeMigracion_(r) {
+  return r.resumen + '\n' + r.controles.map(function (c) { return (c.ok ? '[OK] ' : '[FALLO] ') + c.nombre + ': ' + c.detalle; }).join('\n') + '\n' +
+    r.acciones.filter(function (a) { return !/^YA /.test(a.tipo); }).map(function (a) { return '  · ' + a.paso + ' · ' + a.tipo + ' · ' + a.ref + ' — ' + a.detalle; }).join('\n');
+}
+
+/** Informe en «Estado de instalación» (lo único de la migración que es texto de control). */
+function registrarInformeMigracion_(ss, tz, r, email) {
+  const corrida = 'Migración ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm');
+  const todosOk = r.controles.every(function (c) { return c.ok; });
+  registrarPaso_(ss, tz, corrida, 'Migración de datos antiguos (R0.8)', 'Libro', todosOk ? 'OK' : 'FALLO', r.resumen, todosOk ? '' : 'Revise los controles con FALLO.', email);
+  r.controles.forEach(function (c) {
+    registrarPaso_(ss, tz, corrida, '  · ' + c.nombre, '', c.ok ? 'OK' : 'FALLO', c.detalle, c.ok ? '' : 'Comparar con el xlsx y corregir antes de cobrar.', email);
+  });
+  const revisar = r.acciones.filter(function (a) { return /REVISAR/.test(a.tipo); });
+  if (revisar.length) registrarPaso_(ss, tz, corrida, '  · Posibles duplicados', '', 'AVISO', revisar.map(function (a) { return a.detalle; }).join(' | '), 'Verificar en Cartera › Clientas (no se fusionó nada).', email);
+}

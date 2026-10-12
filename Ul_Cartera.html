@@ -1,0 +1,1231 @@
+<!--
+  DISTRIBUIDORA MB · Cartera de crédito y cobranzas (v2.3 · Fase 2 · R0)
+  Clientas (estado y categoría), créditos y cuotas, cobros y conciliación, pendientes de la migración, cierre mensual,
+  estado de cuenta (pantalla, impresión A4 y PDF), venta a crédito y la pestaña Sistema › Migración.
+  Se incluye en Index.html con <?!= incluir_('UI_Cartera') ?> y se conecta a la app por window.MB.
+  Todo lo que decide (plan, recargo, política, cascada, autorizaciones) lo calcula y valida el SERVIDOR:
+  aquí solo se muestran estimaciones para orientar y se arman las pantallas.
+-->
+<style>
+  /* ═════════════ Cartera (v2.3) ═════════════ */
+  .datos-clienta { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+  .dato { background: var(--superficie-2); border: 1px solid var(--linea); border-radius: var(--radio); padding: 8px 10px; min-width: 0; }
+  .dato-etq { font-size: 10px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--tenue); }
+  .dato-val { font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 3px; font-size: 13px; overflow-wrap: anywhere; }
+  .aviso-linea { margin-top: 10px; font-size: 13px; padding: 9px 12px; border-radius: var(--radio); border-left: 3px solid var(--alerta); background: var(--alerta-suave); color: #6B4A10; }
+  .aviso-linea.grave { border-left-color: var(--error); background: var(--error-suave); color: var(--error); }
+  .aviso-linea.bien { border-left-color: var(--ok); background: var(--ok-suave); color: var(--ok); }
+  .problemas { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .problemas li { font-size: 13px; padding: 8px 12px; border-radius: var(--radio); border-left: 3px solid; }
+  .problemas .duro { background: var(--error-suave); border-color: var(--error); color: var(--error); }
+  .problemas .blando { background: var(--alerta-suave); border-color: var(--alerta); color: #6B4A10; }
+  .problemas .info { background: var(--superficie-2); border-color: var(--linea-2); color: var(--tinta-2); }
+  .tramos { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .tramo { background: var(--superficie); border: 1px solid var(--linea); border-top: 2px solid var(--linea-2); border-radius: 4px; padding: 12px 14px; min-width: 0; }
+  .tramo-etq { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--tenue); }
+  .tramo-val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .tramo-det { font-size: 12px; color: var(--tenue); }
+  .tramo.t0 { border-top-color: var(--ok); } .tramo.t1 { border-top-color: var(--alerta); }
+  .tramo.t2, .tramo.t3, .tramo.t4, .tramo.t5 { border-top-color: var(--error); } .tramo.t6 { border-top-color: var(--linea-2); border-top-style: dashed; }
+  .fila-detalle > td { background: var(--superficie-2); padding: 10px 14px 14px; }
+  .fila-detalle .tabla-cont { margin: 0; }
+  .sel-col { width: 34px; }
+  .sel-col input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--tinta); }
+  .barra-sel { position: sticky; bottom: 12px; z-index: 5; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; background: var(--tinta); color: #fff; padding: 10px 14px; border-radius: 4px; box-shadow: 0 12px 30px rgba(0, 0, 0, .2); margin-top: 12px; font-size: 13px; }
+  .barra-sel label { display: inline-flex; align-items: center; gap: 6px; }
+  .barra-sel input { width: auto; min-height: 34px; padding: 5px 8px; }
+  .barra-sel .btn { background: #fff; color: var(--tinta); border-color: #fff; min-height: 34px; }
+  .barra-sel .btn-sec { background: transparent; color: #fff; border-color: rgba(255, 255, 255, .5); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 4px; }
+  .lineas-cuotas { font-size: 12px; color: var(--tinta-2); margin-top: 4px; }
+  .ec-marco { border: 1px solid var(--linea); border-radius: 4px; background: #fff; padding: 18px 20px; margin-top: 12px; max-height: 62vh; overflow: auto; }
+  .cierre-bloque h3 { font-family: var(--serif, Georgia, serif); font-weight: normal; font-size: 16px; margin: 0 0 8px; }
+  .totales-fila td { font-weight: 600; border-top: 1px solid var(--linea-2); }
+  .resumen-mig { font-size: 14px; line-height: 1.5; }
+  #zona-impresion { display: none; }
+  @page { size: A4; margin: 14mm; }
+  @media print {
+    body.imprimiendo > *:not(#zona-impresion) { display: none !important; }
+    body.imprimiendo #zona-impresion { display: block !important; }
+    body.imprimiendo { background: #fff !important; }
+  }
+  @media (max-width: 900px) { .datos-clienta { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 480px) { .datos-clienta, .tramos { grid-template-columns: repeat(2, minmax(0, 1fr)); } .ec-marco { padding: 12px; } }
+</style>
+<!-- Estado de cuenta: estilos del documento (los manda el servidor) y zona que se imprime en A4 (fuera de la app). -->
+<style id="ec-css"></style>
+<div id="zona-impresion" aria-hidden="true"></div>
+<script>
+(window.MB_EXT = window.MB_EXT || []).push(function (MB) {
+  'use strict';
+  var S = MB.S, $ = MB.$, esc = MB.esc, gs = MB.gs, miles = MB.miles, fecha = MB.fecha, plural = MB.plural,
+    badge = MB.badge, boton = MB.boton, attr = MB.attr, tabla = MB.tabla, kpi = MB.kpi, cabecera = MB.cabecera,
+    subtabs = MB.subtabs, campo = MB.campo, inputGs = MB.inputGs, api = MB.api, toast = MB.toast, fallo = MB.fallo,
+    conBoton = MB.conBoton, abrirModal = MB.abrirModal, requerir = MB.requerir, enteroDe = MB.enteroDe,
+    norm = MB.norm, uid = MB.uid, sumarDias = MB.sumarDias;
+
+  // Estado de las pantallas de cartera (filtros, selección y lo que se carga a pedido).
+  var C = S.cartera = {
+    q: '', filtro: 'saldo', qCred: '', filtroCred: 'abiertos', abiertos: {}, qCob: '', filtroCob: 'todos', sel: {}, fechaConc: '',
+    verTodo: {}, cierre: null, manual: { marangatu: '', extractos: {} }, migracion: null, migConfirmo: false, informe: null, ficha: null,
+  };
+  MB.sistemaExtra = MB.sistemaExtra || [];
+
+  // ═════════════ Utilidades ═════════════
+  function D() { return S.datos; }
+  function hayCartera() { return !!(S.datos && S.datos.cartera); }
+  function K() { return S.datos.cartera; }
+  function P() { return (S.datos.cartera && S.datos.cartera.parametros) || {}; }
+  function esAdmin() { return MB.esAdmin(); }
+  function render() { MB.render(); }
+  function porc(fraccion) { return fraccion === null || fraccion === undefined || isNaN(fraccion) ? '—' : MB.pct(Number(fraccion) * 100); }
+  function minus(t) { return String(t === null || t === undefined ? '' : t).toLowerCase(); }
+  function opcion(valor, texto, sel) { return '<option value="' + esc(valor) + '"' + (sel ? ' selected' : '') + '>' + esc(texto) + '</option>'; }
+  function dato(etq, val, esHtml) { return '<div class="dato"><p class="dato-etq">' + esc(etq) + '</p><p class="dato-val">' + (esHtml ? val : esc(val)) + '</p></div>'; }
+  function aviso(txt, tono) { return '<p class="aviso-linea' + (tono ? ' ' + tono : '') + '">' + esc(txt) + '</p>'; }
+  function gsN(n) { return n === null || n === undefined || n === '' ? '—' : gs(n); }
+  var FREC = { SEMANAL: ['Semanal', 'semanales', 'sem.'], QUINCENAL: ['Quincenal', 'quincenales', 'quinc.'], MENSUAL: ['Mensual', 'mensuales', 'mens.'] };
+  function frec(f, i) { return (FREC[f] || FREC.SEMANAL)[i]; }
+
+  // Estados con los textos literales del xlsx (CREDITOS!AC, CLIENTES!Q) y los del sistema.
+  var TONOS = {
+    'AL DÍA': 'ok', 'ATRASO HASTA 7': 'alerta', 'A CONFIRMAR': 'neutro', 'CANCELADO': 'ok', 'ANULADO': 'neutro', 'VIGENTE': 'ok',
+    'HABILITADA': 'ok', 'SIN DEUDA': 'neutro', 'BLOQUEADA': 'error', 'EXCEDE LÍMITE': 'alerta', 'ASIGNAR CATEGORÍA': 'alerta', 'INACTIVA': 'neutro',
+    'PAGADA': 'ok', 'PENDIENTE': 'neutro', 'PARCIAL': 'alerta', 'EN GRACIA': 'alerta', 'VENCIDA': 'error', 'VENCIDA (PARCIAL)': 'error', 'ANULADA': 'neutro',
+    'CONFIRMADO': 'ok', 'EN DISPUTA': 'error', 'OK': 'ok', 'PENDIENTE DE CONCILIAR': 'alerta', 'REGISTRADO': 'ok', 'DESCARTADO': 'neutro',
+    'LEGIBLE': 'neutro', 'DUDOSA': 'alerta', 'A INVESTIGAR': 'alerta', 'FALLO': 'error', 'AVISO': 'alerta', 'INFO': 'neutro',
+  };
+  function badgeEstado(e) {
+    var k = String(e || '').trim().toUpperCase();
+    if (!k) return '—';
+    var tono = TONOS[k] || (/^ATRASO/.test(k) || /BLOQUE|VENCID|RECHAZ|COBRADO DE MÁS/.test(k) ? 'error' : 'neutro');
+    return badge(k.charAt(0) + k.slice(1).toLowerCase(), tono);
+  }
+  // Atraso: hasta P_DIAS_BLOQUEO días es «alerta»; más, «error» (la clienta queda bloqueada para créditos nuevos).
+  function tonoAtraso(atraso) { return atraso > (P().P_DIAS_BLOQUEO || 0) ? 'error' : 'alerta'; }
+
+  function buscarCredito(ref) {
+    var k = String(ref || '').trim().toUpperCase();
+    if (!k || !hayCartera()) return null;
+    var lista = K().creditos, i;
+    for (i = 0; i < lista.length; i++) if (String(lista[i].id).toUpperCase() === k) return lista[i];
+    for (i = 0; i < lista.length; i++) {
+      if (lista[i].saldo > 0 && (String(lista[i].venta || '').toUpperCase() === k || String(lista[i].legado || '').toUpperCase() === k)) return lista[i];
+    }
+    for (i = 0; i < lista.length; i++) if (String(lista[i].venta || '').toUpperCase() === k) return lista[i];
+    return null;
+  }
+  function creditosAbiertos(cliente) {
+    return K().creditos.filter(function (c) { return c.saldo > 0 && (!cliente || c.codigoCliente === cliente); });
+  }
+  function clienta(codigo) { return (hayCartera() && MB.buscar(K().clientes, codigo)) || MB.buscar(D().peluquerias, codigo); }
+  function categoria(nombre) {
+    var cats = hayCartera() ? K().categorias : [];
+    var k = String(nombre || '').trim().toUpperCase();
+    for (var i = 0; i < cats.length; i++) if (cats[i].nombre === k) return cats[i];
+    return null;
+  }
+  function categoriaBase() { return categoria('NUEVA') || (hayCartera() && K().categorias[0]) || null; }
+  function categoriaDeClienta(codigo) { var c = clienta(codigo); return c ? categoria(c.categoria) : null; }
+  function saldoInicialDe(c) {
+    var lista = (hayCartera() && K().saldosIniciales) || [];
+    return lista.filter(function (s) { return s.credito === c.id; })[0] ||
+      lista.filter(function (s) { return s.tipo === 'SALDO INICIAL' && String(s.numero) === String(c.legado); })[0] || null;
+  }
+  function origenTexto(c) { return c.venta ? 'venta ' + c.venta : (c.legado ? 'saldo histórico N° ' + c.legado : minus(c.origen)); }
+  function lineaCuotas(c) {
+    if (!c.cuotas || !c.cuotas.length) return 'Plan A CONFIRMAR: sin cuotas todavía; los cobros se aplican a cuenta del saldo.';
+    return c.cuotas.map(function (q) {
+      var falta = q.monto - q.pagado;
+      return (q.n === 0 ? 'Entrega' : 'C' + q.n) + ' ' + fecha(q.vto).slice(0, 5) + ' ' + miles(q.monto) +
+        (falta <= 0 ? ' ✓' : (q.pagado > 0 ? ' (falta ' + miles(falta) + ')' : '')) + (/VENCIDA/.test(q.estado) ? ' · vencida' : '');
+    }).join('  ·  ');
+  }
+  function resumenPlanTexto(c) {
+    if (!c.cuotas || !c.cuotas.length) return 'Plan A CONFIRMAR';
+    var cuotas = c.cuotas.filter(function (q) { return q.n > 0; });
+    return (Number(c.entrega) ? 'Entrega ' + miles(c.entrega) + ' + ' : '') + cuotas.length + ' × ' + miles(c.montoCuota || (cuotas[0] ? cuotas[0].monto : 0)) + ' ' +
+      frec(c.frecuencia, 2) + (c.recargo ? ' · recargo ' + miles(c.recargo) : '');
+  }
+
+  // ═════════════ Plan de pagos: estimación con las mismas fórmulas del servidor (el servidor decide) ═════════════
+  function excel15(x) { return Number(Number(x).toPrecision(15)); }
+  function redondear(x, m) { var q = excel15(x / m); return (q >= 0 ? Math.floor(q + 0.5) : -Math.floor(-q + 0.5)) * m; }
+  function abajo(x, m) { var q = excel15(x / m); return (q >= 0 ? Math.floor(q) : -Math.floor(-q)) * m; }
+  function arriba(x, m) { var q = excel15(x / m); return (q >= 0 ? Math.ceil(q) : -Math.ceil(-q)) * m; }
+  function diasFrecuencia(f) { var p = P(); return Number(f === 'QUINCENAL' ? p.P_FREC_QUINCENAL : (f === 'MENSUAL' ? p.P_FREC_MENSUAL : p.P_FREC_SEMANAL)) || 7; }
+  function frecuenciaPermitida(cat, f) { return f === 'SEMANAL' || (f !== 'MENSUAL' && !!cat && cat.frecuencias.indexOf(f) >= 0); }
+  function parametrosCompletos() {
+    var p = P();
+    return ['P_PLAZO_SIN_REC', 'P_TEA_FIN', 'P_LIMITE_BCP', 'P_RED_CUOTA', 'P_FREC_SEMANAL', 'P_CUOTA_MIN', 'P_MAX_CUOTAS', 'P_MIN_CREDITO'].every(function (k) {
+      return p[k] !== null && p[k] !== undefined && p[k] !== '';
+    });
+  }
+  function estimarPlan(e, cat) {
+    var p = P();
+    var frecuencia = e.frecuencia || 'SEMANAL';
+    var dias = diasFrecuencia(frecuencia);
+    var n = Math.max(1, Math.floor(Number(e.cuotas) || 1));
+    var subtotal = Math.max(0, Math.round(Number(e.subtotal) || 0));
+    var entrega = Math.max(0, Math.round(Number(e.entrega) || 0));
+    var base0 = cat || categoriaBase();
+    var pctEntrega = Math.max(base0 ? Number(base0.entrega) || 0 : 0, e.equipamiento ? Number(p.P_ENTREGA_EQUIPO) || 0 : 0);
+    var plazo = n * dias, promedio = dias * (n + 1) / 2, base = Math.max(0, subtotal - entrega), recargo = 0, limitado = false;
+    if (plazo > p.P_PLAZO_SIN_REC && base > 0) {
+      recargo = redondear(base * (Math.pow(1 + p.P_TEA_FIN, promedio / 365) - 1), 1000);
+      if (recargo > 0 && Math.pow(1 + recargo / base, 365 / promedio) - 1 > p.P_LIMITE_BCP + 1e-12) {
+        recargo = Math.max(0, abajo(base * (Math.pow(1 + p.P_LIMITE_BCP, promedio / 365) - 1), 1000));
+        limitado = true;
+      }
+    }
+    var total = subtotal + recargo, financiado = Math.max(0, total - entrega);
+    var cuota = n <= 1 ? financiado : abajo(financiado / n, Number(p.P_RED_CUOTA) || 1000);
+    var primerVto = e.primerVto || sumarDias(e.fecha, dias);
+    return {
+      frecuencia: frecuencia, dias: dias, n: n, subtotal: subtotal, entrega: entrega, entregaMinima: arriba(subtotal * pctEntrega, 1000), pctEntrega: pctEntrega,
+      primerVto: primerVto, ultimoVto: sumarDias(primerVto, (n - 1) * dias), plazo: plazo, recargo: recargo, limitado: limitado, total: total,
+      financiado: financiado, cuota: cuota, ultima: financiado - (n - 1) * cuota,
+    };
+  }
+  function textoPlan(e) {
+    return (e.entrega ? 'entrega ' + gs(e.entrega) + ' + ' : '') + e.n + (e.n === 1 ? ' pago de ' : ' cuotas ' + frec(e.frecuencia, 1) + ' de ') + gs(e.cuota) +
+      (e.ultima !== e.cuota ? ' (última ' + gs(e.ultima) + ')' : '') + (e.n === 1 ? ', el ' + fecha(e.primerVto) : ', del ' + fecha(e.primerVto) + ' al ' + fecha(e.ultimoVto)) + '. ' +
+      (e.recargo ? 'Plazo de ' + e.plazo + ' días: recargo financiero ' + gs(e.recargo) + (e.limitado ? ' (ajustado al límite BCP)' : '') + '; total ' + gs(e.total) + '.'
+        : 'Sin recargo (plazo de ' + e.plazo + ' días; hasta ' + P().P_PLAZO_SIN_REC + ' sin recargo).');
+  }
+  function esEquipamiento(p) {
+    var linea = norm(p.linea || ''), eq = norm(P().P_LINEA_EQUIPO || '');
+    if (linea && eq && linea === eq) return true;
+    return /^equipo|equipamiento|mobiliario/.test(norm(p.categoria || ''));
+  }
+  function subtotalVenta(v) { return v.items.reduce(function (t, i) { return t + i.cantidad * i.precio; }, 0); }
+  function estimadoVenta(v, subtotal) {
+    var cat = v.cliente ? categoriaDeClienta(v.cliente) : null;
+    var equipamiento = v.items.some(function (it) { var p = MB.buscar(D().productos, it.codigo); return !!p && esEquipamiento(p); });
+    return {
+      cat: cat,
+      plan: estimarPlan({
+        fecha: v.fecha || D().hoy, subtotal: subtotal, equipamiento: equipamiento, entrega: enteroDe(v.plan.entrega) || 0,
+        cuotas: parseInt(v.plan.cuotas, 10) || 1, frecuencia: v.plan.frecuencia, primerVto: v.plan.primerVto,
+      }, cat),
+    };
+  }
+  function textoEstimado(v, subtotal) {
+    var p = P();
+    if (!parametrosCompletos()) return '<span class="negativo">Faltan parámetros de crédito (' + esc((p.faltan || []).join(', ') || 'revisar «Parámetros de crédito»') + '): el servidor no podrá calcular el plan.</span>';
+    if (!v.items.length) return 'Agregue productos para ver el plan de pagos.';
+    var est = estimadoVenta(v, subtotal), e = est.plan, cli = v.cliente ? clienta(v.cliente) : null;
+    var avisos = [];
+    if (!v.cliente) avisos.push('Elija la peluquería.');
+    else if (!est.cat) avisos.push('ASIGNAR CATEGORÍA A LA CLIENTA (una administradora, en Cartera › Clientas).');
+    if (subtotal < p.P_MIN_CREDITO) avisos.push('MONTO MENOR AL MÍNIMO PARA CRÉDITO (' + gs(p.P_MIN_CREDITO) + ').');
+    if (e.entrega < e.entregaMinima) avisos.push('ENTREGA MENOR AL MÍNIMO: ' + gs(e.entregaMinima) + ' (' + porc(e.pctEntrega) + ').');
+    if (e.n > 1 && e.cuota < p.P_CUOTA_MIN) avisos.push('CUOTA MENOR A LA MÍNIMA (' + gs(p.P_CUOTA_MIN) + ').');
+    var catCuotas = est.cat || categoriaBase();
+    if (catCuotas && e.n > catCuotas.cuotas) avisos.push('CUOTAS SOBRE EL MÁXIMO DE SU CATEGORÍA (' + catCuotas.cuotas + ').');
+    if (!frecuenciaPermitida(est.cat, e.frecuencia)) avisos.push('FRECUENCIA REQUIERE AUTORIZACIÓN (de una administradora).');
+    if (cli && cli.estado === 'BLOQUEADA') avisos.push('CLIENTA BLOQUEADA (atraso de ' + plural(cli.atraso || 0, 'día', 'días') + ').');
+    if (est.cat && cli && (Number(cli.saldo) || 0) + e.total - (v.cobrarEntrega ? e.entrega : 0) > est.cat.limite) avisos.push('CLIENTA EXCEDE SU LÍMITE (' + gs(est.cat.limite) + ').');
+    if (e.total > 0 && e.entrega >= e.total) avisos.push('LA ENTREGA CUBRE EL TOTAL: registre la venta al contado.');
+    return esc('Estimado: ' + textoPlan(e)) + (avisos.length ? '<br><span class="negativo">' + esc(avisos.join(' ')) + '</span>' : '') +
+      '<br><span class="det">El plan definitivo lo calcula y valida el sistema al pulsar «Revisar plan y registrar».</span>';
+  }
+  function actualizarEstimado() {
+    var v = S.venta;
+    if (!v || v.condicion !== 'Crédito' || !hayCartera()) return;
+    var sub = subtotalVenta(v);
+    var el = $('#v-plan-estimado');
+    if (el) el.innerHTML = textoEstimado(v, sub);
+    var m = $('#v-entrega-min');
+    if (m) {
+      var e = estimadoVenta(v, sub).plan;
+      m.textContent = v.items.length && e.entregaMinima ? 'Mínimo ' + gs(e.entregaMinima) + ' (' + porc(e.pctEntrega) + ')' : '';
+    }
+  }
+
+  function situacionClienta(codigo) {
+    var c = clienta(codigo);
+    if (!c) return '';
+    var cat = categoriaDeClienta(codigo);
+    var estado = c.estado || c.estadoCredito || '';
+    var html = '<div class="datos-clienta mt">' +
+      dato('Categoría', cat ? cat.nombre : 'Sin categoría') + dato('Límite', cat ? gs(cat.limite) : '—') + dato('Saldo actual', gs(c.saldo || 0)) +
+      dato('Disponible', cat ? gs(c.disponible) : '—') + dato('Estado', badgeEstado(estado), true) +
+      dato('Atraso', c.atraso ? plural(c.atraso, 'día', 'días') : 'Sin atraso') + '</div>';
+    if (cat) {
+      html += '<p class="ayuda mt">Categoría ' + esc(cat.nombre) + ': entrega mínima ' + porc(cat.entrega) + ', hasta ' + cat.cuotas + ' cuotas, frecuencia ' +
+        esc(cat.frecuencias.map(minus).join(' o ')) + '.</p>';
+    } else {
+      html += aviso('Sin categoría de crédito: una administradora debe asignarla (Cartera › Clientas) antes de venderle a crédito.', 'grave');
+    }
+    if (estado === 'BLOQUEADA') html += aviso('CLIENTA BLOQUEADA: tiene más de ' + (P().P_DIAS_BLOQUEO || 0) + ' días de atraso. No se le puede vender a crédito hasta que se ponga al día.', 'grave');
+    else if (c.vencido > 0) html += aviso('La clienta tiene ' + gs(c.vencido) + ' vencidos: conviene cobrar antes de otorgar más crédito.');
+    return html;
+  }
+
+  // Sección «Crédito y plan de pagos» del formulario de venta (Index.html la llama al elegir «Crédito»).
+  function seccionCredito(v, subtotal) {
+    if (!hayCartera()) return '<p class="error-linea">El módulo de cartera no está instalado en el servidor.</p>';
+    var p = P(), d = D();
+    var cat = v.cliente ? categoriaDeClienta(v.cliente) : null;
+    var catCuotas = cat || categoriaBase();
+    var opcN = '';
+    for (var n = 1; n <= (Number(p.P_MAX_CUOTAS) || 1); n++) {
+      opcN += opcion(n, n + (n === 1 ? ' pago' : ' cuotas') + (catCuotas && n > catCuotas.cuotas ? ' (fuera de su categoría)' : ''), String(n) === String(v.plan.cuotas));
+    }
+    var opcF = ['SEMANAL', 'QUINCENAL', 'MENSUAL'].map(function (f) {
+      return opcion(f, frec(f, 0) + (frecuenciaPermitida(cat, f) ? '' : ' (requiere autorización)'), v.plan.frecuencia === f);
+    }).join('');
+    if (v.cobrarEntrega && v.entregaMedio === 'EFECTIVO' && !v.entregaRecibo) v.entregaRecibo = K().siguienteRecibo;
+    var efectivo = v.entregaMedio === 'EFECTIVO';
+    return '<div class="separador"></div><p class="eyebrow">Crédito y plan de pagos</p>' +
+      (v.cliente ? situacionClienta(v.cliente) : '<p class="ayuda mt">Elija la peluquería para ver su situación de crédito.</p>') +
+      '<div class="form-grid mt">' +
+      '<div class="campo c-3"><label for="v-entrega">Entrega inicial (Gs.)</label><input id="v-entrega" data-tipo="gs" inputmode="numeric" data-campo="venta.plan.entrega" value="' +
+      esc(v.plan.entrega) + '"><span class="ayuda" id="v-entrega-min"></span></div>' +
+      '<div class="campo c-3"><label for="v-cuotas">Cuotas (además de la entrega)</label><select id="v-cuotas" data-campo="venta.plan.cuotas">' + opcN + '</select></div>' +
+      '<div class="campo c-3"><label for="v-frec">Frecuencia</label><select id="v-frec" data-campo="venta.plan.frecuencia">' + opcF + '</select></div>' +
+      '<div class="campo c-3"><label for="v-vto">Primer vencimiento</label><input id="v-vto" type="date" data-campo="venta.plan.primerVto" value="' + esc(v.plan.primerVto) +
+      '" min="' + esc(sumarDias(v.fecha || d.hoy, 1)) + '"><span class="ayuda">Vacío = automático.</span></div>' +
+      '<div class="c-12"><label class="check"><input type="checkbox" data-campo="venta.plan.moraPactada"' + (v.plan.moraPactada ? ' checked' : '') +
+      '> El plan firmado por la clienta prevé recargo por mora (' + porc(p.P_TEA_MORA) + ' anual sobre lo vencido)</label>' +
+      (p.moraHabilitada ? '' : '<span class="ayuda">Mientras no esté cargada la política de crédito firmada, no se cobra mora.</span>') + '</div>' +
+      '</div>' +
+      '<p class="ficha mt" id="v-plan-estimado">' + textoEstimado(v, subtotal) + '</p>' +
+      '<div class="mt"><label class="check"><input type="checkbox" data-campo="venta.cobrarEntrega"' + (v.cobrarEntrega ? ' checked' : '') +
+      '> Cobrar la entrega ahora (queda el recibo y se aplica al crédito)</label></div>' +
+      (v.cobrarEntrega ? '<div class="form-grid mt">' +
+        '<div class="campo c-4"><label for="v-ent-medio">Medio de pago de la entrega</label><select id="v-ent-medio" data-campo="venta.entregaMedio">' +
+        K().medios.map(function (m) { return opcion(m, m, m === v.entregaMedio); }).join('') + '</select></div>' +
+        (efectivo ? '<div class="campo c-4"><label for="v-ent-recibo">N° de recibo</label><input id="v-ent-recibo" maxlength="30" data-campo="venta.entregaRecibo" value="' + esc(v.entregaRecibo) + '"></div>'
+          : '<div class="campo c-4"><label for="v-ent-op">N° de operación / referencia</label><input id="v-ent-op" maxlength="40" data-campo="venta.entregaOperacion" value="' + esc(v.entregaOperacion) + '"></div>') +
+        '</div>' : '');
+  }
+
+  // «Revisar plan y registrar»: el servidor calcula el plan y lista lo que no cumple la política (mensajes del xlsx).
+  function confirmarVentaCredito(datos, btn) {
+    var v = S.venta;
+    var n = parseInt(v.plan.cuotas, 10);
+    if (!(n >= 1)) { toast('Elija la cantidad de cuotas.', 'error'); return; }
+    var entrega = enteroDe(v.plan.entrega) || 0;
+    datos.plan = { entrega: entrega, cuotas: n, frecuencia: v.plan.frecuencia || 'SEMANAL', primerVto: v.plan.primerVto || '', moraPactada: !!v.plan.moraPactada };
+    var cobrar = !!v.cobrarEntrega && entrega > 0;
+    var efectivo = (v.entregaMedio || 'EFECTIVO') === 'EFECTIVO';
+    datos.entregaCobro = {
+      cobrar: cobrar, medio: v.entregaMedio || 'EFECTIVO',
+      recibo: cobrar && efectivo ? String(v.entregaRecibo || '').trim() : '', operacion: cobrar && !efectivo ? String(v.entregaOperacion || '').trim() : '',
+    };
+    if (cobrar && efectivo && !datos.entregaCobro.recibo) { toast('FALTA N° DE RECIBO de la entrega.', 'error'); return; }
+    if (cobrar && !efectivo && !datos.entregaCobro.operacion) { toast('FALTA N° DE OPERACIÓN de la entrega.', 'error'); return; }
+    conBoton(btn, 'Calculando plan…', function () { return api('calcularPlanCredito', datos); }).then(function (r) {
+      var duros = r.problemas.filter(function (x) { return x.severidad === 'RECHAZO'; });
+      var blandos = r.problemas.filter(function (x) { return x.severidad === 'AUTORIZAR'; });
+      var alertas = r.problemas.filter(function (x) { return x.severidad === 'ALERTA'; });
+      abrirModal({
+        titulo: 'Confirmar venta a crédito', ancho: true, aceptar: 'Registrar venta a crédito',
+        cuerpo: cuerpoConfirmacion(r, datos, duros, blandos, alertas),
+        alAceptar: function (f) {
+          requerir(!duros.length, 'Corrija lo marcado en rojo: cierre esta ventana y ajuste la venta o el plan.');
+          var envio = JSON.parse(JSON.stringify(datos));
+          if (blandos.length) {
+            requerir(r.puedeAutorizar, 'Esta venta necesita la autorización de una administradora.');
+            requerir(f.autorizar === true, 'Marque «Autorizo la excepción».');
+            requerir(String(f.motivoAutorizacion || '').length >= 5, 'Escriba el motivo de la excepción (mínimo 5 letras).');
+            envio.autorizar = true;
+            envio.motivoAutorizacion = f.motivoAutorizacion;
+          }
+          return api('registrarVenta', envio, v.id).then(function (res) {
+            S.venta = MB.ventaNueva();
+            S.venta.condicion = 'Crédito'; // la próxima venta arranca igual (se cambia con un toque)
+            return res;
+          });
+        },
+      });
+      if (duros.length || (blandos.length && !r.puedeAutorizar)) {
+        var b = $('#modal-aceptar');
+        if (b) b.disabled = true;
+      }
+    }).catch(fallo);
+  }
+  function cuerpoConfirmacion(r, datos, duros, blandos, alertas) {
+    var p = r.plan, cli = r.clienta || {};
+    var filas = p.cuotas.map(function (q) {
+      var nota = q.n === 0 ? (datos.entregaCobro.cobrar ? 'se cobra ahora (' + minus(datos.entregaCobro.medio) + ')' : 'queda pendiente: vence hoy') : '';
+      return '<tr><td>' + (q.n === 0 ? 'Entrega' : 'Cuota ' + q.n) + (nota ? '<div class="det">' + esc(nota) + '</div>' : '') + '</td><td>' + fecha(q.vto) + '</td><td class="num">' + gs(q.monto) + '</td></tr>';
+    });
+    var html = '<p class="ficha"><strong>' + esc(cli.nombre || datos.codigoCliente) + '</strong> · categoría ' + esc(cli.categoria || 'sin categoría') + ' · saldo actual ' +
+      gs(cli.saldo || 0) + (cli.limite !== '' && cli.limite !== undefined ? ' · límite ' + gs(cli.limite) : '') + ' · ' + badgeEstado(cli.estado) + '</p>';
+    html += '<dl class="dl mt"><dt>Productos</dt><dd>' + gs(p.subtotal) + '</dd>' +
+      (p.recargo ? '<dt>Recargo financiero</dt><dd>' + gs(p.recargo) + ' <span class="det">(' + esc(P().P_COD_REC || 'REC-FIN') + ': plazo de ' + p.plazo + ' días, tasa efectiva ' +
+        porc(p.tasaEfectiva) + ' anual' + (p.recargoLimitado ? ', ajustado al límite BCP' : '') + ')</span></dd>'
+        : '<dt>Recargo</dt><dd>Sin recargo <span class="det">(plazo de ' + p.plazo + ' días)</span></dd>') +
+      '<dt>Total del crédito</dt><dd class="fuerte">' + gs(p.total) + '</dd>' +
+      '<dt>Entrega</dt><dd>' + gs(p.entrega) + (r.entregaMinima ? ' <span class="det">(mínima ' + gs(r.entregaMinima.monto) + ', ' + porc(r.entregaMinima.pct) +
+        (r.entregaMinima.equipamiento ? ', incluye equipamiento' : '') + ')</span>' : '') + '</dd>' +
+      '<dt>Financiado</dt><dd>' + gs(p.financiado) + ' en ' + p.n + (p.n === 1 ? ' pago' : ' cuotas ' + frec(p.frecuencia, 1)) + '</dd>' +
+      (datos.plan.moraPactada ? '<dt>Mora</dt><dd>Pactada en el plan firmado</dd>' : '') + '</dl>';
+    html += tabla(['Pago', 'Vence', ['Monto', 'num']], filas, '');
+    if (duros.length || blandos.length || alertas.length) {
+      html += '<ul class="problemas mt">' + duros.map(function (x) { return '<li class="duro">' + esc(x.mensaje) + '</li>'; }).join('') +
+        blandos.map(function (x) { return '<li class="blando">' + esc(x.mensaje) + '</li>'; }).join('') +
+        alertas.map(function (x) { return '<li class="info">' + esc(x.mensaje) + '</li>'; }).join('') + '</ul>';
+    }
+    if (!duros.length && !blandos.length) html += aviso('El plan cumple la política de crédito.', 'bien');
+    if (blandos.length && !duros.length && r.puedeAutorizar) {
+      html += '<div class="form-grid mt"><div class="c-12"><label class="check"><input type="checkbox" name="autorizar"> Autorizo la excepción (queda registrada con mi correo, la fecha y el motivo)</label></div>' +
+        campo('Motivo de la excepción *', '<textarea name="motivoAutorizacion" maxlength="200" placeholder="Ej.: clienta de años, cobra quincenal"></textarea>', 'c-12') + '</div>';
+    } else if (blandos.length && !r.puedeAutorizar) {
+      html += aviso('Lo marcado en ámbar necesita la autorización de una administradora: ajuste el plan o pídale que registre la venta.');
+    }
+    return html;
+  }
+
+  // ═════════════ Cobro (cascada: entrega → cuota más antigua → siguientes) ═════════════
+  function simularCascada(c, monto) {
+    var partes = [], resto = monto;
+    var cuotas = (c.cuotas || []).slice().sort(function (a, b) { return a.n - b.n; });
+    cuotas.forEach(function (q) {
+      if (resto <= 0) return;
+      var falta = q.monto - q.pagado;
+      if (falta <= 0) return;
+      var a = Math.min(falta, resto);
+      resto -= a;
+      partes.push((q.n === 0 ? 'Entrega' : 'Cuota ' + q.n) + ' ' + miles(a) + (a < falta ? ' (parcial)' : ''));
+    });
+    if (resto > 0) partes.push((cuotas.length ? 'Excedente ' : 'A cuenta del saldo ') + miles(resto));
+    return { partes: partes, saldoDespues: c.saldo - monto };
+  }
+  function fichaCredito(c) {
+    return '<p class="ficha"><strong>' + esc(c.id) + '</strong> · ' + esc(origenTexto(c)) + ' · total ' + gs(c.total) + ' · cobrado ' + gs(c.cobrado) +
+      ' · <strong>saldo ' + gs(c.saldo) + '</strong>' +
+      (c.vencido > 0 ? ' · <span class="negativo">vencido ' + gs(c.vencido) + ' (' + plural(c.atraso, 'día', 'días') + ')</span>' : '') +
+      (c.estado === 'A CONFIRMAR' ? ' · ' + badgeEstado('A CONFIRMAR') : '') +
+      '<br><span class="lineas-cuotas">' + esc(lineaCuotas(c)) + '</span></p>';
+  }
+  function abrirCobro(op) {
+    op = op || {};
+    if (!hayCartera()) { toast('El módulo de cartera no está instalado en el servidor.', 'error'); return; }
+    var d = D();
+    var c0 = op.credito ? buscarCredito(op.credito) : null;
+    if (op.credito && !c0) { toast('No se encontró el crédito ' + op.credito + ' en la cartera.', 'error'); return; }
+    if (c0 && !(c0.saldo > 0)) { toast('El crédito ' + c0.id + ' no tiene saldo pendiente.', 'aviso'); return; }
+    var abiertos = creditosAbiertos();
+    if (!abiertos.length) { toast('No hay créditos con saldo para cobrar.', 'aviso'); return; }
+    var cliente = c0 ? c0.codigoCliente : (op.cliente || '');
+    if (cliente && !creditosAbiertos(cliente).length) { toast('Esta clienta no tiene saldo pendiente.', 'aviso'); return; }
+    var porCliente = {}, clientes = [];
+    abiertos.forEach(function (c) {
+      if (!porCliente[c.codigoCliente]) { porCliente[c.codigoCliente] = { codigo: c.codigoCliente, nombre: c.cliente, saldo: 0 }; clientes.push(porCliente[c.codigoCliente]); }
+      porCliente[c.codigoCliente].saldo += c.saldo;
+    });
+    clientes.sort(function (a, b) { return a.nombre < b.nombre ? -1 : 1; });
+    var cuerpo = '<div class="form-grid">' +
+      campo('Clienta *', '<select name="cliente">' + opcion('', 'Seleccione…', !cliente) + clientes.map(function (c) {
+        return opcion(c.codigo, c.nombre + ' — saldo ' + gs(c.saldo), c.codigo === cliente);
+      }).join('') + '</select>', 'c-12') +
+      campo('Crédito *', '<select name="credito"></select>', 'c-12') +
+      '<div class="c-12" id="cobro-ficha"></div>' +
+      campo('Monto cobrado (Gs.) *', inputGs('monto', ''), 'c-4') +
+      campo('Fecha del cobro *', '<input type="date" name="fecha" value="' + esc(d.hoy) + '" max="' + esc(d.hoy) + '">', 'c-4') +
+      campo('Medio de pago *', '<select name="medio">' + K().medios.map(function (m) { return opcion(m, m, m === 'EFECTIVO'); }).join('') + '</select>', 'c-4') +
+      '<div class="campo c-6" id="cobro-recibo"><label>N° de recibo *</label><input name="recibo" maxlength="30" value="' + esc(K().siguienteRecibo) +
+      '"><span class="ayuda">Sugerido: el siguiente número libre (vale el del talonario).</span></div>' +
+      '<div class="campo c-6" id="cobro-op" hidden><label>N° de operación / referencia *</label><input name="operacion" maxlength="40" placeholder="Del comprobante de la transferencia, QR o POS"></div>' +
+      '<div class="c-12" id="cobro-mora" hidden><label class="check"><input type="checkbox" name="mora"> Es un cobro de recargo por mora (no descuenta del saldo)</label></div>' +
+      campo('Nota', '<input name="nota" maxlength="200">', 'c-12') +
+      '<div class="c-12"><p class="ficha" id="cobro-aplicacion"></p></div></div>';
+    var st = { cliente: null, credito: null, auto: '' };
+    abrirModal({
+      titulo: 'Registrar cobro', ancho: true, cuerpo: cuerpo, aceptar: 'Registrar cobro',
+      alCambiar: function (form) { actualizarCobro(form, st, c0); },
+      alAceptar: function (f, id) {
+        var cr = buscarCredito(f.credito);
+        requerir(cr, 'Elija la clienta y el crédito.');
+        var monto = enteroDe(f.monto);
+        var mora = f.mora === true;
+        requerir(monto > 0, 'FALTA MONTO del cobro.');
+        requerir(mora || monto <= cr.saldo, 'PAGO MAYOR AL SALDO: el saldo del crédito es ' + gs(cr.saldo) + '.');
+        requerir(f.fecha, 'FALTA FECHA del cobro.');
+        var efectivo = f.medio === 'EFECTIVO';
+        requerir(!efectivo || f.recibo, 'FALTA N° DE RECIBO (cobro en efectivo).');
+        requerir(efectivo || f.operacion, 'FALTA N° DE OPERACIÓN.');
+        return api('registrarCobro', {
+          credito: cr.id, fecha: f.fecha, monto: monto, medio: f.medio, recibo: efectivo ? f.recibo : '', operacion: efectivo ? '' : f.operacion,
+          nota: f.nota, concepto: mora ? P().P_CONC_MORA : '',
+        }, id);
+      },
+    });
+    var form = $('#modal-form');
+    if (form && cliente) form.elements.monto.focus();
+  }
+  function actualizarCobro(form, st, c0) {
+    var el = form.elements;
+    var cli = el.cliente.value;
+    if (cli !== st.cliente) {
+      st.cliente = cli;
+      var lista = cli ? creditosAbiertos(cli) : [];
+      var elegido = c0 && c0.codigoCliente === cli ? c0.id : (lista.length ? lista[0].id : '');
+      el.credito.innerHTML = lista.length ? lista.map(function (c) {
+        return opcion(c.id, c.id + ' · ' + origenTexto(c) + ' · saldo ' + gs(c.saldo) + (c.atraso ? ' · ' + c.atraso + ' d de atraso' : '') +
+          (c.estado === 'A CONFIRMAR' ? ' · plan a confirmar' : ''), c.id === elegido);
+      }).join('') : opcion('', '—', true);
+      el.credito.disabled = !lista.length;
+      st.credito = null;
+    }
+    var cr = buscarCredito(el.credito.value);
+    if (st.credito !== el.credito.value) {
+      st.credito = el.credito.value;
+      var sugerido = cr ? (cr.vencido > 0 ? cr.vencido : (cr.aCobrar || cr.saldo)) : 0;
+      if (!el.monto.value || el.monto.value === st.auto) {
+        st.auto = sugerido ? miles(sugerido) : '';
+        el.monto.value = st.auto;
+      }
+      $('#cobro-ficha').innerHTML = cr ? fichaCredito(cr) : '';
+      var bm = $('#cobro-mora');
+      bm.hidden = !(cr && cr.moraCobrable);
+      if (bm.hidden) el.mora.checked = false;
+    }
+    var efectivo = el.medio.value === 'EFECTIVO';
+    $('#cobro-recibo').hidden = !efectivo;
+    $('#cobro-op').hidden = efectivo;
+    var ap = $('#cobro-aplicacion');
+    var monto = enteroDe(el.monto.value);
+    if (!cr) { ap.textContent = 'Elija la clienta y el crédito.'; return; }
+    if (el.mora.checked) {
+      ap.innerHTML = 'Recargo por mora: no descuenta del saldo (' + gs(cr.saldo) + ').' + (cr.moraSugerida ? ' Calculado a hoy: ' + gs(cr.moraSugerida) + '.' : '');
+      return;
+    }
+    if (!(monto > 0)) { ap.textContent = 'Ingrese el monto cobrado.'; return; }
+    if (monto > cr.saldo) { ap.innerHTML = '<span class="negativo">PAGO MAYOR AL SALDO: el saldo del crédito es ' + gs(cr.saldo) + '.</span>'; return; }
+    var sim = simularCascada(cr, monto);
+    ap.innerHTML = 'Se aplicará: <strong>' + esc(sim.partes.join(' · ')) + '</strong>. Saldo después: <strong>' + gs(sim.saldoDespues) + '</strong>' +
+      (sim.saldoDespues <= 0 ? ' — cancela el crédito.' : '.') + ' Queda pendiente de conciliar con ' + (efectivo ? 'el arqueo de caja.' : 'el extracto.');
+  }
+  function modalAnularCobro(id) {
+    var c = K().cobros.filter(function (x) { return x.id === id; })[0];
+    if (!c) return;
+    abrirModal({
+      titulo: 'Anular cobro ' + c.id, peligro: true, aceptar: 'Anular cobro',
+      cuerpo: '<p class="ficha"><strong>' + esc(c.cliente) + '</strong> · ' + fecha(c.fecha) + ' · ' + gs(c.monto) + ' (' + esc(minus(c.medio)) +
+        (c.recibo ? ', recibo ' + esc(c.recibo) : '') + (c.operacion ? ', op. ' + esc(c.operacion) : '') + ').<br>El cobro no se borra: queda anulado y el saldo, las cuotas y el estado de la venta se recalculan solos.' +
+        (c.conciliado ? '<br><strong>Atención: ya está conciliado con el extracto o el arqueo.</strong>' : '') + '</p>' +
+        campo('Motivo de la anulación *', '<textarea name="motivo" maxlength="200" placeholder="Ej.: transferencia rechazada, error de carga"></textarea>', 'c-12 mt'),
+      alAceptar: function (f, idm) {
+        requerir(f.motivo.length >= 3, 'Escriba el motivo de la anulación.');
+        return api('anularCobro', { id: c.id, motivo: f.motivo }, idm);
+      },
+    });
+  }
+
+  // ═════════════ Estado de cuenta (R0.6): el MISMO documento en pantalla, impreso en A4 y en PDF ═════════════
+  function estilosDocumento(css) {
+    var el = document.getElementById('ec-css');
+    if (!el) { el = document.createElement('style'); el.id = 'ec-css'; document.head.appendChild(el); }
+    if (el.textContent !== css) el.textContent = css;
+  }
+  function imprimirDocumento(cuerpo, titulo) {
+    var z = document.getElementById('zona-impresion');
+    if (!z) { z = document.createElement('div'); z.id = 'zona-impresion'; document.body.appendChild(z); }
+    z.innerHTML = cuerpo;
+    var anterior = document.title;
+    if (titulo) document.title = titulo;
+    document.body.classList.add('imprimiendo');
+    var fin = function () { document.body.classList.remove('imprimiendo'); document.title = anterior; window.removeEventListener('afterprint', fin); };
+    window.addEventListener('afterprint', fin);
+    try {
+      window.print();
+    } catch (e) {
+      fin();
+      toast('El navegador no permitió imprimir desde la aplicación: use «Exportar PDF».', 'aviso', 9000);
+    }
+  }
+  function abrirFicha(codigo) {
+    if (!codigo) return;
+    api('obtenerFichaCliente', { codigo: codigo }).then(function (r) {
+      var f = r.ficha, cli = f.cliente, res = f.resumen, admin = esAdmin();
+      C.ficha = { codigo: codigo, html: r.html };
+      if (r.html) estilosDocumento(r.html.css);
+      var html = '<div class="datos-clienta">' + dato('Categoría', cli.categoria || 'Sin categoría') + dato('Límite', cli.limite !== '' ? gs(cli.limite) : '—') +
+        dato('Saldo', gs(res.saldo)) + dato('Vencido', gs(res.vencido)) + dato('Atraso', res.atraso ? plural(res.atraso, 'día', 'días') : 'Sin atraso') +
+        dato('Estado', badgeEstado(cli.estado), true) + '</div>';
+      if (admin && cli.sugerencia && cli.sugerencia !== 'MANTENER') html += aviso('Sugerencia de categoría: ' + minus(cli.sugerencia) + ' (no se aplica sola).');
+      if (res.aConfirmar) html += aviso(plural(res.aConfirmar, 'saldo con plan A CONFIRMAR', 'saldos con plan A CONFIRMAR') + ': no generan cuotas ni atraso hasta confirmar el plan.');
+      html += '<div class="chips">' + (res.saldo > 0 ? boton('Registrar cobro', 'cobro', attr('cliente', cli.codigo), 'btn') : '') +
+        (r.html ? boton('Imprimir (A4)', 'imprimir-ficha', '', 'btn btn-sec') + boton('Exportar PDF', 'pdf-ficha', attr('codigo', cli.codigo), 'btn btn-sec') : '') +
+        (admin ? boton('Categoría', 'categoria', attr('codigo', cli.codigo), 'btn btn-sec') : '') +
+        (cli.hoja === 'peluquerias' ? boton('Editar datos', 'editar-peluqueria', attr('codigo', cli.codigo), 'btn btn-sec') : '') + '</div>' +
+        '<p class="ayuda" id="ficha-pdf"></p>';
+      html += r.html ? '<div class="ec-marco">' + r.html.cuerpo + '</div>' : aviso('No se pudo armar el documento del estado de cuenta (falta Reportes.gs en el servidor).', 'grave');
+      abrirModal({ titulo: 'Estado de cuenta · ' + cli.nombre, cuerpo: html, soloCerrar: true, ancho: true });
+    }).catch(fallo);
+  }
+  function exportarFicha(el) {
+    var codigo = el.getAttribute('data-codigo');
+    conBoton(el, 'Generando PDF…', function () { return api('exportarEstadoCuenta', { codigo: codigo }); }).then(function (r) {
+      toast(r.mensaje, 'ok', 9000);
+      var p = $('#ficha-pdf');
+      if (p && r.url) p.innerHTML = 'PDF listo: <a href="' + esc(r.url) + '" target="_blank" rel="noopener">abrir «' + esc(r.nombre) + '»</a> (Drive › Distribuidora MB › Exportaciones).';
+    }).catch(fallo);
+  }
+
+  // ═════════════ Categoría, saldo histórico, plan de pagos y cobros a confirmar (administradoras) ═════════════
+  function modalCategoria(codigo) {
+    var c = clienta(codigo);
+    if (!c) return;
+    var actual = categoria(c.categoria) ? categoria(c.categoria).nombre : 'SIN CATEGORÍA';
+    var filas = K().categorias.map(function (x) {
+      return '<tr><td><label class="check"><input type="radio" name="categoria" value="' + esc(x.nombre) + '"' + (x.nombre === actual ? ' checked' : '') + '> <strong>' +
+        esc(x.nombre) + '</strong></label></td><td class="num">' + gs(x.limite) + '</td><td class="num">' + porc(x.entrega) + '</td><td class="num">' + x.cuotas +
+        '</td><td>' + esc(x.frecuencias.map(minus).join(', ')) + '</td><td class="det ocultar-movil">' + esc(x.criterio || '') + '</td></tr>';
+    });
+    filas.push('<tr><td><label class="check"><input type="radio" name="categoria" value="SIN CATEGORÍA"' + (actual === 'SIN CATEGORÍA' ? ' checked' : '') +
+      '> Sin categoría</label></td><td colspan="5" class="det">No puede comprar a crédito.</td></tr>');
+    abrirModal({
+      titulo: 'Categoría de crédito · ' + c.nombre, ancho: true, aceptar: 'Guardar categoría',
+      cuerpo: (c.sugerencia && c.sugerencia !== 'MANTENER' ? aviso('Sugerencia del sistema: ' + minus(c.sugerencia) + '.') : '') +
+        '<p class="ficha">Saldo actual ' + gs(c.saldo || 0) + ' · atraso ' + plural(c.atraso || 0, 'día', 'días') + ' · la categoría define el límite, la entrega mínima, las cuotas y las frecuencias.</p><div class="mt">' +
+        tabla(['Categoría', ['Límite', 'num'], ['Entrega', 'num'], ['Cuotas', 'num'], 'Frecuencia', ['Quién entra', 'ocultar-movil']], filas, '') + '</div>',
+      alAceptar: function (f, id) {
+        var sel = $('#modal-form').querySelector('input[name=categoria]:checked');
+        requerir(sel, 'Elija una categoría.');
+        return api('guardarCategoriaCliente', { codigo: c.codigo, categoria: sel.value }, id);
+      },
+    });
+  }
+  function modalConfirmarSaldo(creditoId) {
+    var c = buscarCredito(creditoId);
+    if (!c) { toast('No se encontró el crédito ' + creditoId + '.', 'error'); return; }
+    var s = saldoInicialDe(c) || {};
+    abrirModal({
+      titulo: 'Confirmar saldo histórico · ' + c.cliente, aceptar: 'Guardar',
+      cuerpo: '<p class="ficha">Crédito <strong>' + esc(c.id) + '</strong>' + (c.legado ? ' (N° ' + esc(c.legado) + ' de las hojas manuscritas)' : '') +
+        ' · saldo según hoja <strong>' + gs(s.saldoHoja !== undefined && s.saldoHoja !== '' ? s.saldoHoja : c.subtotal) + '</strong> al ' + fecha(c.fecha) +
+        (c.cobrado ? ' · cobrado desde entonces ' + gs(c.cobrado) : '') + (s.lectura ? '<br>Lectura: ' + badgeEstado(s.lectura) : '') +
+        (s.detalle ? '<br>' + esc(s.detalle) : '') + (c.alertas ? '<br><span class="negativo">' + esc(c.alertas) + '</span>' : '') + '</p>' +
+        '<div class="form-grid mt">' +
+        campo('Resultado *', '<select name="estado">' + opcion('CONFIRMADO', 'La clienta confirma el saldo', true) + opcion('EN DISPUTA', 'La clienta no está de acuerdo (en disputa)', false) + '</select>', 'c-12') +
+        campo('Saldo confirmado al ' + fecha(c.fecha) + ' (Gs.) *', inputGs('saldo', s.saldoHoja !== undefined && s.saldoHoja !== '' ? s.saldoHoja : c.subtotal), 'c-6', 'Los cobros posteriores se descuentan solos.') +
+        campo('Observación', '<input name="observacion" maxlength="300" placeholder="Ej.: confirmado por WhatsApp el 12/10">', 'c-12') + '</div>',
+      alCambiar: function (form) { form.elements.saldo.disabled = form.elements.estado.value === 'EN DISPUTA'; },
+      alAceptar: function (f, id) {
+        var disputa = f.estado === 'EN DISPUTA';
+        var saldo = enteroDe(f.saldo);
+        requerir(disputa || saldo >= 0, 'Ingrese el saldo confirmado.');
+        return api('confirmarSaldoHistorico', { credito: c.id, estado: f.estado, saldo: disputa ? '' : saldo, observacion: f.observacion }, id);
+      },
+    });
+  }
+  function nSugerido(saldo, cat) {
+    var p = P(), min = Number(p.P_CUOTA_MIN) || 1;
+    var n = Math.max(1, Math.min(cat.cuotas, Number(p.P_MAX_CUOTAS) || 1, Math.floor(saldo / min) || 1));
+    while (n > 1 && estimarPlan({ fecha: D().hoy, subtotal: saldo, entrega: 0, cuotas: n, frecuencia: 'SEMANAL' }, cat).cuota < min) n--;
+    return n;
+  }
+  function modalConfirmarPlan(creditoId) {
+    var c = buscarCredito(creditoId);
+    if (!c) { toast('No se encontró el crédito ' + creditoId + '.', 'error'); return; }
+    if (c.cuotas && c.cuotas.length) { toast('El crédito ' + c.id + ' ya tiene plan de pagos.', 'aviso'); return; }
+    var cat = categoriaDeClienta(c.codigoCliente);
+    if (!cat) { toast('ASIGNAR CATEGORÍA A LA CLIENTA: «' + c.cliente + '» necesita una categoría (define cuotas y frecuencias).', 'aviso', 9000); modalCategoria(c.codigoCliente); return; }
+    var s = saldoInicialDe(c);
+    if (s && s.estado === 'EN DISPUTA') { toast('El saldo de ' + c.cliente + ' está EN DISPUTA: confírmelo antes de acordar el plan.', 'error', 9000); return; }
+    var p = P(), previo = c.origen === 'VIGENTE PREVIO';
+    var baseFecha = previo ? c.fecha : D().hoy;
+    var sugN = nSugerido(c.saldo, cat);
+    var opcN = '';
+    for (var n = 1; n <= (Number(p.P_MAX_CUOTAS) || 1); n++) opcN += opcion(n, n + (n === 1 ? ' pago' : ' cuotas') + (n > cat.cuotas ? ' (fuera de su categoría)' : ''), n === sugN);
+    abrirModal({
+      titulo: 'Plan de pagos · ' + c.cliente, ancho: true, aceptar: 'Confirmar plan',
+      cuerpo: '<p class="ficha">Crédito <strong>' + esc(c.id) + '</strong> · ' + esc(origenTexto(c)) + ' · ' + esc(minus(c.origen)) + ' · total ' + gs(c.subtotal) +
+        (c.cobrado > 0 ? ' · ya cobrado ' + gs(c.cobrado) + ' (se aplica primero a la entrega y a las primeras cuotas)' : '') + ' · saldo <strong>' + gs(c.saldo) + '</strong> · categoría ' + esc(cat.nombre) +
+        '<br>Plan contado desde el <strong>' + fecha(baseFecha) + '</strong> (' + (previo ? 'fecha de la venta: refleja lo acordado' : 'hoy: regularización') + ').' +
+        (c.planSugerido ? '<br><span class="det">' + esc(c.planSugerido) + '</span>' : '') + (c.alertas ? '<br><span class="negativo">' + esc(c.alertas) + '</span>' : '') + '</p>' +
+        '<div class="form-grid mt">' +
+        campo('Entrega (Gs.)', inputGs('entrega', ''), 'c-3', 'Opcional.') +
+        campo('Cuotas *', '<select name="cuotas">' + opcN + '</select>', 'c-3') +
+        campo('Frecuencia *', '<select name="frecuencia">' + ['SEMANAL', 'QUINCENAL', 'MENSUAL'].map(function (f) {
+          return opcion(f, frec(f, 0) + (frecuenciaPermitida(cat, f) ? '' : ' (requiere autorización)'), f === 'SEMANAL');
+        }).join('') + '</select>', 'c-3') +
+        campo('Primer vencimiento', '<input type="date" name="primerVto" min="' + esc(sumarDias(baseFecha, 1)) + '">', 'c-3', 'Vacío = automático.') +
+        '<div class="c-12"><label class="check"><input type="checkbox" name="moraPactada"> El plan firmado prevé recargo por mora</label></div>' +
+        '<div class="c-12"><p class="ficha" id="plan-estimado"></p></div>' +
+        '<div class="c-12" id="plan-autorizar" hidden><label class="check"><input type="checkbox" name="autorizar"> Autorizo la excepción de frecuencia (queda registrada con mi correo)</label></div>' +
+        '<div class="campo c-12" id="plan-motivo" hidden><label>Motivo de la excepción *</label><input name="motivoAutorizacion" maxlength="200"></div></div>',
+      alCambiar: function (form) {
+        var el = form.elements;
+        var e = estimarPlan({ fecha: baseFecha, subtotal: c.subtotal, entrega: enteroDe(el.entrega.value) || 0, cuotas: parseInt(el.cuotas.value, 10) || 1,
+          frecuencia: el.frecuencia.value, primerVto: el.primerVto.value }, cat);
+        var excepcion = !frecuenciaPermitida(cat, e.frecuencia);
+        $('#plan-autorizar').hidden = !excepcion;
+        $('#plan-motivo').hidden = !excepcion;
+        var avisos = [];
+        if (e.n > 1 && e.cuota < p.P_CUOTA_MIN) avisos.push('CUOTA MENOR A LA MÍNIMA (' + gs(p.P_CUOTA_MIN) + '): se rechazará.');
+        if (e.entrega > e.total) avisos.push('LA ENTREGA SUPERA EL TOTAL.');
+        if (excepcion) avisos.push('FRECUENCIA REQUIERE AUTORIZACIÓN: marque la casilla y escriba el motivo.');
+        if (previo && e.entrega < e.entregaMinima) avisos.push('Quedará la ALERTA «ENTREGA MENOR AL MÍNIMO» (mínima ' + gs(e.entregaMinima) + '): el crédito ya estaba otorgado, no se corrige.');
+        if (previo && e.n > cat.cuotas) avisos.push('Quedará la ALERTA «CUOTAS SOBRE EL MÁXIMO DE SU CATEGORÍA».');
+        $('#plan-estimado').innerHTML = esc('Estimado: ' + textoPlan(e) + (e.recargo ? ' El recargo se factura hoy como venta aparte (' + (p.P_COD_REC || 'REC-FIN') + ').' : '')) +
+          (avisos.length ? '<br><span class="negativo">' + esc(avisos.join(' ')) + '</span>' : '');
+      },
+      alAceptar: function (f, id) {
+        requerir(!f.autorizar || String(f.motivoAutorizacion || '').length >= 5, 'Escriba el motivo de la excepción (mínimo 5 letras).');
+        var entrega = enteroDe(f.entrega);
+        return api('confirmarPlanCredito', {
+          credito: c.id, cuotas: parseInt(f.cuotas, 10), frecuencia: f.frecuencia, primerVto: f.primerVto || '', entrega: isNaN(entrega) ? '' : entrega,
+          moraPactada: f.moraPactada === true, autorizar: f.autorizar === true, motivoAutorizacion: f.motivoAutorizacion || '',
+        }, id);
+      },
+    });
+  }
+  function modalCobroAConfirmar(id) {
+    var x = (K().cobrosConfirmar || []).filter(function (y) { return y.id === id; })[0];
+    if (!x) { toast('No se encontró el cobro a confirmar ' + id + '.', 'error'); return; }
+    var cr = buscarCredito(x.credito) || buscarCredito(x.venta);
+    abrirModal({
+      titulo: 'Cobro a confirmar ' + x.id + ' · ' + x.cliente, ancho: true, aceptar: 'Guardar',
+      cuerpo: '<p class="ficha">Mencionado en: ' + esc(x.fuente) + '<br>Monto informado: <strong>' + gs(x.monto) + '</strong>' + (cr ? ' · crédito ' + esc(cr.id) + ' (saldo ' + gs(cr.saldo) + ')' : '') +
+        '<br><span class="det">' + esc(x.observacion || '') + '</span></p>' +
+        '<div class="form-grid mt">' +
+        campo('¿Qué hacemos? *', '<select name="accion">' + opcion('registrar', 'Registrar el cobro con los datos confirmados', true) + opcion('descartar', 'Descartar (no hubo pago o ya está registrado)', false) + '</select>', 'c-12') +
+        '<div class="campo c-4 cc-reg"><label>Fecha real del pago *</label><input type="date" name="fecha" min="' + esc(cr ? cr.fecha : '') + '" max="' + esc(D().hoy) + '"></div>' +
+        '<div class="campo c-4 cc-reg"><label>Monto (Gs.) *</label>' + inputGs('monto', x.monto) + '</div>' +
+        '<div class="campo c-4 cc-reg"><label>Medio de pago *</label><select name="medio">' + K().medios.map(function (m) { return opcion(m, m, m === 'EFECTIVO'); }).join('') + '</select></div>' +
+        '<div class="campo c-6 cc-reg" id="cc-recibo"><label>N° de recibo *</label><input name="recibo" maxlength="30"></div>' +
+        '<div class="campo c-6 cc-reg" id="cc-op" hidden><label>N° de operación *</label><input name="operacion" maxlength="40"></div>' +
+        '<div class="campo c-12" id="cc-motivo" hidden><label>Motivo del descarte *</label><input name="motivo" maxlength="200"></div></div>',
+      alCambiar: function (form) {
+        var el = form.elements, reg = el.accion.value === 'registrar';
+        Array.prototype.forEach.call(form.querySelectorAll('.cc-reg'), function (n) { n.hidden = !reg; });
+        $('#cc-motivo').hidden = reg;
+        if (reg) { $('#cc-recibo').hidden = el.medio.value !== 'EFECTIVO'; $('#cc-op').hidden = el.medio.value === 'EFECTIVO'; }
+      },
+      alAceptar: function (f, idm) {
+        if (f.accion === 'descartar') {
+          requerir(String(f.motivo || '').length >= 5, 'Escriba por qué se descarta (mínimo 5 letras).');
+          return api('resolverCobroAConfirmar', { id: x.id, accion: 'descartar', motivo: f.motivo }, idm);
+        }
+        requerir(f.fecha, 'FALTA FECHA: confirme la fecha real del pago con la clienta o el comprobante.');
+        var monto = enteroDe(f.monto);
+        requerir(monto > 0, 'FALTA MONTO.');
+        var efectivo = f.medio === 'EFECTIVO';
+        requerir(!efectivo || f.recibo, 'FALTA N° DE RECIBO.');
+        requerir(efectivo || f.operacion, 'FALTA N° DE OPERACIÓN.');
+        return api('resolverCobroAConfirmar', { id: x.id, accion: 'registrar', fecha: f.fecha, monto: monto, medio: f.medio,
+          recibo: efectivo ? f.recibo : '', operacion: efectivo ? '' : f.operacion }, idm);
+      },
+    });
+  }
+
+  // ═════════════ Vista: Cartera ═════════════
+  function contarPendientes() {
+    if (!hayCartera()) return 0;
+    var k = K();
+    return (k.cobrosConfirmar || []).length + k.creditos.filter(function (c) { return c.estado === 'A CONFIRMAR'; }).length;
+  }
+  function vCartera() {
+    if (!hayCartera()) return cabecera('Cartera', 'Créditos y cobranzas') + '<div class="vacio">El módulo de cartera todavía no está instalado en el servidor (Fase 2).</div>';
+    var k = K(), admin = esAdmin();
+    var vencidos = k.creditos.filter(function (c) { return c.vencido > 0; }).length;
+    var opciones = [['clientas', 'Clientas'], ['creditos', 'Créditos', vencidos || ''], ['cobros', 'Cobros']];
+    if (admin) opciones.push(['pendientes', 'Pendientes', contarPendientes() || ''], ['cierre', 'Cierre del mes']);
+    if (!admin && (S.sub.cartera === 'pendientes' || S.sub.cartera === 'cierre')) S.sub.cartera = 'clientas';
+    var html = cabecera('Cartera', 'Créditos y cobranzas · al ' + fecha(k.hoy), boton('Registrar cobro', 'cobro', '', 'btn'));
+    if ((P().faltan || []).length) html += aviso('Faltan parámetros de crédito: ' + P().faltan.join(', ') + '. Sin ellos no se pueden calcular planes (Sistema › Parámetros).', 'grave');
+    html += subtabs('cartera', opciones);
+    var sub = S.sub.cartera;
+    if (sub === 'creditos') return html + vCreditos();
+    if (sub === 'cobros') return html + vCobros();
+    if (sub === 'pendientes') return html + vPendientes();
+    if (sub === 'cierre') return html + vCierre();
+    return html + vClientas();
+  }
+  function tramos(antiguedad) {
+    return '<div class="tramos">' + antiguedad.map(function (t, i) {
+      return '<div class="tramo t' + i + '"><p class="tramo-etq">' + esc(t.tramo) + '</p><p class="tramo-val">' + gs(t.saldo) + '</p><p class="tramo-det">' +
+        plural(t.n, 'crédito', 'créditos') + (t.saldo ? ' · ' + porc(t.pct) : '') + (t.vencido ? ' · vencido ' + gs(t.vencido) : '') + '</p></div>';
+    }).join('') + '</div>';
+  }
+  function vClientas() {
+    var k = K(), t = k.totales, admin = esAdmin(), p = P();
+    var html = '<div class="kpis kpis-4">' +
+      kpi('Cartera total', gs(t.cartera), plural(t.creditosConSaldo, 'crédito con saldo', 'créditos con saldo')) +
+      kpi('Vencido', gs(t.vencido), t.cartera ? porc(t.vencido / t.cartera) + ' de la cartera (más de ' + plural(p.P_GRACIA || 0, 'día', 'días') + ' de gracia)' : 'Sin cartera', t.vencido > 0 ? 'error' : '') +
+      kpi('Bloqueadas', miles(t.BLOQUEADA || 0), (t['EXCEDE LÍMITE'] || 0) + ' exceden el límite · ' + (t['ASIGNAR CATEGORÍA'] || 0) + ' sin categoría', t.BLOQUEADA ? 'error' : '') +
+      (admin ? kpi('Cobros por conciliar', gs(t.porConciliar), plural(t.porConciliarN, 'cobro', 'cobros') + ' sin cruzar con el extracto o el arqueo', t.porConciliarN ? 'alerta' : '')
+        : kpi('Plan a confirmar', gs(t.aConfirmar), plural(t.aConfirmarN, 'saldo sin cuotas', 'saldos sin cuotas'))) + '</div>';
+    html += '<p class="eyebrow mt-l">Antigüedad de la cartera (días de atraso)</p><div class="mt">' + tramos(k.antiguedad) + '</div>';
+    if (k.top10 && k.top10.length) {
+      html += '<section class="panel mt"><div class="panel-cab"><h2>Mayores montos vencidos</h2></div>' + tabla(['Clienta', ['Vencido', 'num'], ['Atraso', 'num ocultar-movil'], 'Estado', ''], k.top10.map(function (x) {
+        return '<tr><td><div class="fuerte">' + esc(x.nombre) + '</div><div class="det">' + esc(x.codigo) + ' · saldo ' + gs(x.saldo) + '</div></td><td class="num negativo">' + gs(x.vencido) +
+          '</td><td class="num ocultar-movil">' + plural(x.atraso, 'día', 'días') + '</td><td>' + badgeEstado(x.estado) + '</td><td class="acciones">' +
+          (x.whatsapp ? '<a class="btn-link" href="https://wa.me/' + esc(x.whatsapp) + '" target="_blank" rel="noopener">WhatsApp</a>' : '<span class="det">sin WhatsApp</span>') +
+          boton('Cobrar', 'cobro', attr('cliente', x.codigo)) + '</td></tr>';
+      }), '') + '</section>';
+    }
+    html += '<div class="barra-herr mt-l"><input type="search" placeholder="Buscar clienta, código, alias o código legado" value="' + esc(C.q) + '" data-al-escribir="cartera-buscar" autocomplete="off">' +
+      '<div style="min-width:200px"><select data-al-cambiar="cartera-filtro" aria-label="Filtrar clientas">' +
+      [['saldo', 'Con saldo'], ['vencidas', 'Con vencido'], ['bloqueadas', 'Bloqueadas'], ['excede', 'Exceden el límite'], ['sincat', 'Sin categoría'], ['aconfirmar', 'Con plan a confirmar'], ['todas', 'Todas']]
+        .map(function (o) { return opcion(o[0], o[1], C.filtro === o[0]); }).join('') + '</select></div></div>';
+    return html + '<div id="cartera-tabla">' + tablaClientas() + '</div>' +
+      '<p class="nota-pie">Estados como en la planilla: habilitada · sin deuda · asignar categoría · excede límite · bloqueada (más de ' + plural(p.P_DIAS_BLOQUEO || 0, 'día', 'días') +
+      ' de atraso: no se le vende a crédito). Los saldos se calculan siempre desde «Cobros»; los saldos con plan A CONFIRMAR no generan atraso.</p>';
+  }
+  function proximoPorClienta() {
+    var r = {};
+    K().creditos.forEach(function (c) {
+      if (!(c.saldo > 0) || !c.proximoVto) return;
+      if (!r[c.codigoCliente] || c.proximoVto < r[c.codigoCliente].vto) r[c.codigoCliente] = { vto: c.proximoVto, monto: c.aCobrar };
+    });
+    return r;
+  }
+  function tablaClientas() {
+    var q = norm(C.q).trim(), admin = esAdmin(), prox = proximoPorClienta();
+    var lista = K().clientes.filter(function (x) {
+      if (C.filtro === 'saldo' && !(x.saldo > 0)) return false;
+      if (C.filtro === 'vencidas' && !(x.vencido > 0)) return false;
+      if (C.filtro === 'bloqueadas' && x.estado !== 'BLOQUEADA') return false;
+      if (C.filtro === 'excede' && x.estado !== 'EXCEDE LÍMITE') return false;
+      if (C.filtro === 'sincat' && (categoria(x.categoria) || !x.activo)) return false;
+      if (C.filtro === 'aconfirmar' && !(x.aConfirmar > 0)) return false;
+      if (!q) return true;
+      return norm([x.codigo, x.nombre, x.contacto, x.legado, x.alias, x.categoria].join(' ')).indexOf(q) >= 0;
+    });
+    var tot = { saldo: 0, vencido: 0 };
+    var filas = lista.map(function (x) {
+      tot.saldo += x.saldo; tot.vencido += x.vencido;
+      var pr = prox[x.codigo];
+      return '<tr class="' + (x.activo ? '' : 'fila-anulada') + '"><td><div class="fuerte">' + esc(x.nombre) + '</div><div class="det">' +
+        esc([x.codigo, x.legado ? 'legado ' + x.legado : '', categoria(x.categoria) ? 'cat. ' + x.categoria : 'sin categoría', x.aConfirmar ? 'plan a confirmar' : ''].filter(String).join(' · ')) +
+        '</div><div class="solo-movil">' + badgeEstado(x.estado) + (x.vencido > 0 ? ' <span class="det negativo">vencido ' + gs(x.vencido) + '</span>' : '') +
+        '</div></td><td class="ocultar-movil">' + badgeEstado(x.estado) + (admin && x.sugerencia && x.sugerencia !== 'MANTENER' ? '<div class="det">' + esc(minus(x.sugerencia)) + '</div>' : '') +
+        '</td><td class="num">' + gs(x.saldo) + '</td><td class="num ocultar-movil">' + (x.vencido > 0 ? '<span class="negativo">' + gs(x.vencido) + '</span>' : '—') + '</td>' +
+        '<td class="num ocultar-movil">' + (x.atraso ? plural(x.atraso, 'día', 'días') : '—') + '</td>' +
+        '<td class="ocultar-movil">' + (pr ? fecha(pr.vto) + '<div class="det">' + gs(pr.monto) + '</div>' : '—') + '</td>' +
+        '<td class="num ocultar-movil">' + (x.limite !== '' ? gs(x.disponible) : '—') + '</td>' +
+        '<td class="acciones">' + boton('Estado de cuenta', 'ficha', attr('codigo', x.codigo)) + (x.saldo > 0 ? boton('Cobrar', 'cobro', attr('cliente', x.codigo)) : '') +
+        (admin ? boton('Categoría', 'categoria', attr('codigo', x.codigo)) : '') + '</td></tr>';
+    });
+    var pie = filas.length ? '<tfoot><tr><td>' + plural(filas.length, 'clienta', 'clientas') + '</td><td class="ocultar-movil"></td><td class="num">' + gs(tot.saldo) + '</td><td class="num ocultar-movil">' + gs(tot.vencido) +
+      '</td><td class="ocultar-movil"></td><td class="ocultar-movil"></td><td class="ocultar-movil"></td><td></td></tr></tfoot>' : '';
+    return '<div class="tabla-plegable">' + tabla(['Clienta', ['Estado', 'ocultar-movil'], ['Saldo', 'num'], ['Vencido', 'num ocultar-movil'], ['Atraso', 'num ocultar-movil'], ['Próx. vto.', 'ocultar-movil'],
+      ['Disponible', 'num ocultar-movil'], ''], filas, 'Ninguna clienta coincide con el filtro.', pie) + '</div>';
+  }
+  function vCreditos() {
+    return '<div class="barra-herr"><input type="search" placeholder="Buscar crédito, venta, N° legado o clienta" value="' + esc(C.qCred) + '" data-al-escribir="cred-buscar" autocomplete="off">' +
+      '<div style="min-width:200px"><select data-al-cambiar="cred-filtro" aria-label="Filtrar créditos">' +
+      [['abiertos', 'Con saldo'], ['vencidos', 'Con vencido'], ['aconfirmar', 'Plan a confirmar'], ['cancelados', 'Cancelados (últimos 120 días)'], ['todos', 'Todos']]
+        .map(function (o) { return opcion(o[0], o[1], C.filtroCred === o[0]); }).join('') + '</select></div></div>' +
+      '<div id="cred-tabla">' + tablaCreditos() + '</div>' +
+      '<p class="nota-pie">Los cobros se aplican primero a la entrega y después a la cuota más antigua. Atraso = días desde el vencimiento impago más antiguo; vencido = lo impago con más de ' +
+      plural(P().P_GRACIA || 0, 'día', 'días') + ' de gracia.</p>';
+  }
+  function tablaCreditos() {
+    var q = norm(C.qCred).trim(), admin = esAdmin();
+    var lista = K().creditos.filter(function (c) {
+      if (C.filtroCred === 'abiertos' && !(c.saldo > 0)) return false;
+      if (C.filtroCred === 'vencidos' && !(c.vencido > 0)) return false;
+      if (C.filtroCred === 'aconfirmar' && c.estado !== 'A CONFIRMAR') return false;
+      if (C.filtroCred === 'cancelados' && c.saldo > 0) return false;
+      if (!q) return true;
+      return norm([c.id, c.venta, c.legado, c.cliente, c.codigoCliente].join(' ')).indexOf(q) >= 0;
+    });
+    var filas = [];
+    lista.forEach(function (c) {
+      var abierto = !!C.abiertos[c.id];
+      var aConfirmar = c.estado === 'A CONFIRMAR';
+      var s = aConfirmar && c.origen === 'HISTÓRICO' ? saldoInicialDe(c) : null;
+      filas.push('<tr><td class="ocultar-movil"><div class="fuerte">' + esc(c.id) + '</div><div class="det">' + esc(origenTexto(c)) + '</div></td>' +
+        '<td><div class="fuerte">' + esc(c.cliente) + '</div><div class="det">' + fecha(c.fecha) + ' · ' + esc(minus(c.origen)) + (c.categoria ? ' · cat. ' + esc(c.categoria) : '') + '</div>' +
+        '<div class="det solo-movil">' + esc(c.id + ' · ' + origenTexto(c)) + '</div></td>' +
+        '<td class="ocultar-movil">' + esc(resumenPlanTexto(c)) + (c.alertas ? '<div class="det negativo">Con alertas</div>' : '') + '</td>' +
+        '<td class="num">' + gs(c.saldo) + '<div class="det">de ' + gs(c.total) + '</div>' + (c.vencido > 0 ? '<div class="det negativo">vencido ' + gs(c.vencido) + '</div>' : '') + '</td>' +
+        '<td>' + badgeEstado(c.estado) + (c.atraso ? '<div class="det">' + plural(c.atraso, 'día', 'días') + '</div>' : '') + (c.cobradoDeMas ? '<div class="det negativo">COBRADO DE MÁS: REVISAR</div>' : '') +
+        (s && s.estado ? '<div class="det">saldo ' + esc(minus(s.estado)) + '</div>' : '') + '</td>' +
+        '<td class="ocultar-movil">' + (c.proximoVto ? fecha(c.proximoVto) + '<div class="det">' + gs(c.aCobrar) + '</div>' : '—') + '</td>' +
+        '<td class="acciones">' + boton(abierto ? 'Ocultar' : (c.cuotas.length ? 'Cuotas' : 'Detalle'), 'ver-cuotas', attr('id', c.id)) +
+        (c.saldo > 0 ? boton('Cobrar', 'cobro', attr('credito', c.id)) : '') +
+        (admin && aConfirmar && c.origen === 'HISTÓRICO' && (!s || s.estado !== 'CONFIRMADO') ? boton('Confirmar saldo', 'confirmar-saldo', attr('credito', c.id)) : '') +
+        (admin && aConfirmar ? boton('Plan de pagos', 'confirmar-plan', attr('credito', c.id)) : '') + '</td></tr>');
+      if (abierto) {
+        filas.push('<tr class="fila-detalle"><td colspan="7">' + (c.cuotas.length ? tabla(['Pago', 'Vence', ['Monto', 'num'], ['Pagado', 'num'], 'Estado'], c.cuotas.map(function (x) {
+          return '<tr><td>' + (x.n === 0 ? 'Entrega' : 'Cuota ' + x.n) + '</td><td>' + fecha(x.vto) + '</td><td class="num">' + gs(x.monto) + '</td><td class="num">' + gs(x.pagado) +
+            '</td><td>' + badgeEstado(x.estado) + '</td></tr>';
+        }), '') : '<p class="det">' + esc(lineaCuotas(c)) + '</p>') +
+          (c.planSugerido ? '<p class="det mt">' + esc(c.planSugerido) + '</p>' : '') + (c.alertas ? '<p class="det negativo mt">' + esc(c.alertas) + '</p>' : '') +
+          (c.autorizadoPor ? '<p class="det mt">Excepción autorizada por ' + esc(c.autorizadoPor) + '</p>' : '') +
+          (c.observacion ? '<p class="det mt">' + esc(c.observacion) + '</p>' : '') + '</td></tr>');
+      }
+    });
+    return '<div class="tabla-plegable">' + tabla([['Crédito', 'ocultar-movil'], 'Clienta', ['Plan', 'ocultar-movil'], ['Saldo', 'num'], 'Estado', ['Próx. vto.', 'ocultar-movil'], ''],
+      filas, 'No hay créditos para mostrar.') + '</div>';
+  }
+  function vCobros() {
+    var admin = esAdmin();
+    var html = '<div class="barra-herr"><input type="search" placeholder="Buscar cobro, recibo, operación o clienta" value="' + esc(C.qCob) + '" data-al-escribir="cob-buscar" autocomplete="off">' +
+      '<div style="min-width:200px"><select data-al-cambiar="cob-filtro" aria-label="Filtrar cobros">' +
+      [['todos', 'Últimos 120 días'], ['sinconciliar', 'Pendientes de conciliar'], ['conciliados', 'Conciliados'], ['anulados', 'Anulados']]
+        .map(function (o) { return opcion(o[0], o[1], C.filtroCob === o[0]); }).join('') + '</select></div>' +
+      (admin ? boton('Seleccionar pendientes de conciliar', 'sel-sin-conciliar', '', 'btn btn-sec') : '') + '</div>';
+    html += '<div id="cob-tabla">' + tablaCobros() + '</div>';
+    if (admin) html += '<div id="barra-conc-cont">' + barraConciliacion() + '</div>';
+    return html + '<p class="nota-pie">Un cobro nunca se borra: una administradora lo anula con motivo y la aplicación a las cuotas se recalcula sola. ' +
+      'Cada cobro queda PENDIENTE DE CONCILIAR hasta cruzarlo con el arqueo de caja (efectivo) o el extracto (transferencia, QR, tarjeta).</p>';
+  }
+  function cobrosFiltrados() {
+    var q = norm(C.qCob).trim();
+    return K().cobros.filter(function (c) {
+      if (C.filtroCob === 'sinconciliar' && (c.conciliado || c.anulado)) return false;
+      if (C.filtroCob === 'conciliados' && !c.conciliado) return false;
+      if (C.filtroCob === 'anulados' && !c.anulado) return false;
+      if (!q) return true;
+      return norm([c.id, c.recibo, c.operacion, c.cliente, c.credito, c.venta, c.medio].join(' ')).indexOf(q) >= 0;
+    });
+  }
+  function tablaCobros() {
+    var admin = esAdmin();
+    var filas = cobrosFiltrados().map(function (c) {
+      return '<tr class="' + (c.anulado ? 'fila-anulada' : '') + '">' +
+        (admin ? '<td class="sel-col">' + (c.anulado ? '' : '<input type="checkbox" data-al-cambiar="sel-cobro"' + attr('id', c.id) + (C.sel[c.id] ? ' checked' : '') +
+          ' aria-label="Seleccionar ' + esc(c.id) + '">') + '</td>' : '') +
+        '<td class="ocultar-movil">' + fecha(c.fecha) + '<div class="det cod">' + esc(c.id) + '</div></td>' +
+        '<td><div class="fuerte">' + esc(c.cliente) + '</div><div class="det">' + esc(c.credito) + ' · ' + esc(minus(c.concepto)) + '</div>' +
+        '<div class="det solo-movil">' + esc(fecha(c.fecha) + ' · ' + minus(c.medio) + (c.recibo ? ' · recibo ' + c.recibo : (c.operacion ? ' · op. ' + c.operacion : ''))) + '</div></td>' +
+        '<td class="ocultar-movil">' + esc(c.medio) + '<div class="det">' + esc(c.recibo ? 'recibo ' + c.recibo : (c.operacion ? 'op. ' + c.operacion : '')) + '</div></td>' +
+        '<td class="num">' + gs(c.monto) + '</td>' +
+        '<td class="det ocultar-movil">' + esc(c.aplicacion || '') + (c.anulado && c.motivoAnulacion ? '<div>Motivo: ' + esc(c.motivoAnulacion) + '</div>' : '') + '</td>' +
+        '<td>' + badgeEstado(c.control) + (c.conciliado && c.fechaConciliacion ? '<div class="det">' + fecha(c.fechaConciliacion) + '</div>' : '') + '</td>' +
+        '<td class="acciones">' + (admin && !c.anulado ? boton('Anular', 'anular-cobro', attr('id', c.id), 'btn-link peligro') : '') + '</td></tr>';
+    });
+    var cols = (admin ? [['', 'sel-col']] : []).concat([['Fecha', 'ocultar-movil'], 'Clienta', ['Medio', 'ocultar-movil'], ['Monto', 'num'], ['Aplicación', 'ocultar-movil'], 'Control', '']);
+    return '<div class="tabla-plegable">' + tabla(cols, filas, 'No hay cobros para mostrar.') + '</div>';
+  }
+  function barraConciliacion() {
+    var lista = K().cobros.filter(function (c) { return C.sel[c.id] && !c.anulado; });
+    if (!lista.length) return '';
+    var total = lista.reduce(function (t, c) { return t + c.monto; }, 0);
+    return '<div class="barra-sel"><span>' + plural(lista.length, 'cobro seleccionado', 'cobros seleccionados') + ' · ' + gs(total) + '</span>' +
+      '<label>al <input type="date" id="conc-fecha" value="' + esc(C.fechaConc || D().hoy) + '" max="' + esc(D().hoy) + '" data-al-cambiar="conc-fecha"></label>' +
+      boton('Conciliar', 'conciliar', '', 'btn') + boton('Marcar pendiente', 'desconciliar', '', 'btn btn-sec') + boton('Quitar selección', 'limpiar-sel', '', 'btn btn-sec') + '</div>';
+  }
+  function refrescarBarra() {
+    var b = $('#barra-conc-cont');
+    if (b) b.innerHTML = barraConciliacion();
+  }
+  function conciliar(el, accion) {
+    var ids = Object.keys(C.sel).filter(function (k) { return C.sel[k]; });
+    if (!ids.length) return;
+    var f = $('#conc-fecha');
+    conBoton(el, accion === 'desconciliar' ? 'Guardando…' : 'Conciliando…', function () {
+      return api('conciliarCobros', { ids: ids, fecha: f ? f.value : D().hoy, accion: accion }, uid());
+    }).then(function (r) { C.sel = {}; MB.aplicar(r); }).catch(fallo);
+  }
+
+  // ═════════════ Pendientes de la cartera (administradoras): nada se completa con supuestos ═════════════
+  function grupo(clave, titulo, texto, columnas, filas) {
+    if (!filas.length) return '';
+    var limite = 10, todas = !!C.verTodo[clave];
+    return '<section class="panel mt"><div class="panel-cab"><h2>' + esc(titulo) + ' <span class="contador">' + filas.length + '</span></h2>' +
+      (filas.length > limite ? boton(todas ? 'Ver menos' : 'Ver todas', 'ver-todo', attr('clave', clave)) : '') + '</div>' +
+      (texto ? '<p class="ayuda" style="margin:-4px 0 12px">' + esc(texto) + '</p>' : '') + tabla(columnas, todas ? filas : filas.slice(0, limite), '') + '</section>';
+  }
+  function vPendientes() {
+    var k = K(), saldos = k.saldosIniciales || [];
+    var html = '';
+    var migrada = saldos.length > 0 || k.creditos.some(function (c) { return c.origen === 'HISTÓRICO'; });
+    if (!migrada) {
+      html += '<section class="panel"><div class="panel-cab"><h2>Migración de la cartera histórica pendiente</h2>' + boton('Ir a Sistema › Migración', 'ir', attr('destino', 'sistema:migracion'), 'btn') + '</div>' +
+        '<p class="ayuda">Carga las 41 clientas de las hojas manuscritas, los 20 saldos al 25/09/2026 (A CONFIRMAR) y pasa a «Créditos» las ventas a crédito ya cargadas. Primero muestra una vista previa; no se escribe nada hasta confirmar.</p></section>';
+    }
+    html += grupo('cc', 'Cobros a confirmar', 'Pagos mencionados en notas, sin fecha, medio ni recibo: no mueven el saldo hasta registrarlos con los datos confirmados.',
+      ['Clienta', ['Monto', 'num'], ['Fuente', 'ocultar-movil'], ''],
+      (k.cobrosConfirmar || []).map(function (x) {
+        return '<tr><td><div class="fuerte">' + esc(x.cliente) + '</div><div class="det">' + esc([x.id, x.credito, x.venta].filter(String).join(' · ')) + '</div></td><td class="num">' + gs(x.monto) +
+          '</td><td class="det ocultar-movil">' + esc(x.fuente) + '</td><td class="acciones">' + boton('Resolver', 'cobro-confirmar', attr('id', x.id)) + '</td></tr>';
+      }));
+    var aConfirmar = k.creditos.filter(function (c) { return c.estado === 'A CONFIRMAR'; });
+    html += grupo('hist', 'Saldos históricos con plan A CONFIRMAR', 'Confirme el saldo con la clienta y después acuerde el plan. Mientras tanto no hay cuotas, atraso ni bloqueo; los cobros se registran «a cuenta del saldo».',
+      ['Clienta', ['Saldo', 'num'], ['Hoja / sugerencia', 'ocultar-movil'], ''],
+      aConfirmar.filter(function (c) { return c.origen === 'HISTÓRICO'; }).map(function (c) {
+        var s = saldoInicialDe(c) || {};
+        return '<tr><td><div class="fuerte">' + esc(c.cliente) + '</div><div class="det">' + esc([c.id, c.legado ? 'N° ' + c.legado : '', c.codigoCliente].filter(String).join(' · ')) + '</div>' +
+          '<div>' + badgeEstado(s.lectura || c.lectura) + ' ' + badgeEstado(s.estado || 'A CONFIRMAR') + '</div></td><td class="num">' + gs(c.saldo) + (c.cobrado ? '<div class="det">cobrado ' + gs(c.cobrado) + '</div>' : '') +
+          '</td><td class="det ocultar-movil">' + esc(s.detalle || '') + (c.planSugerido ? '<div>' + esc(c.planSugerido) + '</div>' : '') + '</td><td class="acciones">' +
+          (s.estado !== 'CONFIRMADO' ? boton('Confirmar saldo', 'confirmar-saldo', attr('credito', c.id)) : '') + boton('Plan de pagos', 'confirmar-plan', attr('credito', c.id)) +
+          boton('Cobrar', 'cobro', attr('credito', c.id)) + '</td></tr>';
+      }));
+    html += grupo('previos', 'Ventas a crédito cargadas antes de la v2.3 (VIGENTE PREVIO)', 'Confirme el plan acordado con la clienta (se cuenta desde la fecha de la venta). Lo que la nota menciona queda como alerta; no se corrigió nada.',
+      ['Clienta', ['Saldo', 'num'], ['Alertas', 'ocultar-movil'], ''],
+      aConfirmar.filter(function (c) { return c.origen !== 'HISTÓRICO'; }).map(function (c) {
+        return '<tr><td><div class="fuerte">' + esc(c.cliente) + '</div><div class="det">' + esc([c.id, origenTexto(c), fecha(c.fecha)].join(' · ')) + '</div></td><td class="num">' + gs(c.saldo) +
+          (c.cobrado ? '<div class="det">cobrado ' + gs(c.cobrado) + '</div>' : '') + '</td><td class="det negativo ocultar-movil">' + esc(c.alertas || '') + '</td><td class="acciones">' +
+          boton('Plan de pagos', 'confirmar-plan', attr('credito', c.id)) + boton('Cobrar', 'cobro', attr('credito', c.id)) + '</td></tr>';
+      }));
+    html += grupo('investigar', 'Saldos a investigar (no suman a la cartera)', 'Aparecen en hojas viejas y luego desaparecen: revise los originales. No se migraron como deuda.',
+      ['Clienta', ['Último saldo visto', 'num'], 'Observación'],
+      saldos.filter(function (s) { return s.tipo === 'A INVESTIGAR'; }).map(function (s) {
+        return '<tr><td><div class="fuerte">' + esc(s.clienta) + '</div><div class="det">' + esc([s.legado, s.codigoCliente, s.hojaFecha ? 'hoja ' + s.hojaFecha : ''].filter(String).join(' · ')) +
+          '</div></td><td class="num">' + gs(s.ultimoVisto) + '</td><td class="det">' + esc(s.observacion || '') + '</td></tr>';
+      }));
+    html += grupo('sincat', 'Clientas sin categoría de crédito', 'Sin categoría no se les puede vender a crédito ni confirmar su plan.', ['Clienta', ['Saldo', 'num'], ''],
+      k.clientes.filter(function (x) { return x.activo && !categoria(x.categoria); }).sort(function (a, b) { return b.saldo - a.saldo; }).map(function (x) {
+        return '<tr><td><div class="fuerte">' + esc(x.nombre) + '</div><div class="det">' + esc([x.codigo, x.legado ? 'legado ' + x.legado : ''].filter(String).join(' · ')) + '</div></td><td class="num">' +
+          gs(x.saldo) + '</td><td class="acciones">' + boton('Asignar categoría', 'categoria', attr('codigo', x.codigo)) + '</td></tr>';
+      }));
+    html += grupo('demas', 'COBRADO DE MÁS: REVISAR', 'Los cobros superan el total del crédito: revise y anule el cobro que corresponda.', ['Crédito', ['Excedente', 'num'], ''],
+      k.creditos.filter(function (c) { return c.cobradoDeMas; }).map(function (c) {
+        return '<tr><td><div class="fuerte">' + esc(c.cliente) + '</div><div class="det">' + esc(c.id) + '</div></td><td class="num negativo">' + gs(-c.saldo) + '</td><td class="acciones">' +
+          boton('Ver cobros', 'ir', attr('destino', 'cartera:cobros')) + '</td></tr>';
+      }));
+    html += grupo('sincli', 'Créditos sin clienta registrada', 'Vincule el crédito a su clienta.', ['Crédito'], (k.sinClienta || []).map(function (t) { return '<tr><td>' + esc(t) + '</td></tr>'; }));
+    if (!html) html = aviso('No hay pendientes de cartera.', 'bien');
+    return html + '<p class="nota-pie">Todos los pendientes del sistema (parámetros, productos, datos fiscales…): ' + boton('Sistema › Pendientes', 'ir', attr('destino', 'sistema:pendientes')) + '</p>';
+  }
+
+  // ═════════════ Cierre del mes (R0.7, administradoras): TABLERO A–E y CONCILIACIÓN 1–5 del xlsx ═════════════
+  function filaDl(etq, val) { return '<dt>' + esc(etq) + '</dt><dd>' + val + '</dd>'; }
+  function vCierre() {
+    var c = C.cierre && C.cierre.mes === S.mes ? C.cierre : null;
+    var html = '<div class="barra-herr">' + boton(c ? 'Recalcular' : 'Calcular el cierre de ' + MB.etiquetaMes(S.mes), 'calcular-cierre', '', 'btn') +
+      (c ? boton('Imprimir (A4)', 'imprimir-cierre', '', 'btn btn-sec') : '') + '<span class="ayuda">Cambie el mes con las flechas de arriba.</span></div>';
+    if (!c) {
+      return html + '<div class="vacio">Tablero del mes como la planilla: resultado y punto de equilibrio, cartera y cobranza, mayores vencidos, margen por línea, últimos 12 meses, ' +
+        'conciliación de ventas, medios de pago, cuadre de la cartera y asiento resumen (Debe = Haber).</div>';
+    }
+    var ra = c.A, rb = c.B, cc = c.conciliacion, v = cc.ventas, cu = cc.cuadre, as = cc.asiento;
+    var d = '<div id="cierre-doc">';
+    d += '<p class="eyebrow mt">Cierre de ' + esc(c.etiqueta) + ' · del ' + fecha(c.desde) + ' al ' + fecha(c.hasta) + ' · cartera al ' + fecha(c.corte) + ' · calculado ' + esc(c.emitido) + '</p>';
+    if ((c.parametrosFaltantes || []).length) d += aviso('Faltan parámetros: ' + c.parametrosFaltantes.join(', ') + '.', 'grave');
+    d += c.diferencias.length ? '<ul class="problemas mt">' + c.diferencias.map(function (x) { return '<li class="blando">' + esc(x) + '</li>'; }).join('') + '</ul>' : aviso('Sin diferencias en la conciliación.', 'bien');
+    // A. Resultado y punto de equilibrio
+    d += '<section class="panel mt cierre-bloque"><h3>A. Resultado del mes y punto de equilibrio</h3><div class="kpis">' +
+      kpi('Ventas con IVA', gs(ra.ventasIva), plural(ra.operaciones, 'operación', 'operaciones') + (ra.ticketPromedio !== null ? ' · ticket promedio ' + gs(ra.ticketPromedio) : '')) +
+      kpi('Venta neta sin IVA', gs(ra.neta), 'a crédito ' + porc(ra.pctCredito) + ' de las ventas') +
+      kpi('Margen bruto', gs(ra.margen), porc(ra.margenPct) + ' (necesario ' + porc(ra.margenNecesario) + ')', ra.margenPct !== null && ra.margenNecesario !== null && ra.margenPct < ra.margenNecesario ? 'alerta' : '') +
+      kpi('Resultado estimado', gs(ra.resultado), 'contribución ' + gs(ra.contribucion) + ' − costos fijos ' + gs(ra.costosFijos), ra.resultado < 0 ? 'error' : '') +
+      kpi('Punto de equilibrio', gsN(ra.peIva), ra.pePorDia !== null ? 'con IVA · ' + gs(ra.pePorDia) + ' por día de venta · avance ' + porc(ra.avance) : 'sin margen suficiente para calcularlo', ra.avance !== null && ra.avance < 1 ? 'alerta' : '') +
+      kpi('Clientas activas', miles(ra.clientasActivas), 'compraron en los últimos ' + plural(P().P_DIAS_ACTIVA || 90, 'día', 'días') + ' · stock bajo: ' + ra.stockBajo.length) + '</div>' +
+      '<p class="ficha mt">' + esc(ra.diagnostico) + '.</p></section>';
+    // B. Cartera
+    d += '<section class="panel mt cierre-bloque"><h3>B. Cartera de créditos al ' + fecha(rb.corte) + '</h3>' + tramos(rb.antiguedad) +
+      '<dl class="dl mt">' + filaDl('Cartera total', gs(rb.cartera) + ' · vencido ' + gs(rb.vencido) + ' (' + porc(rb.pctVencido) + ')') +
+      filaDl('Plan a confirmar', gs(rb.aConfirmar) + ' en ' + plural(rb.aConfirmarN || 0, 'crédito', 'créditos')) +
+      filaDl('Clientas', (rb.bloqueadas || 0) + ' bloqueadas · ' + (rb.exceden || 0) + ' exceden el límite · ' + (rb.sinCategoria || 0) + ' sin categoría') +
+      filaDl('Cobranza', 'programado ' + gs(rb.programado) + ' · cobrado ' + gs(rb.cobrado) + ' · efectividad ' + porc(rb.efectividad) + (rb.mora ? ' · recargos por mora ' + gs(rb.mora) : '')) +
+      filaDl('Por conciliar', gs(rb.porConciliar) + ' en ' + plural(rb.porConciliarN || 0, 'cobro', 'cobros')) + '</dl></section>';
+    // C. Top 10 y D. Margen por línea
+    d += '<div class="grilla-2 mt"><section class="panel cierre-bloque"><h3>C. Clientas con mayor monto vencido</h3>' + tabla(['Clienta', ['Vencido', 'num'], 'Estado'], c.C.map(function (x) {
+      return '<tr><td><div class="fuerte">' + esc(x.nombre) + '</div><div class="det">' + plural(x.atraso, 'día', 'días') + ' · saldo ' + gs(x.saldo) + (x.whatsapp ? ' · +' + esc(x.whatsapp) : '') +
+        '</div></td><td class="num">' + gs(x.vencido) + '</td><td>' + badgeEstado(x.estado) + '</td></tr>';
+    }), 'Sin saldos vencidos.') + '</section>' +
+      '<section class="panel cierre-bloque"><h3>D. Margen por línea</h3>' + tabla(['Línea', ['Venta neta', 'num'], ['Margen', 'num'], ['% venta', 'num']], c.D.map(function (l) {
+        return '<tr><td>' + esc(l.linea) + '</td><td class="num">' + gs(l.neto) + '</td><td class="num">' + gs(l.margen) + '<div class="det">' + porc(l.margenPct) + '</div></td><td class="num">' + porc(l.pctVenta) + '</td></tr>';
+      }), 'Sin ventas en el mes.') + '</section></div>';
+    // E. 12 meses
+    d += '<section class="panel mt cierre-bloque"><h3>E. Últimos 12 meses</h3>' + tabla(['Mes', ['Venta neta', 'num'], ['Margen', 'num'], ['Contribución', 'num'], ['Resultado', 'num']], c.E.map(function (x) {
+      return '<tr><td>' + esc(MB.etiquetaMes(x.mes)) + '</td><td class="num">' + gs(x.neta) + '</td><td class="num">' + gs(x.margen) + '</td><td class="num">' + gs(x.contribucion) +
+        '</td><td class="num' + (x.resultado < 0 ? ' negativo' : '') + '">' + gs(x.resultado) + '</td></tr>';
+    }), '') + '</section>';
+    // Conciliación 1 a 4
+    var controles = Object.keys(v.controles || {}).map(function (k) { return k + ': ' + v.controles[k]; }).join(' · ');
+    d += '<div class="grilla-2 mt"><section class="panel cierre-bloque"><h3>1. Ventas y facturación</h3><dl class="dl">' +
+      filaDl('Ventas con IVA', gs(v.ventasIva) + ' (contado ' + gs(v.contado) + ' · crédito ' + gs(v.credito) + ')') + filaDl('Venta neta', gs(v.neta)) +
+      filaDl('IVA', '10%: ' + gs(v.iva10) + ' · 5%: ' + gs(v.iva5) + ' · exentas ' + gs(v.exentas)) +
+      filaDl('Libro de ventas (comprobantes)', gs(v.libro) + ' · ' + plural(v.comprobantes, 'comprobante', 'comprobantes') + (v.comprobantesAnulados ? ' · ' + v.comprobantesAnulados + ' anulados' : '') +
+        (v.notasCredito ? ' · notas de crédito ' + gs(v.notasCredito) : '')) +
+      filaDl('Ventas − libro', gs(v.difVentasLibro) + (v.lineasSinComprobante ? ' (' + plural(v.lineasSinComprobante, 'línea sin comprobante', 'líneas sin comprobante') + ')' : '')) +
+      filaDl('Marangatu / SIFEN', v.marangatu === null ? 'no cargado' : gs(v.marangatu) + ' · diferencia ' + gs(v.difLibroMarangatu)) +
+      (controles ? filaDl('Controles de las líneas', esc(controles)) : '') + '</dl></section>' +
+      '<section class="panel cierre-bloque"><h3>2. Ingresos por medio de pago</h3>' + tabla(['Medio', ['Contado', 'num'], ['Cobros', 'num'], ['Extracto', 'num'], ['Dif.', 'num']], cc.medios.medios.map(function (m) {
+        return '<tr><td>' + esc(m.medio) + (m.sinConciliar ? '<div class="det">sin conciliar ' + gs(m.sinConciliar) + '</div>' : '') + '</td><td class="num">' + gs(m.contado) + '</td><td class="num">' + gs(m.cobros) +
+          '</td><td class="num">' + gsN(m.extracto) + '</td><td class="num' + (m.diferencia ? ' negativo' : '') + '">' + (m.diferencia === null ? '—' : gs(m.diferencia)) + '</td></tr>';
+      }), '', '<tfoot><tr class="totales-fila"><td>Total</td><td colspan="2" class="num">' + gs(cc.medios.total) + '</td><td colspan="2" class="num">sin conciliar ' + gs(cc.medios.sinConciliar) + '</td></tr></tfoot>') + '</section></div>';
+    d += '<div class="grilla-2 mt"><section class="panel cierre-bloque"><h3>3. Cuadre de la cartera</h3><dl class="dl">' +
+      filaDl('Saldo inicial + otorgados − cobros', gs(cu.inicio) + ' + ' + gs(cu.otorgados) + ' − ' + gs(cu.cobros) + ' = <strong>' + gs(cu.cierre) + '</strong>') +
+      filaDl('Cartera según créditos', gs(cu.carteraCreditos) + (cu.cierre === cu.carteraCreditos ? ' ' + badge('cuadra', 'ok') : ' ' + badge('diferencia ' + gs(cu.cierre - cu.carteraCreditos), 'alerta'))) +
+      filaDl('Ventas a crédito vs créditos', gs(cu.ventasCredito) + ' / ' + gs(cu.creditosConVenta) + (cu.difVentasSinPlan ? ' ' + badge('sin plan ' + gs(cu.difVentasSinPlan), 'error') : ' ' + badge('cuadra', 'ok'))) +
+      filaDl('Cartera vs saldos de clientas', gs(cu.carteraCreditos) + ' / ' + gs(cu.carteraClientas) + (cu.difSinClienta ? ' ' + badge('sin clienta ' + gs(cu.difSinClienta), 'error') : ' ' + badge('cuadra', 'ok'))) +
+      '</dl></section>' +
+      '<section class="panel cierre-bloque"><h3>4. Asiento resumen</h3>' + tabla(['Cuenta', ['Debe', 'num'], ['Haber', 'num']], as.lineas.map(function (l) {
+        return '<tr><td>' + esc(l.cuenta) + '<div class="det">' + esc(l.grupo) + (l.codigo ? ' · cuenta ' + esc(l.codigo) : ' · código a completar') + '</div></td><td class="num">' + (l.debe ? gs(l.debe) : '') +
+          '</td><td class="num">' + (l.haber ? gs(l.haber) : '') + '</td></tr>';
+      }), '', '<tfoot><tr class="totales-fila"><td>Totales ' + (as.diferencia ? badge('diferencia ' + gs(as.diferencia), 'error') : badge('Debe = Haber', 'ok')) + '</td><td class="num">' + gs(as.debe) +
+        '</td><td class="num">' + gs(as.haber) + '</td></tr></tfoot>') +
+      (as.codigosFaltantes ? '<p class="ayuda mt">' + plural(as.codigosFaltantes, 'línea sin código de cuenta', 'líneas sin código de cuenta') + ': completar con el contador en «Parámetros de crédito» (P_CTA_…).</p>' : '') + '</section></div>';
+    d += '<p class="nota-pie">Salón (informativo; el consolidado por unidad llega con los reportes financieros): ' + plural(c.salon.servicios, 'servicio', 'servicios') + ' por ' + gs(c.salon.facturacion) +
+      ' (IVA incluido ' + gs(c.salon.iva) + ').' + ((c.avisos || []).length ? ' Avisos de parámetros: ' + esc(c.avisos.join(' · ')) : '') + '</p></div>';
+    html += d;
+    // Lo que en el xlsx se carga a mano + registro (5)
+    var medios = cc.medios.medios.map(function (m) { return m.medio; });
+    html += '<section class="panel mt"><h2>Datos cargados a mano</h2><form id="form-cierre-manual" novalidate autocomplete="off"><div class="form-grid">' +
+      campo('Total en Marangatu / SIFEN (Gs.)', inputGs('marangatu', C.manual.marangatu), 'c-4', 'Del libro de ventas presentado.') +
+      medios.map(function (m, i) { return campo('Extracto o arqueo: ' + m, inputGs('ext_' + i, C.manual.extractos[m] === undefined ? '' : C.manual.extractos[m]), 'c-4'); }).join('') +
+      '</div><div class="form-acciones"><button type="submit" class="btn btn-sec">Recalcular con estos datos</button></div></form></section>';
+    html += '<section class="panel mt"><h2>5. Registrar el cierre</h2><form id="form-cierre" novalidate autocomplete="off"><div class="form-grid">' +
+      campo('Observaciones', '<textarea name="observaciones" maxlength="400" placeholder="Ej.: arqueo del 31 hecho, diferencias explicadas"></textarea>', 'c-12') +
+      '</div><div class="form-acciones"><button type="submit" class="btn">Registrar cierre de ' + esc(MB.etiquetaMes(S.mes)) + '</button></div></form>' +
+      '<p class="ayuda">Guarda las cifras y las diferencias en la hoja «Cierres mensuales» (si el mes ya estaba registrado, se actualiza).</p>' +
+      (cc.registros.length ? tabla(['Mes', 'Fecha', 'Responsable', 'Diferencias'], cc.registros.slice(0, 12).map(function (r) {
+        return '<tr><td>' + esc(r.mes) + '</td><td>' + esc(String(r.fecha || '').slice(0, 16)) + '</td><td>' + esc(r.usuario) + '</td><td class="det">' + esc(String(r.diferencias || '').slice(0, 220)) + '</td></tr>';
+      }), '') : '') + '</section>';
+    return html;
+  }
+  function manualDeForm(f) {
+    var m = { marangatu: '', extractos: {} };
+    var el = f.elements;
+    m.marangatu = el.marangatu && el.marangatu.value ? enteroDe(el.marangatu.value) : '';
+    var medios = C.cierre ? C.cierre.conciliacion.medios.medios.map(function (x) { return x.medio; }) : [];
+    medios.forEach(function (medio, i) {
+      var inp = el['ext_' + i];
+      if (inp && inp.value !== '') m.extractos[medio] = enteroDe(inp.value);
+    });
+    return m;
+  }
+  function calcularCierre(el) {
+    var mes = S.mes;
+    conBoton(el, 'Calculando…', function () { return api('obtenerCierreMensual', { mes: mes, manual: C.manual }); }).then(function (r) {
+      C.cierre = r.cierre;
+      render();
+    }).catch(fallo);
+  }
+
+  // ═════════════ Sistema › Migración (R0.8): vista previa (no escribe), confirmación con huella e informe ═════════════
+  function tablaControles(controles) {
+    return tabla(['Control', 'Resultado', 'Detalle'], controles.map(function (c) {
+      return '<tr><td class="fuerte">' + esc(c.nombre) + '</td><td>' + badge(c.ok ? 'OK' : 'FALLO', c.ok ? 'ok' : 'error') + '</td><td class="det">' + esc(c.detalle) + '</td></tr>';
+    }), '');
+  }
+  function vMigracion() {
+    var v = C.migracion, inf = C.informe;
+    var html = '<section class="panel"><h2>Migrar datos antiguos</h2><p class="ayuda">Ordena lo ya cargado y la cartera de las hojas manuscritas sin re-tipear: 41 clientas (con su código legado C001…C041 y alias), ' +
+      '20 saldos al 25/09/2026 como créditos HISTÓRICO con plan A CONFIRMAR, «Saldos iniciales» (copia fiel), y las ventas a crédito ya cargadas pasan a «Créditos» (VIGENTE PREVIO). ' +
+      'Lo que las notas mencionan (entregas, saldos) va a «Cobros a confirmar» y «Alertas»: no se registra ningún pago. Antes de escribir se hace un respaldo del libro. Repetirla no duplica nada.</p>' +
+      '<div class="chips">' + boton(v ? 'Generar otra vista previa' : 'Generar vista previa', 'migracion-vista', '', 'btn') + boton('Revisar datos de EJEMPLO', 'migracion-ejemplos', '', 'btn btn-sec') + '</div></section>';
+    if (inf) {
+      html += '<section class="panel mt"><h2>Migración aplicada</h2><p class="resumen-mig">' + esc(inf.resumen) + '</p>' + tablaControles(inf.controles) + '</section>';
+    }
+    if (!v) return html;
+    var pend = v.acciones.filter(function (a) { return !/^YA /.test(a.tipo); });
+    var porPaso = {};
+    v.acciones.forEach(function (a) { var k = a.paso + '|' + a.tipo; porPaso[k] = (porPaso[k] || 0) + 1; });
+    html += '<section class="panel mt"><h2>Vista previa (no se escribió nada)</h2><p class="resumen-mig">' + esc(v.resumen) + '</p>' + tablaControles(v.controles) +
+      '<p class="eyebrow mt-l">Acciones</p>' + tabla(['Paso', 'Tipo', ['Cantidad', 'num']], Object.keys(porPaso).map(function (k) {
+        var p = k.split('|');
+        return '<tr><td>' + esc(p[0]) + '</td><td>' + badge(p[1], /^YA/.test(p[1]) ? 'neutro' : (/REVISAR/.test(p[1]) ? 'alerta' : 'ok')) + '</td><td class="num">' + porPaso[k] + '</td></tr>';
+      }), '') +
+      (pend.length ? '<details class="mt"><summary class="fuerte">Ver el detalle de las ' + pend.length + ' acciones pendientes</summary>' + tabla(['Paso', 'Tipo', 'Ref.', 'Detalle'], pend.slice(0, 200).map(function (a) {
+        return '<tr><td>' + esc(a.paso) + '</td><td>' + esc(a.tipo) + '</td><td class="cod">' + esc(a.ref) + '</td><td class="det">' + esc(a.detalle) + '</td></tr>';
+      }), '') + '</details>' : '');
+    if (!pend.length) return html + aviso('No hay nada pendiente: todo ya estaba migrado.', 'bien') + '</section>';
+    var fallas = v.controles.filter(function (c) { return !c.ok; }).length;
+    html += (fallas ? aviso(plural(fallas, 'control con FALLO', 'controles con FALLO') + ': revise antes de confirmar (puede confirmar igual si la diferencia está explicada).', 'grave') : '') +
+      '<div class="mt"><label class="check"><input type="checkbox" id="mig-confirmo" data-al-cambiar="mig-confirmo"' + (C.migConfirmo ? ' checked' : '') + '> Revisé la vista previa y confirmo la migración</label></div>' +
+      '<div class="form-acciones">' + boton('Confirmar migración', 'migracion-ejecutar', C.migConfirmo ? '' : ' disabled', 'btn') + '</div></section>';
+    return html;
+  }
+  function vistaMigracion(el) {
+    conBoton(el, 'Calculando vista previa…', function () { return api('vistaPreviaMigracion', {}); }).then(function (r) {
+      C.migracion = r.vista;
+      C.migConfirmo = false;
+      render();
+    }).catch(fallo);
+  }
+  function ejecutarMigracion(el) {
+    var v = C.migracion;
+    if (!v || !C.migConfirmo) return;
+    conBoton(el, 'Migrando… (no cierre la página)', function () { return api('ejecutarMigracion', { confirmado: true, huella: v.huella }, 'mig-' + v.huella); }).then(function (r) {
+      C.informe = r.informe || null;
+      C.migracion = null;
+      C.migConfirmo = false;
+      MB.aplicar(r);
+    }).catch(function (e) {
+      fallo(e);
+      if (/cambiaron desde la vista previa/.test(e.message)) { C.migracion = null; render(); }
+    });
+  }
+  function ignorarEjemplos() {
+    MB.confirmar({
+      titulo: 'Datos de EJEMPLO del xlsx', aceptar: 'Revisar y dejar inactivos',
+      mensaje: 'Se buscan la clienta C999, los ítems EJ-, los créditos 1001 y 1002 y las filas marcadas «EJEMPLO». Si aparece alguno, se deja inactivo o anulado (nunca se borra).',
+    }).then(function (si) {
+      if (!si) return;
+      api('ejecutarMigracion', { accion: 'ignorarEjemplos' }, uid()).then(MB.aplicar).catch(fallo);
+    });
+  }
+
+  // ═════════════ Conexión con la app ═════════════
+  MB.vistas.cartera = vCartera;
+  MB.sistemaExtra.push(['migracion', 'Migración', vMigracion]);
+  MB.ext.badgeEstado = badgeEstado;
+  MB.ext.abrirCobro = abrirCobro;
+  MB.ext.abrirFicha = abrirFicha;
+  MB.ext.seccionCredito = seccionCredito;
+  MB.ext.confirmarVentaCredito = confirmarVentaCredito;
+  MB.ext.estimarPlan = estimarPlan;
+  MB.ext.tonoAtraso = tonoAtraso;
+
+  var A = MB.acciones;
+  A.cobro = function (el) { abrirCobro({ credito: el.getAttribute('data-credito'), cliente: el.getAttribute('data-cliente') }); };
+  A.ficha = function (el) { abrirFicha(el.getAttribute('data-codigo')); };
+  A.categoria = function (el) { modalCategoria(el.getAttribute('data-codigo')); };
+  A['anular-cobro'] = function (el) { modalAnularCobro(el.getAttribute('data-id')); };
+  A['ver-cuotas'] = function (el) { var id = el.getAttribute('data-id'); C.abiertos[id] = !C.abiertos[id]; $('#cred-tabla').innerHTML = tablaCreditos(); };
+  A['confirmar-saldo'] = function (el) { modalConfirmarSaldo(el.getAttribute('data-credito')); };
+  A['confirmar-plan'] = function (el) { modalConfirmarPlan(el.getAttribute('data-credito')); };
+  A['cobro-confirmar'] = function (el) { modalCobroAConfirmar(el.getAttribute('data-id')); };
+  A['ver-todo'] = function (el) { var k = el.getAttribute('data-clave'); C.verTodo[k] = !C.verTodo[k]; render(); };
+  A['sel-sin-conciliar'] = function () {
+    K().cobros.forEach(function (c) { if (!c.anulado && !c.conciliado) C.sel[c.id] = true; });
+    $('#cob-tabla').innerHTML = tablaCobros();
+    refrescarBarra();
+  };
+  A.conciliar = function (el) { conciliar(el, 'conciliar'); };
+  A.desconciliar = function (el) { conciliar(el, 'desconciliar'); };
+  A['limpiar-sel'] = function () { C.sel = {}; $('#cob-tabla').innerHTML = tablaCobros(); refrescarBarra(); };
+  A['calcular-cierre'] = function (el) { calcularCierre(el); };
+  A['imprimir-cierre'] = function () { var d = $('#cierre-doc'); if (d) imprimirDocumento(d.innerHTML, 'Cierre ' + (C.cierre ? C.cierre.etiqueta : '')); };
+  A['imprimir-ficha'] = function () { if (C.ficha && C.ficha.html) imprimirDocumento(C.ficha.html.cuerpo, C.ficha.html.titulo); };
+  A['pdf-ficha'] = function (el) { exportarFicha(el); };
+  A['migracion-vista'] = function (el) { vistaMigracion(el); };
+  A['migracion-ejecutar'] = function (el) { ejecutarMigracion(el); };
+  A['migracion-ejemplos'] = function () { ignorarEjemplos(); };
+
+  MB.alEscribir['cartera-buscar'] = function (el) { C.q = el.value; $('#cartera-tabla').innerHTML = tablaClientas(); };
+  MB.alEscribir['cred-buscar'] = function (el) { C.qCred = el.value; $('#cred-tabla').innerHTML = tablaCreditos(); };
+  MB.alEscribir['cob-buscar'] = function (el) { C.qCob = el.value; $('#cob-tabla').innerHTML = tablaCobros(); };
+  MB.alCambio['cartera-filtro'] = function (el) { C.filtro = el.value; $('#cartera-tabla').innerHTML = tablaClientas(); };
+  MB.alCambio['cred-filtro'] = function (el) { C.filtroCred = el.value; $('#cred-tabla').innerHTML = tablaCreditos(); };
+  MB.alCambio['cob-filtro'] = function (el) { C.filtroCob = el.value; $('#cob-tabla').innerHTML = tablaCobros(); };
+  MB.alCambio['sel-cobro'] = function (el) { C.sel[el.getAttribute('data-id')] = el.checked; refrescarBarra(); };
+  MB.alCambio['conc-fecha'] = function (el) { C.fechaConc = el.value; };
+  MB.alCambio['mig-confirmo'] = function (el) {
+    C.migConfirmo = el.checked;
+    var b = document.querySelector('[data-accion="migracion-ejecutar"]');
+    if (b) b.disabled = !el.checked;
+  };
+  MB.alEnviar['form-cierre-manual'] = function (f, btn) {
+    C.manual = manualDeForm(f);
+    calcularCierre(btn);
+  };
+  MB.alEnviar['form-cierre'] = function (f, btn) {
+    var mes = S.mes;
+    conBoton(btn, 'Registrando…', function () {
+      return api('registrarCierreMensual', { mes: mes, manual: C.manual, observaciones: f.elements.observaciones.value.trim() }, 'cierre-' + uid());
+    }).then(function (r) { C.cierre = r.cierre; MB.aplicar(r); }).catch(fallo);
+  };
+
+  // Formulario de venta a crédito: refresca la estimación sin redibujar (no se pierde el foco al escribir).
+  var campoPrevio = MB.alCambiarCampo;
+  MB.alCambiarCampo = function (ruta) {
+    if (campoPrevio) campoPrevio(ruta);
+    var v = S.venta;
+    if (!v || S.vista !== 'ventas' || v.condicion !== 'Crédito') return;
+    if (ruta === 'venta.cliente' || ruta === 'venta.cobrarEntrega' || ruta === 'venta.entregaMedio') { render(); return; }
+    if (ruta === 'venta.fecha' || ruta.indexOf('venta.plan.') === 0) actualizarEstimado();
+  };
+  var renderPrevio = MB.alRender;
+  MB.alRender = function () {
+    if (renderPrevio) renderPrevio();
+    if (S.vista === 'ventas' && S.sub.ventas === 'nueva') actualizarEstimado();
+  };
+});
+</script>
