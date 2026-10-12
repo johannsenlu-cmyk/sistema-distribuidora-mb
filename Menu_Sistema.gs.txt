@@ -1,0 +1,45 @@
+/**
+ * @OnlyCurrentDoc
+ * =====================================================================
+ *  MB Sistema · menú dentro de la hoja «Inventario - Distribuidora MB» (OPCIONAL · v2.3 · Fase 3 · R1.1)
+ * =====================================================================
+ *  Va en un proyecto de Apps Script VINCULADO al libro (en la hoja: Extensiones › Apps Script), NO en el proyecto
+ *  «Sistema Distribuidora MB». Solo agrega el menú «MB Sistema» y abre la aplicación en una pestaña nueva:
+ *  no lee ni escribe datos de la hoja (por eso «@OnlyCurrentDoc» y ningún otro permiso).
+ *  Las altas, ediciones y la exportación se hacen en la aplicación, donde el servidor valida cada dato y deja rastro
+ *  en «Auditoría».
+ * =====================================================================
+ */
+
+/** Enlace de la aplicación (el mismo de siempre, el que usan Mirian y Raquel). */
+const MB_URL_APP = 'https://script.google.com/macros/s/AKfycbw1WS0g31ZIS4H6Dke1rn0rMLDA9PFQP971es0m6lVqM8VjoI36qrordGJ7cXpBsVXD/exec';
+
+/** Se ejecuta solo al abrir la hoja: agrega el menú. */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('MB Sistema')
+    .addItem('Abrir la aplicación', 'mbAbrirAplicacion')
+    .addItem('Abrir Base de datos (clientes)', 'mbAbrirBaseDeDatos')
+    .addToUi();
+}
+
+function mbAbrirAplicacion() {
+  mbMostrarEnlace_(MB_URL_APP, 'Abrir Distribuidora MB');
+}
+
+/** Con la sesión recordada en ese navegador entra directo a «Base de datos»; si no, pasa antes por «Ingresar con Google». */
+function mbAbrirBaseDeDatos() {
+  mbMostrarEnlace_(MB_URL_APP + '?page=clientes', 'Abrir la Base de datos');
+}
+
+/** Ventana con el enlace (Google no deja abrir pestañas desde un menú sin un clic de la persona). */
+function mbMostrarEnlace_(url, texto) {
+  const html = HtmlService.createHtmlOutput(
+    '<div style="font:14px/1.5 Arial,sans-serif;color:#1C1C1A;padding:2px">' +
+    '<p style="margin:0 0 14px">La aplicación se abre en una pestaña nueva del navegador.</p>' +
+    '<a href="' + url + '" target="_blank" rel="noopener" onclick="setTimeout(function () { google.script.host.close(); }, 400);" ' +
+    'style="display:inline-block;background:#1C1C1A;color:#FFFFFF;text-decoration:none;padding:9px 16px;border-radius:3px">' + texto + '</a>' +
+    '</div>'
+  ).setWidth(340).setHeight(130);
+  SpreadsheetApp.getUi().showModalDialog(html, 'MB Sistema');
+}
