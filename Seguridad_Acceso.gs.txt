@@ -1,0 +1,105 @@
+/**
+ * =====================================================================
+ *  MB ACCESO · Distribuidora MB (proyecto aparte, chico)
+ * =====================================================================
+ *  Para qué sirve: confirmar con Google QUIÉN es la persona que entra, sin que escriba su correo.
+ *  - Se ejecuta como la usuaria que accede y SOLO pide ver su dirección de correo (scopes «openid» y
+ *    «userinfo.email»). No abre la hoja de cálculo ni ve datos del negocio.
+ *  - Obtiene el token de identidad de Google (ScriptApp.getIdentityToken, OpenID Connect) y lo entrega a la
+ *    app principal con el botón «Continuar» (parámetro de un solo uso). La app principal lo valida con Google
+ *    (tokeninfo) y abre una sesión propia.
+ *  - Google exige un clic para cambiar de página: por eso existe el botón «Continuar».
+ *  - ?config=1 muestra el «Client ID» de este proyecto (para «Configuración» de la hoja) y su enlace.
+ *
+ *  Publicación (una sola vez): Implementar → Nueva implementación → Aplicación web →
+ *  Ejecutar como: «Usuario que accede a la aplicación web» · Quién tiene acceso: «Cualquier usuario con cuenta
+ *  de Google» → Implementar. Para versiones futuras, editar ESA implementación (no crear otra).
+ * =====================================================================
+ */
+
+/** Enlace oficial de la app principal (implementación «Enlace principal»: no cambia al publicar versiones). */
+const URL_APP_PRINCIPAL = 'https://script.google.com/macros/s/AKfycbw1WS0g31ZIS4H6Dke1rn0rMLDA9PFQP971es0m6lVqM8VjoI36qrordGJ7cXpBsVXD/exec';
+const PATRON_EXEC = /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]{20,}\/exec$/;
+
+function doGet(e) {
+  const p = e && e.parameter ? e.parameter : {};
+  let token = null;
+  let error = '';
+  try {
+    token = ScriptApp.getIdentityToken();
+  } catch (err) {
+    error = String(err && err.message ? err.message : err);
+  }
+  const datos = token ? leerJwt_(token) : null;
+  let propia = '';
+  try { propia = String(ScriptApp.getService().getUrl() || ''); } catch (err) { propia = ''; }
+
+  if (p.config === '1') return pagina_(htmlConfiguracion_(datos, propia, error));
+  if (!token || !datos || !datos.email) return pagina_(htmlSinToken_(error));
+
+  const recordar = p.r === '1';
+  const destino = URL_APP_PRINCIPAL + '?acceso=' + encodeURIComponent(token) + (recordar ? '&r=1' : '') +
+    (PATRON_EXEC.test(propia) ? '&desde=' + encodeURIComponent(propia) : '');
+  return pagina_(htmlContinuar_(String(datos.email), destino, recordar));
+}
+
+/** Lee (sin validar: lo valida la app principal con Google) la parte central del token. */
+function leerJwt_(token) {
+  try {
+    const parte = String(token).split('.')[1];
+    const texto = Utilities.newBlob(Utilities.base64DecodeWebSafe(parte + '==='.slice((parte.length + 3) % 4))).getDataAsString('UTF-8');
+    return JSON.parse(texto);
+  } catch (e) {
+    return null;
+  }
+}
+
+function esc_(s) {
+  return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function pagina_(cuerpo) {
+  const html = '<!doctype html><html lang="es"><head><meta charset="utf-8"><base target="_top">' +
+    '<link rel="preconnect" href="https://fonts.googleapis.com">' +
+    '<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">' +
+    '<style>' +
+    ':root{--fondo:#F6F5F1;--tinta:#1C1C1A;--suave:#6F6C64;--acento:#8C6D46;--linea:#DDD8CC;}' +
+    '*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--fondo);' +
+    'color:var(--tinta);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:24px}' +
+    '.caja{width:100%;max-width:420px;text-align:center}.marca{font-family:"Cormorant Garamond",Georgia,serif;font-size:34px;letter-spacing:.02em;margin:0}' +
+    '.marca b{color:var(--acento);font-weight:600}.sub{text-transform:uppercase;letter-spacing:.18em;font-size:11px;color:var(--suave);margin:6px 0 22px}' +
+    '.regla{width:48px;height:1px;background:var(--acento);margin:0 auto 26px}.texto{font-size:15px;line-height:1.55;margin:0 0 22px}' +
+    '.correo{font-weight:600;word-break:break-all}.btn{display:inline-block;width:100%;padding:14px 18px;background:var(--tinta);color:#fff;' +
+    'text-decoration:none;border-radius:3px;font-weight:500;letter-spacing:.02em;font-size:15px}.btn:focus{outline:2px solid var(--acento);outline-offset:3px}' +
+    '.pie{font-size:12.5px;color:var(--suave);line-height:1.5;margin-top:22px}.dato{text-align:left;background:#fff;border:1px solid var(--linea);' +
+    'padding:12px 14px;border-radius:3px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all;margin:6px 0 16px}' +
+    '.etq{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--suave)}' +
+    '</style></head><body><main class="caja">' +
+    '<p class="marca">Distribuidora <b>MB</b></p><p class="sub">Acceso verificado por Google</p><div class="regla"></div>' +
+    cuerpo + '</main></body></html>';
+  return HtmlService.createHtmlOutput(html).setTitle('Distribuidora MB · Acceso').addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function htmlContinuar_(email, destino, recordar) {
+  return '<p class="texto">Google confirmó que usted es<br><span class="correo">' + esc_(email) + '</span></p>' +
+    '<a class="btn" href="' + esc_(destino) + '" target="_top" rel="noreferrer">Continuar a Distribuidora MB</a>' +
+    '<p class="pie">' + (recordar ? 'Este dispositivo quedará recordado por 30 días.' : 'La sesión dura 12 horas en este dispositivo.') +
+    ' Si esta no es su cuenta, cierre la sesión de Google o use otro perfil del navegador (un perfil por persona).</p>';
+}
+
+function htmlSinToken_(error) {
+  return '<p class="texto">No se pudo obtener la confirmación de Google.</p>' +
+    '<p class="pie">Vuelva a abrir la aplicación y pulse «Ingresar con Google». Si Google le pidió permisos, acéptelos: «MB Acceso» solo ve su dirección de correo.' +
+    (error ? '<br><br>Detalle técnico: ' + esc_(error) : '') + '</p>' +
+    '<a class="btn" href="' + esc_(URL_APP_PRINCIPAL) + '" target="_top">Volver a la aplicación</a>';
+}
+
+function htmlConfiguracion_(datos, propia, error) {
+  return '<p class="texto">Datos de configuración de «MB Acceso»</p>' +
+    '<p class="etq">Client ID (copiar en «Configuración» → «Client ID de MB Acceso»)</p><div class="dato">' + esc_(datos && datos.aud ? datos.aud : '(no disponible' + (error ? ': ' + error : '') + ')') + '</div>' +
+    '<p class="etq">Enlace de esta implementación («Enlace de MB Acceso»)</p><div class="dato">' + esc_(propia || '(copie la dirección /exec de esta página)') + '</div>' +
+    '<p class="etq">Cuenta</p><div class="dato">' + esc_(datos && datos.email ? datos.email : '') + '</div>' +
+    '<p class="pie">Normalmente no hace falta copiarlos: el primer ingreso de la cuenta propietaria los registra solos.</p>';
+}
